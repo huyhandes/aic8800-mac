@@ -160,11 +160,10 @@ static void *rx_thread(void *arg) {
         if (rc == LIBUSB_ERROR_TIMEOUT && got == 0) continue;
         if (rc != 0 && rc != LIBUSB_ERROR_TIMEOUT) {
             if (rc == LIBUSB_ERROR_NO_DEVICE) {
-                fprintf(stderr, "aicd: device gone\n");
-                pthread_mutex_lock(&g.state_lock);
-                g.lmac_ready = g.associated = g.link_up = false;
-                pthread_mutex_unlock(&g.state_lock);
-                break;
+                /* unplugged: dongle returns to stage 0; exit so launchd restarts us for the next plug */
+                fprintf(stderr, "aicd: device gone, exiting\n");
+                set_host_link(false);
+                exit(1);
             }
             usleep(10000);
             continue;
@@ -512,27 +511,32 @@ fail:
 
 int open_wifi_client(io_connect_t *out_conn, io_service_t *out_svc, bool quiet, kern_return_t *out_kr) {
     if (out_kr) *out_kr = KERN_FAILURE;
+    /* Once the USB side is live (threads, claimed iface) a fresh process is the only clean
+       reset: exit and let launchd KeepAlive restart us (replug, LMAC failure, feth failure). */
     if (g.started) {
-        if (!g.lmac_ready) return -1; /* device vanished; needs a process restart */
+        if (!g.lmac_ready) { fprintf(stderr, "aicd: device lost, exiting for restart\n"); exit(1); }
         goto ok;
     }
-    pthread_mutex_init(&g.cmd_serial, NULL);
-    pthread_mutex_init(&g.cmd_lock, NULL);
-    pthread_cond_init(&g.cmd_cond, NULL);
-    pthread_mutex_init(&g.state_lock, NULL);
-    pthread_mutex_init(&g.tx_lock, NULL);
-    aic_lmac_cmd_matcher_init(&g.matcher);
+    static bool inited;
+    if (!inited) {
+        pthread_mutex_init(&g.cmd_serial, NULL);
+        pthread_mutex_init(&g.cmd_lock, NULL);
+        pthread_cond_init(&g.cmd_cond, NULL);
+        pthread_mutex_init(&g.state_lock, NULL);
+        pthread_mutex_init(&g.tx_lock, NULL);
+        aic_lmac_cmd_matcher_init(&g.matcher);
+        inited = true;
+    }
 
-    if (usb_open(quiet) != 0) return -1;
-    if (pthread_create(&g.rx_thr, NULL, rx_thread, NULL) != 0) return -1;
+    if (usb_open(quiet) != 0) return -1; /* not plugged / firmware not loaded yet: caller retries */
+    if (pthread_create(&g.rx_thr, NULL, rx_thread, NULL) != 0) exit(1);
     if (bring_up_lmac() != 0) {
         fprintf(stderr, "error: LMAC bring-up failed (replug dongle and reload firmware)\n");
-        g.stopping = true;
-        return -1;
+        exit(1);
     }
     if (getenv("AICD_NO_NET") == NULL) {
-        if (setup_feth() != 0) return -1;
-        if (pthread_create(&g.bpf_thr, NULL, bpf_thread, NULL) != 0) return -1;
+        if (setup_feth() != 0) exit(1);
+        if (pthread_create(&g.bpf_thr, NULL, bpf_thread, NULL) != 0) exit(1);
     }
     g.started = true;
 ok:

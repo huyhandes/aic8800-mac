@@ -65,7 +65,10 @@ static void set_err(char *err_buf, size_t err_cap, const char *fmt, ...) {
 
 
 static int trigger_dhcp(const char *bsd) {
-    if (!bsd || strcmp(bsd, "unknown") == 0 || (strncmp(bsd, "en", 2) != 0 && strncmp(bsd, "feth", 4) != 0)) {
+    if (bsd && strncmp(bsd, "feth", 4) == 0) {
+        return 0; /* port: the feth80 network service (aic_netsvc) runs DHCP via configd */
+    }
+    if (!bsd || strcmp(bsd, "unknown") == 0 || strncmp(bsd, "en", 2) != 0) {
         return -1;
     }
     char *argv_dhcp[] = { (char *)"ipconfig", (char *)"set", (char *)bsd, (char *)"DHCP", NULL };
