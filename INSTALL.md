@@ -9,8 +9,9 @@ Requirements:
 ## From the release package
 
 1. Download `AIC8800-mac.pkg` from the [latest release](https://github.com/huyhandes/aic8800-mac/releases/latest).
-2. The package is not notarized. Right-click it and choose Open, or run
-   `sudo installer -pkg AIC8800-mac.pkg -target /`.
+2. The package is not notarized, so macOS blocks a double-click. Either run
+   `sudo installer -pkg AIC8800-mac.pkg -target /` in Terminal, or double-click
+   once, then open System Settings → Privacy & Security and click **Open Anyway**.
 3. Plug in the dongle. Within a few seconds the firmware loads and the
    **AIC8800Menu** icon appears in the menu bar.
 4. Click the icon, pick a network and enter the password once. The password is
