@@ -115,18 +115,20 @@ static void format_sec_str(uint32_t m, char *buf, size_t cap) {
 static int run_scan_and_wait(io_connect_t conn,
                              const uint8_t *ssid,
                              uint8_t ssid_len,
+                             const uint16_t *freqs,
+                             int n_freqs,
                              aic_wifi_scan_list_t *out_list,
                              char *err_buf,
                              size_t err_cap) {
-    kern_return_t kr = uc_start_scan(conn, ssid, ssid_len);
+    kern_return_t kr = uc_start_scan(conn, ssid, ssid_len, freqs, n_freqs);
     if (kr != KERN_SUCCESS) {
         set_err(err_buf, err_cap, "START_SCAN failed: 0x%08x", kr);
         fprintf(stderr, "error: START_SCAN failed: 0x%08x\n", kr);
         return -1;
     }
 
-    for (int i = 0; i < 60; ++i) {
-        usleep(100000);
+    for (int i = 0; i < 300; ++i) {
+        usleep(20000);
         kr = uc_get_scan_results(conn, out_list);
         if (kr != KERN_SUCCESS) {
             set_err(err_buf, err_cap, "GET_SCAN_RESULTS failed: 0x%08x", kr);
@@ -183,7 +185,7 @@ static int cmd_status(io_connect_t conn, io_service_t svc) {
 static int cmd_scan(io_connect_t conn) {
     aic_wifi_scan_list_t list;
     char err[160] = {0};
-    if (run_scan_and_wait(conn, NULL, 0U, &list, err, sizeof(err)) != 0) {
+    if (run_scan_and_wait(conn, NULL, 0U, NULL, 0, &list, err, sizeof(err)) != 0) {
         return 1;
     }
 
@@ -232,19 +234,34 @@ static int perform_connect(io_connect_t conn,
         return 1;
     }
 
-    printf("[1/4] Scanning for \"%s\"...\n", ssid_arg);
+    /* A full scan (38 channels, DFS ones passive) takes ~3 s; rescan only the channels this SSID was last
+       seen on (~0.2 s) and fall back to the full scan when it is not there. */
+    static char     known_ssid[33];
+    static uint16_t known_freqs[8];
+    static int      n_known;
+    const bool fast = n_known > 0 && strcmp(known_ssid, ssid_arg) == 0;
     aic_wifi_scan_list_t list;
-    if (run_scan_and_wait(conn, (const uint8_t *)ssid_arg, (uint8_t)ssid_len, &list, err_buf, err_cap) != 0) {
-        return 1;
-    }
-
     const aic_wifi_scan_bss_t *target = NULL;
-    for (uint16_t i = 0U; i < list.count; ++i) {
-        if (list.bss[i].ssid_len == ssid_len &&
-            memcmp(list.bss[i].ssid, ssid_arg, ssid_len) == 0) {
-            target = &list.bss[i];
-            break;
+    for (int pass = fast ? 0 : 1; pass < 2 && !target; ++pass) {
+        printf("[1/4] Scanning for \"%s\"%s...\n", ssid_arg, pass == 0 ? " (known channels)" : "");
+        if (run_scan_and_wait(conn, (const uint8_t *)ssid_arg, (uint8_t)ssid_len,
+                              pass == 0 ? known_freqs : NULL, pass == 0 ? n_known : 0,
+                              &list, err_buf, err_cap) != 0) {
+            return 1;
         }
+        /* list is RSSI-sorted; prefer 5 GHz unless it is >15 dB weaker or below -75 dBm */
+        int best = -1000;
+        n_known = 0;
+        for (uint16_t i = 0U; i < list.count; ++i) {
+            const aic_wifi_scan_bss_t *b = &list.bss[i];
+            if (b->ssid_len != ssid_len || memcmp(b->ssid, ssid_arg, ssid_len) != 0) continue;
+            const int score = b->rssi + ((b->freq >= 5000U && b->rssi > -75) ? 15 : 0);
+            if (score > best) { best = score; target = b; }
+            bool dup = false;
+            for (int k = 0; k < n_known; ++k) dup |= known_freqs[k] == b->freq;
+            if (!dup && n_known < 8) known_freqs[n_known++] = b->freq;
+        }
+        snprintf(known_ssid, sizeof(known_ssid), "%s", ssid_arg);
     }
     if (!target) {
         set_err(err_buf, err_cap, "Network \"%s\" not found", ssid_arg);
@@ -313,8 +330,8 @@ static int perform_connect(io_connect_t conn,
     }
 
     bool assoc_ok = false;
-    for (int i = 0; i < 60; ++i) {
-        usleep(100000);
+    for (int i = 0; i < 300; ++i) {
+        usleep(20000);
         if (uc_get_status(conn, &st) == KERN_SUCCESS) {
             if (st.associated) {
                 assoc_ok = true;
@@ -781,7 +798,7 @@ static void execute_pending_scan(io_connect_t conn) {
     }
     aic_wifi_scan_list_t list;
     char err[160] = {0};
-    if (run_scan_and_wait(conn, NULL, 0U, &list, err, sizeof(err)) != 0) {
+    if (run_scan_and_wait(conn, NULL, 0U, NULL, 0, &list, err, sizeof(err)) != 0) {
         build_err_json(err[0] ? err : "Scan failed", g_pending_cmd.json_reply, sizeof(g_pending_cmd.json_reply));
         return;
     }
@@ -1082,7 +1099,7 @@ static bool handle_daemon_pending_command(io_connect_t conn,
         } else {
             aic_wifi_scan_list_t list;
             char err[160] = {0};
-            if (run_scan_and_wait(conn, NULL, 0U, &list, err, sizeof(err)) != 0) {
+            if (run_scan_and_wait(conn, NULL, 0U, NULL, 0, &list, err, sizeof(err)) != 0) {
                 build_err_json(err[0] ? err : "Scan failed", reply, sizeof(reply));
             } else {
                 build_scan_json(&list, reply, sizeof(reply));

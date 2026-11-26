@@ -339,9 +339,11 @@ static int bring_up_lmac(void) {
     }
     g.vif_idx = addif_cfm.inst_nbr;
 
-    /* shortcut: RX A-MPDU disabled so no BlockAck reorder is needed; port aic8800_reord.h if throughput is poor. */
+    /* shortcut: RX A-MPDU disabled so no BlockAck reorder is needed; port aic8800_reord.h if throughput is poor.
+       TX A-MPDU stays on: the firmware handles it alone, and without it uplink is capped near 15 Mbit/s. */
     aic_mm_set_agg_disable_req_t agg = {0};
     aic_build_d80_agg_disable_req(&agg);
+    agg.disable = 0;
     CMD(AIC_MM_SET_AGG_DISABLE_REQ, AIC_TASK_MM, &agg, AIC_MM_SET_AGG_DISABLE_CFM, (uint8_t *)NULL);
 
     g.lmac_ready = true;
@@ -621,7 +623,8 @@ kern_return_t uc_get_status(io_connect_t conn, aic_wifi_status_t *o) {
     return KERN_SUCCESS;
 }
 
-kern_return_t uc_start_scan(io_connect_t conn, const uint8_t *ssid, uint8_t ssid_len) {
+kern_return_t uc_start_scan(io_connect_t conn, const uint8_t *ssid, uint8_t ssid_len,
+                            const uint16_t *freqs, int n_freqs) {
     (void)conn;
     if (!g.lmac_ready) return kIOReturnNotReady;
     pthread_mutex_lock(&g.state_lock);
@@ -633,6 +636,13 @@ kern_return_t uc_start_scan(io_connect_t conn, const uint8_t *ssid, uint8_t ssid
 
     aic_scanu_start_req_t req;
     aic_build_scanu_start_req(&req, g.vif_idx, g.is_5g != 0, ssid_len ? ssid : NULL, ssid_len, false);
+    if (n_freqs > 0) { /* keep only the requested channels (with their band/flags from the full list) */
+        uint8_t k = 0;
+        for (uint8_t i = 0; i < req.chan_cnt; ++i)
+            for (int j = 0; j < n_freqs; ++j)
+                if (req.chan[i].freq == freqs[j]) { req.chan[k++] = req.chan[i]; break; }
+        if (k > 0) req.chan_cnt = k;
+    }
     kern_return_t r = send_cmd(AIC_SCANU_START_REQ, AIC_TASK_SCANU, &req, sizeof(req),
                                AIC_SCANU_START_CFM_ADDTIONAL, NULL, 0, NULL);
     if (r != KERN_SUCCESS) {

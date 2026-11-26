@@ -21,7 +21,9 @@ int  open_wifi_client(io_connect_t *out_conn, io_service_t *out_svc, bool quiet,
 void get_bsd_name(io_service_t svc, char *buf, size_t cap);
 
 kern_return_t uc_get_status(io_connect_t conn, aic_wifi_status_t *out);
-kern_return_t uc_start_scan(io_connect_t conn, const uint8_t *ssid, uint8_t ssid_len);
+/* freqs/n_freqs: restrict the scan to these channels (n_freqs == 0: all channels) */
+kern_return_t uc_start_scan(io_connect_t conn, const uint8_t *ssid, uint8_t ssid_len,
+                            const uint16_t *freqs, int n_freqs);
 kern_return_t uc_get_scan_results(io_connect_t conn, aic_wifi_scan_list_t *out);
 kern_return_t uc_connect(io_connect_t conn, const aic_wifi_connect_req_t *in_req, aic_wifi_connect_req_t *out_resp);
 kern_return_t uc_disconnect(io_connect_t conn, uint16_t reason);
