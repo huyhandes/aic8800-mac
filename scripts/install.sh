@@ -18,8 +18,13 @@ USER_UID=$(id -u "$USER_NAME")
 USER_HOME=$(dscl . -read "/Users/$USER_NAME" NFSHomeDirectory | awk '{print $2}')
 AGENT="$USER_HOME/Library/LaunchAgents/$MENU_LABEL.plist"
 
-for l in "${LABELS[@]}"; do launchctl bootout "system/$l" 2>/dev/null || true; done
-launchctl bootout "gui/$USER_UID/$MENU_LABEL" 2>/dev/null || true
+# bootout returns before the job is gone; bootstrapping it again too early fails with "5: Input/output error"
+unload() {
+  launchctl bootout "$1" 2>/dev/null || true
+  for _ in {1..20}; do launchctl print "$1" >/dev/null 2>&1 || return 0; sleep 0.5; done
+}
+for l in "${LABELS[@]}"; do unload "system/$l"; done
+unload "gui/$USER_UID/$MENU_LABEL"
 pkill -x AIC8800Menu 2>/dev/null || true
 
 if [[ "${1:-}" == "--uninstall" ]]; then
