@@ -91,9 +91,14 @@ static int usb_bulk_out(uint8_t ep, uint16_t mps, const uint8_t *buf, int len, u
 }
 
 /* Host side link state mirrors the WiFi link so configd (Network UI) runs DHCP / shows status. */
+/* feth link status follows peering, not up/down: unpeer on WiFi loss so configd sees link-down and
+   re-runs DHCP on the next network (otherwise it keeps the previous SSID's lease). */
 static void set_host_link(bool up) {
     if (g.bpf_fd < 0) return;
+    char *p[] = { "ifconfig", AICD_IF_HOST, "peer", AICD_IF_PEER, NULL };
+    char *np[] = { "ifconfig", AICD_IF_HOST, "-peer", NULL };
     char *a[] = { "ifconfig", AICD_IF_HOST, up ? "up" : "down", NULL };
+    (void)run_cmd("/sbin/ifconfig", up ? p : np);
     (void)run_cmd("/sbin/ifconfig", a);
 }
 
@@ -437,8 +442,8 @@ static int setup_feth(void) {
     char *c2[] = { "ifconfig", AICD_IF_PEER, "create", NULL };
     (void)run_cmd("/sbin/ifconfig", c1);
     (void)run_cmd("/sbin/ifconfig", c2);
-    char *c3[] = { "ifconfig", AICD_IF_HOST, "peer", AICD_IF_PEER, NULL };
-    (void)run_cmd("/sbin/ifconfig", c3); /* already peered -> EEXIST */
+    char *c3[] = { "ifconfig", AICD_IF_HOST, "-peer", NULL };
+    (void)run_cmd("/sbin/ifconfig", c3); /* start link-down; set_host_link() peers once WiFi is up */
     char *c4[] = { "ifconfig", AICD_IF_HOST, "lladdr", mac, "down", NULL }; /* up only once WiFi link is up */
     char *c5[] = { "ifconfig", AICD_IF_PEER, "up", NULL };
     if (run_cmd("/sbin/ifconfig", c4) != 0 || run_cmd("/sbin/ifconfig", c5) != 0) {
@@ -667,6 +672,7 @@ kern_return_t uc_connect(io_connect_t conn, const aic_wifi_connect_req_t *in, ai
     memcpy(g.target_ssid, in->ssid, in->ssid_len);
     memset(g.ap_bssid, 0, 6);
     pthread_mutex_unlock(&g.state_lock);
+    set_host_link(false);
 
     aic_sm_connect_req_t r;
     memset(&r, 0, sizeof(r));
@@ -700,6 +706,7 @@ kern_return_t uc_disconnect(io_connect_t conn, uint16_t reason) {
     g.associated = g.link_up = false;
     g.eapol_head = g.eapol_tail = g.eapol_count = 0;
     pthread_mutex_unlock(&g.state_lock);
+    set_host_link(false);
     if (was) {
         aic_me_set_control_port_req_t p = { sta, 0 };
         (void)send_cmd(AIC_ME_SET_CONTROL_PORT_REQ, AIC_TASK_ME, &p, sizeof(p), AIC_ME_SET_CONTROL_PORT_CFM, NULL, 0, NULL);
