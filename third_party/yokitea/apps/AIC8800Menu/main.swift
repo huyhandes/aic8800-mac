@@ -1,5 +1,6 @@
 import Cocoa
 import Darwin
+import Security
 
 private let kSockPath = "/var/run/aic8800_wifi.sock"
 private let kLoginAgentLabel = "com.aic8800mac.menu"
@@ -52,6 +53,34 @@ struct ScanResponse: Decodable {
 struct BasicResponse: Decodable {
     let ok: Bool
     let error: String?
+}
+
+// Per-SSID passphrases in the user's login keychain (the daemon only keeps the one auto-join profile).
+private func keychainQuery(_ ssid: String) -> [String: Any] {
+    return [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.aic8800mac.wifi",
+            kSecAttrAccount as String: ssid]
+}
+
+private func keychainPassword(_ ssid: String) -> String? {
+    var q = keychainQuery(ssid)
+    q[kSecReturnData as String] = true
+    q[kSecMatchLimit as String] = kSecMatchLimitOne
+    var out: CFTypeRef?
+    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
+    return String(data: d, encoding: .utf8)
+}
+
+private func keychainSave(_ ssid: String, _ pass: String) {
+    SecItemDelete(keychainQuery(ssid) as CFDictionary)
+    var q = keychainQuery(ssid)
+    q[kSecValueData as String] = Data(pass.utf8)
+    q[kSecAttrLabel as String] = "AIC8800 Wi-Fi: \(ssid)"
+    SecItemAdd(q as CFDictionary, nil)
+}
+
+private func keychainDelete(_ ssid: String) {
+    SecItemDelete(keychainQuery(ssid) as CFDictionary)
 }
 
 private func hexEncode(_ s: String) -> String {
@@ -318,7 +347,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func performConnect(ssid: String, passphrase: String?, save: Bool) {
+    /// keychainSec != nil: passphrase came from the keychain; if it is rejected, drop it and ask again.
+    private func performConnect(ssid: String, passphrase: String?, save: Bool, keychainSec: String? = nil) {
         let ssidHex = hexEncode(ssid)
         let passHex = (passphrase != nil && !passphrase!.isEmpty) ? hexEncode(passphrase!) : "-"
         let saveFlag = save ? 1 : 0
@@ -332,9 +362,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 switch res {
                 case .success(let data):
                     if let resp = try? JSONDecoder().decode(BasicResponse.self, from: data), !resp.ok {
-                        self?.actionMessage = resp.error ?? "Connection failed"
+                        let err = resp.error ?? "Connection failed"
+                        self?.actionMessage = err
+                        if err == "Wrong password", let sec = keychainSec {
+                            keychainDelete(ssid)
+                            self?.actionMessage = "Wrong saved password for \"\(ssid)\""
+                            self?.promptForPassword(ssid: ssid, secLabel: sec, allowEditSsid: false)
+                        }
                     } else {
                         self?.actionMessage = nil
+                        if save, let p = passphrase, !p.isEmpty { keychainSave(ssid, p) }
                     }
                 case .failure(let err):
                     self?.actionMessage = err.localizedDescription
@@ -496,6 +533,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func onForget() {
+        if let s = currentStatus?.saved_ssid, !s.isEmpty { keychainDelete(s) }
         sendSimpleAction("FORGET", timeoutSec: 8)
     }
 
@@ -503,6 +541,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let bss = sender.representedObject as? ScanBss else { return }
         if bss.open {
             performConnect(ssid: bss.ssid, passphrase: nil, save: true)
+            return
+        }
+        if let pw = keychainPassword(bss.ssid) {
+            performConnect(ssid: bss.ssid, passphrase: pw, save: true, keychainSec: bss.sec)
             return
         }
         promptForPassword(ssid: bss.ssid, secLabel: bss.sec, allowEditSsid: false)

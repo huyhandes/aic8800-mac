@@ -345,6 +345,7 @@ static int perform_connect(io_connect_t conn,
         aic_wpa2_ctx_init(wpa_ctx, st.mac_addr, st.ap_bssid, pmk, rsn_ie, (uint8_t)rsn_ie_len, pw, grp);
 
         bool keys_installed = false;
+        bool replied = false; /* msg2 sent: AP silence after it means its MIC (i.e. the PSK) was wrong */
         for (int i = 0; i < 600 && !keys_installed; ++i) {
             aic_wifi_eapol_frame_t rx_frame;
             if (uc_poll_eapol(conn, &rx_frame) == KERN_SUCCESS && rx_frame.has_frame) {
@@ -361,13 +362,14 @@ static int perform_connect(io_connect_t conn,
                                                          &keys_ready,
                                                          &gtk_rekey);
                 if (hrc < 0) {
-                    set_err(err_buf, err_cap, "EAPOL MIC/handshake mismatch (check password)");
+                    set_err(err_buf, err_cap, "Wrong password");
                     fprintf(stderr, "error: EAPOL handshake/MIC failure\n");
                     (void)uc_disconnect(conn, 3U);
                     return 1;
                 }
                 if (hrc == 1 && reply_len > 0U) {
                     kr = uc_send_eapol(conn, reply_eth, reply_len);
+                    replied = true;
                     if (kr != KERN_SUCCESS) {
                         set_err(err_buf, err_cap, "SEND_EAPOL failed: 0x%08x", kr);
                         fprintf(stderr, "error: SEND_EAPOL failed: 0x%08x\n", kr);
@@ -401,7 +403,7 @@ static int perform_connect(io_connect_t conn,
         }
 
         if (!keys_installed) {
-            set_err(err_buf, err_cap, "4-Way Handshake timed out (wrong password?)");
+            set_err(err_buf, err_cap, replied ? "Wrong password" : "4-Way Handshake timed out (no reply from AP)");
             fprintf(stderr, "error: timed out waiting for 4-way handshake\n");
             (void)uc_disconnect(conn, 3U);
             return 1;
@@ -1125,10 +1127,6 @@ static bool handle_daemon_pending_command(io_connect_t conn,
         pthread_mutex_unlock(&g_state_lock);
         finish_pending_cmd_locked("{\"ok\":true}\n");
     } else if (local.kind == CMD_CONNECT) {
-        if (local.save_profile) {
-            (void)save_profile(local.ssid, local.has_pass ? local.pass : NULL);
-            sync_saved_ssid_snapshot();
-        }
         snprintf(g_active_ssid, sizeof(g_active_ssid), "%s", local.ssid);
         if (local.has_pass) {
             snprintf(g_active_pass, sizeof(g_active_pass), "%s", local.pass);
@@ -1178,9 +1176,14 @@ static bool handle_daemon_pending_command(io_connect_t conn,
         pthread_mutex_unlock(&g_state_lock);
 
         if (rc == 0) {
+            if (local.save_profile) { /* only after success, so a mistyped password never becomes the auto-join profile */
+                (void)save_profile(local.ssid, local.has_pass ? local.pass : NULL);
+                sync_saved_ssid_snapshot();
+            }
             *connected_now = true;
             finish_pending_cmd_locked("{\"ok\":true}\n");
         } else {
+            if (strcmp(err, "Wrong password") == 0) g_has_active_target = false; /* retrying cannot help */
             build_err_json(err[0] ? err : "Connection failed", reply, sizeof(reply));
             finish_pending_cmd_locked(reply);
         }
