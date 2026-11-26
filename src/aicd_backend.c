@@ -130,9 +130,33 @@ static void on_eth(const uint8_t *eth, size_t len, const aic_rx_frame_meta_t *me
     }
 }
 
+/* RX diagnostics: where data chunks go (logged every 10 s when changed) */
+static struct { uint64_t chunks, emitted, zero, err, mpdu, ga, decr[8], last_sum; time_t last_log; } rxs;
+
+static void log_rx_stats(void) {
+    time_t now = time(NULL);
+    uint64_t sum = rxs.chunks + g.tx_pkts;
+    if (now - rxs.last_log < 10 || sum == rxs.last_sum) return;
+    rxs.last_log = now;
+    rxs.last_sum = sum;
+    fprintf(stderr, "aicd: rx chunks=%llu eth=%llu skip=%llu err=%llu mpdu=%llu group=%llu decr[unenc/tkip/ccmp]=%llu/%llu/%llu eth_out=%llu eapol=%llu tx=%llu\n",
+            rxs.chunks, rxs.emitted, rxs.zero, rxs.err, rxs.mpdu, rxs.ga,
+            rxs.decr[AIC_RX_HD_DECR_UNENC], rxs.decr[AIC_RX_HD_DECR_TKIP], rxs.decr[AIC_RX_HD_DECR_CCMP128],
+            g.rx_pkts, g.eapol_total, g.tx_pkts);
+}
+
 static void on_data_chunk(const uint8_t *chunk, size_t len, void *ctx) {
     (void)ctx;
-    (void)aic_rx_chunk_to_eth_frames(chunk, len, g.rx_eth_scratch, sizeof(g.rx_eth_scratch), on_eth, NULL);
+    rxs.chunks++;
+    if (len >= sizeof(aic_hw_rxhdr_t)) {
+        aic_hw_rxhdr_t h;
+        memcpy(&h, chunk, sizeof(h));
+        rxs.decr[h.hwvect.decr_status & 7]++;
+        rxs.mpdu += h.flags_is_80211_mpdu;
+        rxs.ga += h.hwvect.ga_frame;
+    }
+    int n = aic_rx_chunk_to_eth_frames(chunk, len, g.rx_eth_scratch, sizeof(g.rx_eth_scratch), on_eth, NULL);
+    if (n > 0) rxs.emitted += (uint64_t)n; else if (n == 0) rxs.zero++; else rxs.err++;
 }
 
 static void on_cfg_pkt(uint8_t type, const uint8_t *payload, size_t len, void *ctx) {
@@ -169,6 +193,7 @@ static void *rx_thread(void *arg) {
             continue;
         }
         if (got >= 4) (void)aic_rx_demux_usb_aggr(buf, (size_t)got, on_data_chunk, on_cfg_pkt, NULL);
+        log_rx_stats();
     }
     free(buf);
     return NULL;
