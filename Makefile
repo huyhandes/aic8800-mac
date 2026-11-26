@@ -43,6 +43,10 @@ pkg: all
 	cp -R build/AIC8800Menu.app $(PKGROOT)/Applications/
 	install -m 755 build/aic8800_fwload build/aic8800_wifi build/aic_netsvc build/libusb-1.0.0.dylib scripts/install.sh $(PKGROOT)/Library/PrivilegedHelperTools/aic8800-mac/
 	cp -R fw/aic8800D80 "$(PKGROOT)/Library/Application Support/AIC8800/fw/"
+	install -d "$(PKGROOT)/Library/Application Support/AIC8800/licenses"
+	install -m 644 LICENSE "$(PKGROOT)/Library/Application Support/AIC8800/licenses/LICENSE"
+	install -m 644 third_party/yokitea/LICENSE "$(PKGROOT)/Library/Application Support/AIC8800/licenses/yokitea-LICENSE"
+	install -m 644 $$(pkg-config --variable=prefix libusb-1.0)/COPYING "$(PKGROOT)/Library/Application Support/AIC8800/licenses/libusb-COPYING"
 	printf '#!/bin/bash\nexec /Library/PrivilegedHelperTools/aic8800-mac/install.sh --setup\n' > build/pkgscripts/postinstall
 	chmod 755 build/pkgscripts/postinstall
 	pkgbuild --analyze --root $(PKGROOT) build/components.plist
