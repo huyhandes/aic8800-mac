@@ -1216,8 +1216,11 @@ static void on_boot_usb_matched(void *refcon, io_iterator_t iterator) {
             }
         }
     }
-    if (!ctx->initial_arming && relevant > 0U && !g_stop_requested) {
+    /* port: a fresh plug can outlast one cycle (mass storage still mounting) -> retry while still in boot stages */
+    for (int attempt = 0; attempt < 3 && !ctx->initial_arming && relevant > 0U && !g_stop_requested; attempt++) {
         dispatch_daemon_cycle(ctx, AIC_FWLOAD_TRIGGER_USB_MATCH);
+        if (!any_stage0_present(NULL) && !usb_vid_pid_present(AIC_USB_VID_AICS_BOOT, AIC_USB_PID_BOOTLOADER)) break;
+        sleep(2);
     }
 }
 

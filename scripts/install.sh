@@ -56,7 +56,7 @@ plist() { # label, args...
   chmod 644 "/Library/LaunchDaemons/$label.plist"
   launchctl bootstrap system "/Library/LaunchDaemons/$label.plist"
 }
-plist com.aic8800mac.fwload "$BIN/aic8800_fwload" --daemon --fw-dir "$SUP/fw/aic8800D80" --post-wake-delay-ms 1200
+plist com.aic8800mac.fwload "$BIN/aic8800_fwload" --daemon --fw-dir "$SUP/fw/aic8800D80" --post-wake-delay-ms 1200 --usb-settle-timeout-ms 8000
 plist com.aic8800mac.wifi "$BIN/aic8800_wifi" --daemon
 chmod 644 /var/log/com.aic8800mac.wifi.log 2>/dev/null || true # readable from the app's "Open Wi-Fi Log"
 
