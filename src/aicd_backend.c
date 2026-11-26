@@ -273,8 +273,7 @@ static void LIBUSB_CALL rx_done(struct libusb_transfer *t) {
     else if (t->status != LIBUSB_TRANSFER_COMPLETED) usleep(10000); /* transient error: don't spin */
     if (g.stopping) return;
     int rc = libusb_submit_transfer(t);
-    if (rc == LIBUSB_ERROR_NO_DEVICE) device_gone();
-    if (rc != 0) { fprintf(stderr, "aicd: RX resubmit failed: %s\n", libusb_error_name(rc)); exit(1); }
+    if (rc != 0) { fprintf(stderr, "aicd: RX resubmit failed: %s\n", libusb_error_name(rc)); device_gone(); }
 }
 
 static void *rx_thread(void *arg) {
@@ -649,6 +648,12 @@ int open_wifi_client(io_connect_t *out_conn, io_service_t *out_svc, bool quiet, 
         pthread_mutex_init(&g.state_lock, NULL);
         pthread_mutex_init(&g.tx_lock, NULL);
         aic_lmac_cmd_matcher_init(&g.matcher);
+        /* a previous run may have died with feth80 still peered (unplug can surface as PIPE, not
+           NO_DEVICE); drop it so Network UI stops showing a live link while no dongle is present */
+        char *np[] = { "ifconfig", AICD_IF_HOST, "-peer", NULL };
+        char *dn[] = { "ifconfig", AICD_IF_HOST, "down", NULL };
+        (void)run_cmd("/sbin/ifconfig", np);
+        (void)run_cmd("/sbin/ifconfig", dn);
         inited = true;
     }
 
