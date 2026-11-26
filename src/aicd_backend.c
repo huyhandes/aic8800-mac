@@ -56,6 +56,7 @@ typedef struct {
     uint32_t chip_id, lmac_ver, fw_features;
     uint8_t vendor_info;
     uint8_t fw_version[64];
+    uint8_t hw_keys[8], n_hw_keys; /* installed by uc_add_key; deleted before the next connect */
     aic_wifi_scan_bss_t scan_bss[AIC_WIFI_MAX_SCAN_BSS];
     uint16_t scan_count;
     aic_wifi_eapol_frame_t eapol_ring[AIC_WIFI_EAPOL_RING_CAP];
@@ -662,6 +663,14 @@ kern_return_t uc_connect(io_connect_t conn, const aic_wifi_connect_req_t *in, ai
     *out = *in;
     out->out_status = 0xFF;
 
+    /* stale keys from the previous association make the next 4-way handshake fail (AP never sends msg3);
+       Linux deletes them via wpa_supplicant del_key on disconnect */
+    for (uint8_t i = 0; i < g.n_hw_keys; ++i) {
+        aic_mm_key_del_req_t d = { g.hw_keys[i] };
+        (void)send_cmd(AIC_MM_KEY_DEL_REQ, AIC_TASK_MM, &d, sizeof(d), AIC_MM_KEY_DEL_CFM, NULL, 0, NULL);
+    }
+    g.n_hw_keys = 0;
+
     pthread_mutex_lock(&g.state_lock);
     g.associated = g.link_up = false;
     g.assoc_status = 0xFFFF;
@@ -756,7 +765,11 @@ kern_return_t uc_add_key(io_connect_t conn, uint8_t key_idx, bool pairwise, uint
     kern_return_t ret = send_cmd(AIC_MM_KEY_ADD_REQ, AIC_TASK_MM, &r, sizeof(r), AIC_MM_KEY_ADD_CFM, &cfm, sizeof(cfm), &l);
     if (ret != KERN_SUCCESS) return ret;
     if (out_hw_idx) *out_hw_idx = cfm.hw_key_idx;
-    return (l >= sizeof(cfm) && cfm.status == 0) ? KERN_SUCCESS : kIOReturnIOError;
+    if (l < sizeof(cfm) || cfm.status != 0) return kIOReturnIOError;
+    bool known = false; /* GTK rekeys reuse the same hw slot */
+    for (uint8_t i = 0; i < g.n_hw_keys; ++i) known |= g.hw_keys[i] == cfm.hw_key_idx;
+    if (!known && g.n_hw_keys < sizeof(g.hw_keys)) g.hw_keys[g.n_hw_keys++] = cfm.hw_key_idx;
+    return KERN_SUCCESS;
 }
 
 kern_return_t uc_set_port_link(io_connect_t conn, bool open_port, bool link_up) {
