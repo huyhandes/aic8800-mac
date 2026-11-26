@@ -51,7 +51,7 @@ pkg: all
 	chmod 755 build/pkgscripts/postinstall
 	pkgbuild --analyze --root $(PKGROOT) build/components.plist
 	plutil -replace 0.BundleIsRelocatable -bool NO build/components.plist
-	pkgbuild --root $(PKGROOT) --component-plist build/components.plist --scripts build/pkgscripts --identifier com.aic8800mac.pkg --version 1.0 --ownership recommended --install-location / build/AIC8800-mac.pkg
+	pkgbuild --root $(PKGROOT) --component-plist build/components.plist --scripts build/pkgscripts --identifier com.aic8800mac.pkg --version 1.0.1 --ownership recommended --install-location / build/AIC8800-mac.pkg
 .PHONY: pkg
 
 clean:
