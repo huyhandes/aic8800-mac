@@ -11,6 +11,9 @@ if ! ioreg -p IOUSB -l | grep -q '"idProduct" = 36229'; then
   "$ROOT/build/aic8800_fwload" --once --fw-dir "$ROOT/fw/aic8800D80" --lock-file /tmp/aicfw.lock
 fi
 
+# network service on feth80 = shows in System Settings > Network; configd does DHCP when link goes up
+"$ROOT/build/aic_netsvc" install
+
 read -rsp "Passphrase for $SSID: " PASS; echo
 trap 'ifconfig feth80 destroy 2>/dev/null || true; ifconfig feth81 destroy 2>/dev/null || true' EXIT
-"$ROOT/build/aic8800_wifi" connect "$SSID" ${PASS:+"$PASS"} --stay
+"$ROOT/build/aic8800_wifi" connect "$SSID" ${PASS:+"$PASS"} --no-dhcp --stay

@@ -4,7 +4,11 @@ INC      = -Ithird_party/yokitea/common -Isrc
 USB      = $(shell pkg-config --cflags --libs libusb-1.0)
 FW       = -framework IOKit -framework CoreFoundation
 
-all: build/aic8800_fwload build/aic8800_wifi
+all: build/aic8800_fwload build/aic8800_wifi build/aic_netsvc
+
+build/aic_netsvc: src/aic_netsvc.c src/aicd_backend.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(INC) $< -o $@ -framework SystemConfiguration $(FW)
 
 build/aic8800_fwload: third_party/yokitea/fwload/main.c
 	@mkdir -p build

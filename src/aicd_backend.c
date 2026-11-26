@@ -90,6 +90,13 @@ static int usb_bulk_out(uint8_t ep, uint16_t mps, const uint8_t *buf, int len, u
     return rc;
 }
 
+/* Host side link state mirrors the WiFi link so configd (Network UI) runs DHCP / shows status. */
+static void set_host_link(bool up) {
+    if (g.bpf_fd < 0) return;
+    char *a[] = { "ifconfig", AICD_IF_HOST, up ? "up" : "down", NULL };
+    (void)run_cmd("/sbin/ifconfig", a);
+}
+
 /* ------------------------------------------------------------- RX path */
 
 static void on_async_ind(uint16_t id, const uint8_t *param, uint16_t len, void *ctx);
@@ -375,6 +382,7 @@ static void on_async_ind(uint16_t id, const uint8_t *param, uint16_t len, void *
         g.eapol_head = g.eapol_tail = g.eapol_count = 0;
         pthread_mutex_unlock(&g.state_lock);
         fprintf(stderr, "aicd: SM_DISCONNECT_IND reason=%u\n", ind.reason_code);
+        set_host_link(false);
     }
 }
 
@@ -407,7 +415,7 @@ static int setup_feth(void) {
     (void)run_cmd("/sbin/ifconfig", c2);
     char *c3[] = { "ifconfig", AICD_IF_HOST, "peer", AICD_IF_PEER, NULL };
     (void)run_cmd("/sbin/ifconfig", c3); /* already peered -> EEXIST */
-    char *c4[] = { "ifconfig", AICD_IF_HOST, "lladdr", mac, "up", NULL };
+    char *c4[] = { "ifconfig", AICD_IF_HOST, "lladdr", mac, "down", NULL }; /* up only once WiFi link is up */
     char *c5[] = { "ifconfig", AICD_IF_PEER, "up", NULL };
     if (run_cmd("/sbin/ifconfig", c4) != 0 || run_cmd("/sbin/ifconfig", c5) != 0) {
         fprintf(stderr, "aicd: feth setup failed (need root)\n");
@@ -725,6 +733,8 @@ kern_return_t uc_set_port_link(io_connect_t conn, bool open_port, bool link_up) 
     if (ret != KERN_SUCCESS) return ret;
     pthread_mutex_lock(&g.state_lock);
     g.link_up = link_up && g.associated;
+    bool up = g.link_up;
     pthread_mutex_unlock(&g.state_lock);
+    set_host_link(up);
     return KERN_SUCCESS;
 }
