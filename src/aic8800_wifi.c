@@ -12,6 +12,8 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -1208,6 +1210,41 @@ static bool handle_daemon_pending_command(io_connect_t conn,
     return true;
 }
 
+/* System sleep: an associated dongle keeps receiving frames and wakes the Mac over USB within seconds
+   (pmset log: "Wake ... due to USB2_wake"). Drop the WiFi link before sleep, rejoin on wake. */
+static volatile bool g_sys_sleeping = false;
+static io_connect_t  g_pm_root      = IO_OBJECT_NULL;
+
+static void on_power(void *ref, io_service_t svc, natural_t msg, void *arg) {
+    (void)ref; (void)svc;
+    if (msg == kIOMessageCanSystemSleep) {
+        IOAllowPowerChange(g_pm_root, (long)arg);
+    } else if (msg == kIOMessageSystemWillSleep) {
+        g_sys_sleeping = true;
+        fprintf(stderr, "notice: system sleep, dropping Wi-Fi link\n");
+        (void)uc_disconnect(IO_OBJECT_NULL, 3U);
+        IOAllowPowerChange(g_pm_root, (long)arg);
+    } else if (msg == kIOMessageSystemHasPoweredOn && g_sys_sleeping) {
+        g_sys_sleeping = false;
+        fprintf(stderr, "notice: system wake, rejoining Wi-Fi\n");
+        wake_daemon_loop();
+    }
+}
+
+static void *power_thread(void *arg) {
+    (void)arg;
+    IONotificationPortRef port = NULL;
+    io_object_t notifier = IO_OBJECT_NULL;
+    g_pm_root = IORegisterForSystemPower(NULL, &port, on_power, &notifier);
+    if (g_pm_root == IO_OBJECT_NULL) {
+        fprintf(stderr, "warning: IORegisterForSystemPower failed; dongle may wake the Mac from sleep\n");
+        return NULL;
+    }
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), IONotificationPortGetRunLoopSource(port), kCFRunLoopDefaultMode);
+    CFRunLoopRun();
+    return NULL;
+}
+
 static int run_daemon(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
@@ -1226,6 +1263,9 @@ static int run_daemon(void) {
     if (g_ctrl_listen_fd >= 0 && pthread_create(&ctrl_thread, NULL, control_socket_thread, NULL) == 0) {
         ctrl_thread_started = true;
     }
+
+    pthread_t pm_thread;
+    if (pthread_create(&pm_thread, NULL, power_thread, NULL) == 0) pthread_detach(pm_thread);
 
     sync_saved_ssid_snapshot();
     printf("aic8800_wifi daemon starting (profile=%s, sock=%s)\n", AIC_WIFI_CONF_PATH, AIC_WIFI_SOCK_PATH);
@@ -1278,7 +1318,7 @@ static int run_daemon(void) {
 
         bool auto_paused = false;
         pthread_mutex_lock(&g_state_lock);
-        auto_paused = g_snap_auto_paused;
+        auto_paused = g_snap_auto_paused || g_sys_sleeping;
         pthread_mutex_unlock(&g_state_lock);
 
         char target_ssid[36] = {0};
