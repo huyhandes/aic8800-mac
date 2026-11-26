@@ -26,6 +26,7 @@
 #include "aic8800_abi.h"
 #include "aic8800_framing.h"
 #include "aic8800_lmac.h"
+#include "aic8800_reord.h"
 
 extern char **environ;
 
@@ -91,10 +92,13 @@ static int usb_bulk_out(uint8_t ep, uint16_t mps, const uint8_t *buf, int len, u
     return rc;
 }
 
+static void reord_reset(void);
+
 /* Host side link state mirrors the WiFi link so configd (Network UI) runs DHCP / shows status. */
 /* feth link status follows peering, not up/down: unpeer on WiFi loss so configd sees link-down and
    re-runs DHCP on the next network (otherwise it keeps the previous SSID's lease). */
 static void set_host_link(bool up) {
+    if (!up) reord_reset(); /* frames buffered for the old link must not leak into the next one */
     if (g.bpf_fd < 0) return;
     char *p[] = { "ifconfig", AICD_IF_HOST, "peer", AICD_IF_PEER, NULL };
     char *np[] = { "ifconfig", AICD_IF_HOST, "-peer", NULL };
@@ -123,17 +127,85 @@ static void enqueue_eapol(const uint8_t *eth, size_t len) {
     pthread_mutex_unlock(&g.state_lock);
 }
 
+static void deliver_eth(const uint8_t *eth, size_t len) {
+    if (!g.link_up || g.bpf_fd < 0 || len < 14U) return;
+    /* BPF write on the peer = frame received by the host interface. */
+    if (write(g.bpf_fd, eth, len) == (ssize_t)len) {
+        g.rx_pkts++;
+    }
+}
+
+/* RX BlockAck reorder: A-MPDU subframes can arrive out of order (retries), TCP needs them in order.
+   Frames waiting in the window are copies from a fixed pool; rx_lock guards pool + window because
+   libusb may run RX callbacks on any thread that handles events (sync bulk transfers do too). */
+#define REORD_POOL 512
+typedef struct rpkt { struct rpkt *next; uint16_t len; uint8_t data[AIC_DATA_BUF_MAX]; } rpkt_t;
+static rpkt_t rpool[REORD_POOL], *rfree;
+static aic_rx_reord_t reord;
+static pthread_mutex_t rx_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool reord_pending;
+static struct timespec reord_armed;
+
+static void rpkt_drop(void *head, void *ctx) {
+    (void)ctx;
+    for (rpkt_t *p = head, *n; p; p = n) { n = p->next; p->next = rfree; rfree = p; }
+}
+static void rpkt_deliver(void *head, uint32_t bytes, void *ctx) {
+    (void)bytes;
+    for (rpkt_t *p = head; p; p = p->next) deliver_eth(p->data, p->len);
+    rpkt_drop(head, ctx);
+}
+static void rpkt_append(void *tail, void *pkt) { ((rpkt_t *)tail)->next = pkt; }
+
+static void reord_reset(void) {
+    pthread_mutex_lock(&rx_lock);
+    aic_rx_reord_flush_all(&reord, true, NULL, rpkt_drop, NULL);
+    aic_rx_reord_init(&reord);
+    reord_pending = false;
+    pthread_mutex_unlock(&rx_lock);
+}
+
+static double since_ms(const struct timespec *t) {
+    struct timespec n;
+    clock_gettime(CLOCK_MONOTONIC, &n);
+    return (double)(n.tv_sec - t->tv_sec) * 1e3 + (double)(n.tv_nsec - t->tv_nsec) / 1e6;
+}
+
+/* rx_thread tick: release frames stuck behind a lost subframe after AIC_REORD_TIMEOUT_MS */
+static void reord_tick(void) {
+    pthread_mutex_lock(&rx_lock);
+    if (reord_pending && since_ms(&reord_armed) >= AIC_REORD_TIMEOUT_MS) {
+        reord_pending = aic_rx_reord_timeout_flush(&reord, rpkt_deliver, NULL);
+        if (reord_pending) clock_gettime(CLOCK_MONOTONIC, &reord_armed);
+    }
+    pthread_mutex_unlock(&rx_lock);
+}
+
+/* called with rx_lock held (from on_data_chunk) */
 static void on_eth(const uint8_t *eth, size_t len, const aic_rx_frame_meta_t *meta, void *ctx) {
     (void)ctx;
     if (meta && meta->is_eapol) {
         enqueue_eapol(eth, len);
         return;
     }
-    if (!g.link_up || g.bpf_fd < 0 || len < 14U) return;
-    /* BPF write on the peer = frame received by the host interface. */
-    if (write(g.bpf_fd, eth, len) == (ssize_t)len) {
-        g.rx_pkts++;
+    if (!meta || !meta->is_qos || len > AIC_DATA_BUF_MAX) { deliver_eth(eth, len); return; }
+    if (!meta->need_reord) {
+        /* firmware says this TID has no BA session: anything buffered for it is stale */
+        if (reord.tids[meta->tid & 7].pending_count) aic_rx_reord_flush_tid(&reord, meta->tid, false, rpkt_deliver, rpkt_drop, NULL);
+        deliver_eth(eth, len);
+        return;
     }
+    rpkt_t *p = rfree;
+    if (!p) { deliver_eth(eth, len); return; } /* pool exhausted: deliver unordered rather than drop */
+    rfree = p->next;
+    p->next = NULL;
+    p->len = (uint16_t)len;
+    memcpy(p->data, eth, len);
+    bool timer = false;
+    aic_rx_reord_submit(&reord, meta->tid, meta->seq_num, p, (uint32_t)len, meta->amsdu_sub_idx > 0,
+                        rpkt_deliver, rpkt_append, rpkt_drop, NULL, &timer);
+    if (timer && !reord_pending) clock_gettime(CLOCK_MONOTONIC, &reord_armed);
+    reord_pending = reord_pending || timer; /* timer is per-TID; reord_tick() clears it once all TIDs drain */
 }
 
 /* RX diagnostics: where data chunks go (logged every 10 s when changed) */
@@ -145,10 +217,10 @@ static void log_rx_stats(void) {
     if (now - rxs.last_log < 10 || sum == rxs.last_sum) return;
     rxs.last_log = now;
     rxs.last_sum = sum;
-    fprintf(stderr, "aicd: rx chunks=%llu eth=%llu skip=%llu err=%llu mpdu=%llu group=%llu decr[unenc/tkip/ccmp]=%llu/%llu/%llu eth_out=%llu eapol=%llu tx=%llu\n",
+    fprintf(stderr, "aicd: rx chunks=%llu eth=%llu skip=%llu err=%llu mpdu=%llu group=%llu decr[unenc/tkip/ccmp]=%llu/%llu/%llu eth_out=%llu eapol=%llu tx=%llu reord[buf/dup/tmo]=%llu/%llu/%llu\n",
             rxs.chunks, rxs.emitted, rxs.zero, rxs.err, rxs.mpdu, rxs.ga,
             rxs.decr[AIC_RX_HD_DECR_UNENC], rxs.decr[AIC_RX_HD_DECR_TKIP], rxs.decr[AIC_RX_HD_DECR_CCMP128],
-            g.rx_pkts, g.eapol_total, g.tx_pkts);
+            g.rx_pkts, g.eapol_total, g.tx_pkts, reord.buffered_reorders, reord.dup_drops, reord.timeout_flushes);
 }
 
 static void on_data_chunk(const uint8_t *chunk, size_t len, void *ctx) {
@@ -161,7 +233,9 @@ static void on_data_chunk(const uint8_t *chunk, size_t len, void *ctx) {
         rxs.mpdu += h.flags_is_80211_mpdu;
         rxs.ga += h.hwvect.ga_frame;
     }
+    pthread_mutex_lock(&rx_lock);
     int n = aic_rx_chunk_to_eth_frames(chunk, len, g.rx_eth_scratch, sizeof(g.rx_eth_scratch), on_eth, NULL);
+    pthread_mutex_unlock(&rx_lock);
     if (n > 0) rxs.emitted += (uint64_t)n; else if (n == 0) rxs.zero++; else rxs.err++;
 }
 
@@ -181,27 +255,45 @@ static void on_cfg_pkt(uint8_t type, const uint8_t *payload, size_t len, void *c
     }
 }
 
+static void device_gone(void) {
+    /* unplugged: dongle returns to stage 0; exit so launchd restarts us for the next plug */
+    fprintf(stderr, "aicd: device gone, exiting\n");
+    set_host_link(false);
+    exit(1);
+}
+
+/* Several IN transfers stay queued so the dongle can push the next chunk while we process the last one
+   (a single synchronous read left the bus idle between frames and capped RX near 25 Mbit/s).
+   libusb completes transfers of one endpoint in submission order, so the stream stays ordered. */
+#define RX_XFERS 4
+static void LIBUSB_CALL rx_done(struct libusb_transfer *t) {
+    if (t->status == LIBUSB_TRANSFER_NO_DEVICE) device_gone();
+    if (t->status == LIBUSB_TRANSFER_COMPLETED && t->actual_length >= 4)
+        (void)aic_rx_demux_usb_aggr(t->buffer, (size_t)t->actual_length, on_data_chunk, on_cfg_pkt, NULL);
+    else if (t->status != LIBUSB_TRANSFER_COMPLETED) usleep(10000); /* transient error: don't spin */
+    if (g.stopping) return;
+    int rc = libusb_submit_transfer(t);
+    if (rc == LIBUSB_ERROR_NO_DEVICE) device_gone();
+    if (rc != 0) { fprintf(stderr, "aicd: RX resubmit failed: %s\n", libusb_error_name(rc)); exit(1); }
+}
+
 static void *rx_thread(void *arg) {
     (void)arg;
-    uint8_t *buf = malloc(RX_BUF_BYTES);
-    while (buf && !g.stopping) {
-        int got = 0;
-        int rc = libusb_bulk_transfer(g.h, g.ep_in, buf, RX_BUF_BYTES, &got, 500);
-        if (rc == LIBUSB_ERROR_TIMEOUT && got == 0) continue;
-        if (rc != 0 && rc != LIBUSB_ERROR_TIMEOUT) {
-            if (rc == LIBUSB_ERROR_NO_DEVICE) {
-                /* unplugged: dongle returns to stage 0; exit so launchd restarts us for the next plug */
-                fprintf(stderr, "aicd: device gone, exiting\n");
-                set_host_link(false);
-                exit(1);
-            }
-            usleep(10000);
-            continue;
-        }
-        if (got >= 4) (void)aic_rx_demux_usb_aggr(buf, (size_t)got, on_data_chunk, on_cfg_pkt, NULL);
+    for (int i = 0; i < RX_XFERS; ++i) {
+        struct libusb_transfer *t = libusb_alloc_transfer(0);
+        uint8_t *buf = malloc(RX_BUF_BYTES);
+        if (!t || !buf) exit(1);
+        libusb_fill_bulk_transfer(t, g.h, g.ep_in, buf, RX_BUF_BYTES, rx_done, NULL, 0);
+        int rc = libusb_submit_transfer(t);
+        if (rc == LIBUSB_ERROR_NO_DEVICE) device_gone();
+        if (rc != 0) { fprintf(stderr, "aicd: RX submit failed: %s\n", libusb_error_name(rc)); exit(1); }
+    }
+    while (!g.stopping) {
+        struct timeval tv = { 0, reord_pending ? 10000 : 500000 };
+        (void)libusb_handle_events_timeout_completed(g.ctx, &tv, NULL);
+        reord_tick();
         log_rx_stats();
     }
-    free(buf);
     return NULL;
 }
 
@@ -339,11 +431,10 @@ static int bring_up_lmac(void) {
     }
     g.vif_idx = addif_cfm.inst_nbr;
 
-    /* shortcut: RX A-MPDU disabled so no BlockAck reorder is needed; port aic8800_reord.h if throughput is poor.
-       TX A-MPDU stays on: the firmware handles it alone, and without it uplink is capped near 15 Mbit/s. */
+    /* TX + RX A-MPDU on; RX order is restored by the reorder window in on_eth(). AICD_NO_RX_AGG=1 turns RX agg off. */
     aic_mm_set_agg_disable_req_t agg = {0};
-    aic_build_d80_agg_disable_req(&agg);
-    agg.disable = 0;
+    aic_build_d80_agg_enable_req(&agg);
+    if (getenv("AICD_NO_RX_AGG")) agg.disable_rx = 1;
     CMD(AIC_MM_SET_AGG_DISABLE_REQ, AIC_TASK_MM, &agg, AIC_MM_SET_AGG_DISABLE_CFM, (uint8_t *)NULL);
 
     g.lmac_ready = true;
@@ -562,6 +653,8 @@ int open_wifi_client(io_connect_t *out_conn, io_service_t *out_svc, bool quiet, 
     }
 
     if (usb_open(quiet) != 0) return -1; /* not plugged / firmware not loaded yet: caller retries */
+    for (int i = 0; i < REORD_POOL; ++i) { rpool[i].next = rfree; rfree = &rpool[i]; }
+    reord_reset();
     if (pthread_create(&g.rx_thr, NULL, rx_thread, NULL) != 0) exit(1);
     if (bring_up_lmac() != 0) {
         fprintf(stderr, "error: LMAC bring-up failed (replug dongle and reload firmware)\n");
