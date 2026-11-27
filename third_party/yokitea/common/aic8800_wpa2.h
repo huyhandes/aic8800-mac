@@ -238,10 +238,10 @@ static inline int aic_wpa2_compute_eapol_mic(uint16_t key_ver,
                                              uint8_t mic_out[16]) {
     if (!kck || !eapol_pdu || !mic_out ||
         eapol_len < AIC_EAPOL_HDR_LEN + AIC_EAPOL_KEY_BODY_MIN_LEN ||
-        eapol_len > AIC_WIFI_EAPOL_MAX_FRAME) {
+        eapol_len > WIFI_EAPOL_MAX_FRAME) {
         return -1;
     }
-    uint8_t copy[AIC_WIFI_EAPOL_MAX_FRAME];
+    uint8_t copy[WIFI_EAPOL_MAX_FRAME];
     memcpy(copy, eapol_pdu, eapol_len);
     memset(&copy[AIC_EAPOL_HDR_LEN + 77U], 0, 16U);
 

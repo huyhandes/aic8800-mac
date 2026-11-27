@@ -6,19 +6,18 @@
 #                  scripts/install.sh --uninstall
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN=/Library/PrivilegedHelperTools/aic8800-mac
-SUP="/Library/Application Support/AIC8800"
+BIN=/Library/PrivilegedHelperTools/usbwifi
+SUP="/Library/Application Support/USB Wifi"
 APP="/Applications/USB Wifi.app"
-OLD_APP=/Applications/AIC8800Menu.app # 1.0.x name
-LABELS=(com.aic8800mac.fwload com.aic8800mac.wifi)
-MENU_LABEL=com.aic8800mac.menu
+LABELS=(com.usbwifi.wifi)
+MENU_LABEL=com.usbwifi.menu
 [[ $EUID -eq 0 ]] || { echo "need root" >&2; exit 1; }
 
 USER_NAME=$(stat -f %Su /dev/console)
 USER_UID=$(id -u "$USER_NAME")
 USER_HOME=$(dscl . -read "/Users/$USER_NAME" NFSHomeDirectory | awk '{print $2}')
 AGENT="$USER_HOME/Library/LaunchAgents/$MENU_LABEL.plist"
-CD_LABEL=com.aic8800mac.cdswitch
+CD_LABEL=com.usbwifi.cdswitch
 CD_AGENT="/Library/LaunchAgents/$CD_LABEL.plist"
 
 # bootout returns before the job is gone; bootstrapping it again too early fails with "5: Input/output error"
@@ -29,17 +28,28 @@ unload() {
 for l in "${LABELS[@]}"; do unload "system/$l"; done
 unload "gui/$USER_UID/$MENU_LABEL"
 unload "gui/$USER_UID/$CD_LABEL"
-pkill -x AIC8800Menu 2>/dev/null || true
 pkill -x USBWifi 2>/dev/null || true
-rm -rf "$OLD_APP"
+
+# older installs used com.aic8800mac.* / aic8800-mac: remove them so two daemons never fight over the dongle
+OLD=com.aic8800mac
+OLD_SUP="/Library/Application Support/AIC8800"
+for l in fwload wifi; do unload "system/$OLD.$l"; rm -f "/Library/LaunchDaemons/$OLD.$l.plist"; done
+for l in menu cdswitch; do unload "gui/$USER_UID/$OLD.$l"; done
+rm -f "$USER_HOME/Library/LaunchAgents/$OLD.menu.plist" "/Library/LaunchAgents/$OLD.cdswitch.plist"
+pkill -x AIC8800Menu 2>/dev/null || true
+[[ -f "$OLD_SUP/wifi.conf" && ! -f "$SUP/wifi.conf" ]] && install -d -m 755 "$SUP" && mv "$OLD_SUP/wifi.conf" "$SUP/"
+rm -rf /Library/PrivilegedHelperTools/aic8800-mac "$OLD_SUP" /Applications/AIC8800Menu.app
+for p in $OLD.pkg $OLD.pkg.aic8800 $OLD.pkg.rtl8852bu $OLD.pkg.setup; do pkgutil --forget "$p" >/dev/null 2>&1 || true; done
 
 if [[ "${1:-}" == "--uninstall" ]]; then
-  [[ -x "$BIN/aic_netsvc" ]] && "$BIN/aic_netsvc" remove || true
+  for s in {0..15}; do # one network service + feth pair per adapter slot
+    [[ -x "$BIN/usbwifi_netsvc" ]] && "$BIN/usbwifi_netsvc" remove - "feth$((80 + 2 * s))" >/dev/null || true
+    ifconfig "feth$((80 + 2 * s))" destroy 2>/dev/null || true
+    ifconfig "feth$((81 + 2 * s))" destroy 2>/dev/null || true
+  done
   for l in "${LABELS[@]}"; do rm -f "/Library/LaunchDaemons/$l.plist"; done
-  rm -rf "$BIN" "$SUP" "$APP" "$OLD_APP" "$AGENT" "$CD_AGENT"
-  ifconfig feth80 destroy 2>/dev/null || true
-  ifconfig feth81 destroy 2>/dev/null || true
-  for p in com.aic8800mac.pkg com.aic8800mac.pkg.aic8800 com.aic8800mac.pkg.rtl8852bu com.aic8800mac.pkg.setup; do
+  rm -rf "$BIN" "$SUP" "$APP" "$AGENT" "$CD_AGENT" /var/run/usbwifi
+  for p in com.usbwifi.pkg com.usbwifi.pkg.aic8800 com.usbwifi.pkg.rtl8852bu com.usbwifi.pkg.setup; do
     pkgutil --forget "$p" >/dev/null 2>&1 || true
   done
   echo "uninstalled"
@@ -49,15 +59,15 @@ fi
 if [[ "${1:-}" != "--setup" ]]; then
   [[ -d "$ROOT/build/USBWifi.app" ]] || { echo "run make first" >&2; exit 1; }
   install -d -m 755 "$BIN" "$SUP/fw"
-  install -S -m 755 "$ROOT"/build/{aic8800_fwload,aic8800_wifi,aic_netsvc,libusb-1.0.0.dylib} "$BIN/"
+  install -S -m 755 "$ROOT"/build/{usbwifid,usbwifi_netsvc,libusb-1.0.0.dylib} "$BIN/"
   rm -rf "$SUP/fw/aic8800D80" "$SUP/fw/rtw89" "$APP"
   for d in aic8800D80 rtw89; do [[ -d "$ROOT/fw/$d" ]] && cp -R "$ROOT/fw/$d" "$SUP/fw/"; done
   cp -R "$ROOT/build/USBWifi.app" "$APP"
 fi
 
 # 1.0.x named the service after one vendor; recreate it under the neutral name
-networksetup -listallnetworkservices 2>/dev/null | grep -qx 'UGREEN WiFi' && "$BIN/aic_netsvc" remove
-"$BIN/aic_netsvc" install
+networksetup -listallnetworkservices 2>/dev/null | grep -qx 'UGREEN WiFi' && "$BIN/usbwifi_netsvc" remove
+"$BIN/usbwifi_netsvc" install
 
 plist() { # label, args...
   local label=$1; shift
@@ -71,14 +81,10 @@ plist() { # label, args...
   chmod 644 "/Library/LaunchDaemons/$label.plist"
   launchctl bootstrap system "/Library/LaunchDaemons/$label.plist"
 }
-# the AIC8800 firmware loader only when that driver was chosen (the RTL8852BU driver lives in aic8800_wifi)
-if [[ -x "$BIN/aic8800_fwload" && -d "$SUP/fw/aic8800D80" ]]; then
-  plist com.aic8800mac.fwload "$BIN/aic8800_fwload" --daemon --fw-dir "$SUP/fw/aic8800D80" --post-wake-delay-ms 1200 --usb-settle-timeout-ms 8000
-else
-  rm -f /Library/LaunchDaemons/com.aic8800mac.fwload.plist
-fi
-plist com.aic8800mac.wifi "$BIN/aic8800_wifi" --daemon
-chmod 644 /var/log/com.aic8800mac.wifi.log 2>/dev/null || true # readable from the app's "Open Wi-Fi Log"
+# usbwifid runs one worker per plugged dongle (each adds its own "USB Wi-Fi N" service), plus the
+# AIC8800D80 firmware loader when $SUP/fw/aic8800D80 is installed
+plist com.usbwifi.wifi "$BIN/usbwifid" --daemon
+chmod 644 /var/log/com.usbwifi.wifi.log 2>/dev/null || true # readable from the app's "Open Wi-Fi Log"
 
 # Realtek dongles boot as a "driver CD" (0bda:1a2b). Its USB interface sits behind the per-user Removable
 # Volumes permission, which a daemon can never hold, so launchd runs the eject in the console user's session
@@ -89,7 +95,7 @@ if [[ -d "$SUP/fw/rtw89" ]]; then
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>$CD_LABEL</string>
-<key>ProgramArguments</key><array><string>$BIN/aic8800_wifi</string><string>cd-eject</string></array>
+<key>ProgramArguments</key><array><string>$BIN/usbwifid</string><string>cd-eject</string></array>
 <key>LimitLoadToSessionType</key><string>Aqua</string>
 <key>LaunchEvents</key><dict><key>com.apple.iokit.matching</key><dict><key>$CD_LABEL.realtek</key><dict>
 <key>IOProviderClass</key><string>IOUSBHostDevice</string>
@@ -118,4 +124,4 @@ PL
 chown "$USER_NAME" "$AGENT"
 launchctl bootstrap "gui/$USER_UID" "$AGENT" || launchctl asuser "$USER_UID" open "$APP"
 
-echo "installed. logs: /var/log/com.aic8800mac.{fwload,wifi}.log"
+echo "installed. log: /var/log/com.usbwifi.wifi.log"

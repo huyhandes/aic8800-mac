@@ -10,19 +10,19 @@
         <line choice="setup"/>
     </choices-outline>
     <choice id="core" title="USB Wifi app and daemon" description="Menu bar app (network list, Keychain passwords) and the Wi-Fi daemon. Required." enabled="false" selected="true">
-        <pkg-ref id="com.aic8800mac.pkg"/>
+        <pkg-ref id="com.usbwifi.pkg"/>
     </choice>
-    <choice id="aic8800" title="AIC8800D80 driver" description="UGREEN and other AIC8800D80 dongles: firmware loader and AICSemi firmware.">
-        <pkg-ref id="com.aic8800mac.pkg.aic8800"/>
+    <choice id="aic8800" title="AIC8800D80 driver" description="UGREEN and other AIC8800D80 dongles: AICSemi firmware.">
+        <pkg-ref id="com.usbwifi.pkg.aic8800"/>
     </choice>
     <choice id="rtl8852bu" title="RTL8852BU driver" description="TP-Link Archer TX20U Nano and other RTL8852BU dongles: Realtek firmware for the rtw89 port.">
-        <pkg-ref id="com.aic8800mac.pkg.rtl8852bu"/>
+        <pkg-ref id="com.usbwifi.pkg.rtl8852bu"/>
     </choice>
     <choice id="setup" visible="false" selected="true" enabled="false">
-        <pkg-ref id="com.aic8800mac.pkg.setup"/>
+        <pkg-ref id="com.usbwifi.pkg.setup"/>
     </choice>
-    <pkg-ref id="com.aic8800mac.pkg">core.pkg</pkg-ref>
-    <pkg-ref id="com.aic8800mac.pkg.aic8800">aic8800.pkg</pkg-ref>
-    <pkg-ref id="com.aic8800mac.pkg.rtl8852bu">rtl8852bu.pkg</pkg-ref>
-    <pkg-ref id="com.aic8800mac.pkg.setup">setup.pkg</pkg-ref>
+    <pkg-ref id="com.usbwifi.pkg">core.pkg</pkg-ref>
+    <pkg-ref id="com.usbwifi.pkg.aic8800">aic8800.pkg</pkg-ref>
+    <pkg-ref id="com.usbwifi.pkg.rtl8852bu">rtl8852bu.pkg</pkg-ref>
+    <pkg-ref id="com.usbwifi.pkg.setup">setup.pkg</pkg-ref>
 </installer-gui-script>

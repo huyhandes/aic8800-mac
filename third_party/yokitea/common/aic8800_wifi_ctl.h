@@ -15,13 +15,13 @@
 extern "C" {
 #endif
 
-#define AIC_WIFI_CTL_VERSION        1U
-#define AIC_WIFI_USERCLIENT_TYPE    0x41494357U /* "AICW" */
+#define WIFI_CTL_VERSION        1U
+#define WIFI_USERCLIENT_TYPE    0x41494357U /* "AICW" */
 
-#define AIC_WIFI_MAX_SCAN_BSS       64U
-#define AIC_WIFI_EAPOL_RING_CAP     16U
-#define AIC_WIFI_EAPOL_MAX_FRAME    1600U
-#define AIC_WIFI_CONNECT_IE_MAX     256U
+#define WIFI_MAX_SCAN_BSS       64U
+#define WIFI_EAPOL_RING_CAP     16U
+#define WIFI_EAPOL_MAX_FRAME    1600U
+#define WIFI_CONNECT_IE_MAX     256U
 
 /* Firmware AC / TID defaults for STA data & EAPOL frames (rwnx_txq.h) */
 #define AIC_RWNX_HWQ_BE             1U
@@ -46,7 +46,7 @@ enum aic_mac_cipher_suite {
 };
 
 /* Security capability bitmask extracted from Beacon/ProbeResp IEs */
-enum aic_wifi_sec_bits {
+enum wifi_sec_bits {
     AIC_SEC_OPEN      = 0U,
     AIC_SEC_PRIVACY   = (1U << 0U),
     AIC_SEC_WPA_PSK   = (1U << 1U),
@@ -60,17 +60,17 @@ enum aic_wifi_sec_bits {
 };
 
 /* IOUserClient external method selectors */
-enum aic_wifi_uc_selector {
-    AIC_WIFI_UC_GET_STATUS       = 0U,
-    AIC_WIFI_UC_START_SCAN       = 1U,
-    AIC_WIFI_UC_GET_SCAN_RESULTS = 2U,
-    AIC_WIFI_UC_CONNECT          = 3U,
-    AIC_WIFI_UC_DISCONNECT       = 4U,
-    AIC_WIFI_UC_POLL_EAPOL       = 5U,
-    AIC_WIFI_UC_SEND_EAPOL       = 6U,
-    AIC_WIFI_UC_ADD_KEY          = 7U,
-    AIC_WIFI_UC_SET_PORT_LINK    = 8U,
-    AIC_WIFI_UC_METHOD_COUNT     = 9U,
+enum wifi_uc_selector {
+    WIFI_UC_GET_STATUS       = 0U,
+    WIFI_UC_START_SCAN       = 1U,
+    WIFI_UC_GET_SCAN_RESULTS = 2U,
+    WIFI_UC_CONNECT          = 3U,
+    WIFI_UC_DISCONNECT       = 4U,
+    WIFI_UC_POLL_EAPOL       = 5U,
+    WIFI_UC_SEND_EAPOL       = 6U,
+    WIFI_UC_ADD_KEY          = 7U,
+    WIFI_UC_SET_PORT_LINK    = 8U,
+    WIFI_UC_METHOD_COUNT     = 9U,
 };
 
 typedef struct {
@@ -109,7 +109,7 @@ typedef struct {
     uint8_t  ap_bssid[AIC_MAC_ADDR_LEN];
     uint8_t  ssid[AIC_MAC_SSID_LEN];
     uint8_t  fw_version[64];
-} aic_wifi_status_t;
+} wifi_status_t;
 
 typedef struct {
     uint8_t ssid_len;
@@ -117,7 +117,7 @@ typedef struct {
     uint8_t no_cck;
     uint8_t reserved;
     uint8_t ssid[AIC_MAC_SSID_LEN];
-} aic_wifi_scan_req_t;
+} wifi_scan_req_t;
 
 typedef struct {
     uint8_t  bssid[AIC_MAC_ADDR_LEN];
@@ -133,15 +133,15 @@ typedef struct {
     uint8_t  ssid[AIC_MAC_SSID_LEN];
     uint16_t rsn_capab;
     uint16_t pad;
-} aic_wifi_scan_bss_t; /* 56 bytes */
+} wifi_scan_bss_t; /* 56 bytes */
 
 typedef struct {
     uint16_t            count;
     uint8_t             scanning;
     uint8_t             scan_done;
     uint32_t            reserved;
-    aic_wifi_scan_bss_t bss[AIC_WIFI_MAX_SCAN_BSS];
-} aic_wifi_scan_list_t; /* 8 + 64*56 = 3592 bytes <= 4096 inline IOKit limit */
+    wifi_scan_bss_t bss[WIFI_MAX_SCAN_BSS];
+} wifi_scan_list_t; /* 8 + 64*56 = 3592 bytes <= 4096 inline IOKit limit */
 
 typedef struct {
     uint8_t  ssid_len;
@@ -154,22 +154,22 @@ typedef struct {
     uint16_t ctrl_port_ethertype; /* network byte order (htons(0x888E)) */
     uint8_t  bssid[AIC_MAC_ADDR_LEN];
     uint8_t  ssid[AIC_MAC_SSID_LEN];
-    uint8_t  ie_buf[AIC_WIFI_CONNECT_IE_MAX];
+    uint8_t  ie_buf[WIFI_CONNECT_IE_MAX];
     uint8_t  out_status;
     uint8_t  pad[3];
-} aic_wifi_connect_req_t;
+} wifi_connect_req_t;
 
 typedef struct {
     uint16_t reason_code;
     uint16_t reserved;
-} aic_wifi_disconnect_req_t;
+} wifi_disconnect_req_t;
 
 typedef struct {
     uint16_t len;
     uint8_t  has_frame;
     uint8_t  reserved;
-    uint8_t  data[AIC_WIFI_EAPOL_MAX_FRAME];
-} aic_wifi_eapol_frame_t;
+    uint8_t  data[WIFI_EAPOL_MAX_FRAME];
+} wifi_eapol_frame_t;
 
 typedef struct {
     uint8_t key_idx;
@@ -180,19 +180,19 @@ typedef struct {
     uint8_t out_hw_key_idx;
     uint8_t out_status;
     uint8_t reserved[2];
-} aic_wifi_key_req_t;
+} wifi_key_req_t;
 
 typedef struct {
     uint8_t control_port_open;
     uint8_t link_up;
     uint8_t reserved[2];
-} aic_wifi_port_req_t;
+} wifi_port_req_t;
 
-AIC_STATIC_ASSERT(sizeof(aic_wifi_status_t) <= 4096U, "status fits inline UserClient");
-AIC_STATIC_ASSERT(sizeof(aic_wifi_scan_bss_t) == 56U, "scan_bss packed 56B");
-AIC_STATIC_ASSERT(sizeof(aic_wifi_scan_list_t) <= 4096U, "scan_list MUST fit 4096B inline UserClient");
-AIC_STATIC_ASSERT(sizeof(aic_wifi_connect_req_t) <= 4096U, "connect_req fits inline UserClient");
-AIC_STATIC_ASSERT(sizeof(aic_wifi_eapol_frame_t) <= 4096U, "eapol_frame fits inline UserClient");
+AIC_STATIC_ASSERT(sizeof(wifi_status_t) <= 4096U, "status fits inline UserClient");
+AIC_STATIC_ASSERT(sizeof(wifi_scan_bss_t) == 56U, "scan_bss packed 56B");
+AIC_STATIC_ASSERT(sizeof(wifi_scan_list_t) <= 4096U, "scan_list MUST fit 4096B inline UserClient");
+AIC_STATIC_ASSERT(sizeof(wifi_connect_req_t) <= 4096U, "connect_req fits inline UserClient");
+AIC_STATIC_ASSERT(sizeof(wifi_eapol_frame_t) <= 4096U, "eapol_frame fits inline UserClient");
 
 static inline uint8_t aic_rsn_cipher_suite_to_mac(const uint8_t suite[4]) {
     /* OUI 00-0F-AC (RSN) or 00-50-F2 (WPA) */
@@ -218,7 +218,7 @@ static inline uint8_t aic_rsn_cipher_suite_to_mac(const uint8_t suite[4]) {
  */
 static inline void aic_parse_rsn_ie_body(const uint8_t *body,
                                          size_t body_len,
-                                         aic_wifi_scan_bss_t *out) {
+                                         wifi_scan_bss_t *out) {
     if (!body || !out || body_len < 2U) {
         return;
     }
@@ -293,7 +293,7 @@ static inline void aic_parse_rsn_ie_body(const uint8_t *body,
  */
 static inline int aic_parse_scanu_result_ind(const uint8_t *param,
                                              size_t param_len,
-                                             aic_wifi_scan_bss_t *out) {
+                                             wifi_scan_bss_t *out) {
     if (!param || !out || param_len < sizeof(aic_scanu_result_ind_hdr_t)) {
         return -1;
     }

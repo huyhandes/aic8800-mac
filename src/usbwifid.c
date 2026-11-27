@@ -1,13 +1,14 @@
 /*
- * aic8800_wifi.c - User-space Wi-Fi scan/connect/auto-daemon & WPA2-PSK CLI
+ * usbwifid.c - User-space Wi-Fi scan/connect/auto-daemon & WPA2-PSK CLI
  *
  * Connects to AIC8800WiFiUserClient (admin privilege required) via pure public
  * IOKit + CoreFoundation + CommonCrypto APIs.
  *
- * In --daemon mode, exposes a local root:admin (0660) UNIX domain control
- * socket at /var/run/aic8800_wifi.sock so an unprivileged desktop Menu Bar
- * app (AIC8800Menu.app) can query status, scan, connect, save, and disconnect
- * without sudo prompts while keeping wifi.conf root-only (0600).
+ * --daemon is a supervisor: it keeps one "--worker" process per plugged dongle plus one more that waits
+ * for the next dongle. Each worker drives one dongle and exposes a root:admin (0660) UNIX domain
+ * control socket at /var/run/usbwifi/<slot>.sock, so an unprivileged desktop Menu Bar app
+ * (USB Wifi.app) can query status, scan, connect, save, and disconnect without sudo prompts while
+ * keeping the saved profile root-only (0600).
  */
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -34,18 +35,24 @@
 #include <sys/ucred.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <dirent.h>
+#include <net/if.h>
 #include <unistd.h>
+#include <mach-o/dyld.h>
 #include <xpc/xpc.h>
 
 #include "aic8800_abi.h"
 #include "aic8800_wifi_ctl.h"
 #include "aic8800_wpa2.h"
-#include "aicd_backend.h" /* port: in-process libusb backend replaces the kext */
+#include "usbwifi_core.h" /* in-process station core + chip drivers replace the kext */
 #include "rtwd.h"
 
-#define AIC_WIFI_CONF_DIR  "/Library/Application Support/AIC8800"
-#define AIC_WIFI_CONF_PATH "/Library/Application Support/AIC8800/wifi.conf"
-#define AIC_WIFI_SOCK_PATH "/var/run/aic8800_wifi.sock"
+/* per adapter slot: slot 0 keeps the single-dongle wifi.conf, slot N uses wifi-N.conf */
+static char g_conf_path[PATH_MAX] = WIFI_CONF_DIR "/wifi.conf";
+/* shortcut: the CLI always talks to slot 0, add a --slot flag when someone drives several from a shell */
+static char g_sock_path[104] = WIFI_RUN_DIR "/0.sock";
+#define WIFI_CONF_PATH g_conf_path
+#define WIFI_SOCK_PATH g_sock_path
 #define AIC_IPC_BUF_SIZE   32768U
 
 extern char **environ;
@@ -55,6 +62,33 @@ static volatile sig_atomic_t g_keep_running = 1;
 static void on_sigterm(int sig) {
     (void)sig;
     g_keep_running = 0;
+}
+
+/* AIC8800D80 firmware loader (third_party/yokitea/fwload), linked in as the "fwload" subcommand */
+int aic_fwload_main(int argc, char **argv);
+#define AIC_FWLOAD_DIR WIFI_CONF_DIR "/fw/aic8800D80"
+static volatile pid_t g_fwload_pid = 0;
+
+/* Keeps "usbwifid fwload --daemon" running beside the daemon (one launchd job instead of two). It is
+   spawned, not just forked: CoreFoundation aborts in a forked child that does not exec. */
+static void *fwload_thread(void *arg) {
+    (void)arg;
+    char self[PATH_MAX];
+    uint32_t n = sizeof(self);
+    if (_NSGetExecutablePath(self, &n) != 0) return NULL;
+    char *av[] = { self, "fwload", "--daemon", "--fw-dir", AIC_FWLOAD_DIR,
+                   "--post-wake-delay-ms", "1200", "--usb-settle-timeout-ms", "8000", NULL };
+    while (g_keep_running) {
+        pid_t pid;
+        if (posix_spawn(&pid, self, NULL, NULL, av, environ) == 0) {
+            g_fwload_pid = pid;
+            int st;
+            while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+            g_fwload_pid = 0;
+        }
+        if (g_keep_running) sleep(5); /* same throttle launchd used to apply */
+    }
+    return NULL;
 }
 
 static void set_err(char *err_buf, size_t err_cap, const char *fmt, ...) {
@@ -70,7 +104,7 @@ static void set_err(char *err_buf, size_t err_cap, const char *fmt, ...) {
 
 static int trigger_dhcp(const char *bsd) {
     if (bsd && strncmp(bsd, "feth", 4) == 0) {
-        return 0; /* port: the feth80 network service (aic_netsvc) runs DHCP via configd */
+        return 0; /* port: the feth80 network service (usbwifi_netsvc) runs DHCP via configd */
     }
     if (!bsd || strcmp(bsd, "unknown") == 0 || strncmp(bsd, "en", 2) != 0) {
         return -1;
@@ -89,8 +123,8 @@ static int trigger_dhcp(const char *bsd) {
 
 
 static int cmp_bss_rssi_desc(const void *a, const void *b) {
-    const aic_wifi_scan_bss_t *ba = (const aic_wifi_scan_bss_t *)a;
-    const aic_wifi_scan_bss_t *bb = (const aic_wifi_scan_bss_t *)b;
+    const wifi_scan_bss_t *ba = (const wifi_scan_bss_t *)a;
+    const wifi_scan_bss_t *bb = (const wifi_scan_bss_t *)b;
     if (ba->rssi > bb->rssi) return -1;
     if (ba->rssi < bb->rssi) return 1;
     return 0;
@@ -121,10 +155,10 @@ static int run_scan_and_wait(io_connect_t conn,
                              uint8_t ssid_len,
                              const uint16_t *freqs,
                              int n_freqs,
-                             aic_wifi_scan_list_t *out_list,
+                             wifi_scan_list_t *out_list,
                              char *err_buf,
                              size_t err_cap) {
-    kern_return_t kr = uc_start_scan(conn, ssid, ssid_len, freqs, n_freqs);
+    kern_return_t kr = wifi_start_scan(conn, ssid, ssid_len, freqs, n_freqs);
     if (kr != KERN_SUCCESS) {
         set_err(err_buf, err_cap, "START_SCAN failed: 0x%08x", kr);
         fprintf(stderr, "error: START_SCAN failed: 0x%08x\n", kr);
@@ -133,7 +167,7 @@ static int run_scan_and_wait(io_connect_t conn,
 
     for (int i = 0; i < 3000; ++i) {
         usleep(2000);
-        kr = uc_get_scan_results(conn, out_list);
+        kr = wifi_get_scan_results(conn, out_list);
         if (kr != KERN_SUCCESS) {
             set_err(err_buf, err_cap, "GET_SCAN_RESULTS failed: 0x%08x", kr);
             fprintf(stderr, "error: GET_SCAN_RESULTS failed: 0x%08x\n", kr);
@@ -145,20 +179,20 @@ static int run_scan_and_wait(io_connect_t conn,
     }
 
     if (out_list->count > 1U) {
-        qsort(out_list->bss, out_list->count, sizeof(aic_wifi_scan_bss_t), cmp_bss_rssi_desc);
+        qsort(out_list->bss, out_list->count, sizeof(wifi_scan_bss_t), cmp_bss_rssi_desc);
     }
     return 0;
 }
 
 static int cmd_status(io_connect_t conn, io_service_t svc) {
-    aic_wifi_status_t st;
-    const kern_return_t kr = uc_get_status(conn, &st);
+    wifi_status_t st;
+    const kern_return_t kr = wifi_get_status(conn, &st);
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "error: GET_STATUS failed: 0x%08x\n", kr);
         return 1;
     }
     char bsd[32];
-    get_bsd_name(svc, bsd, sizeof(bsd));
+    wifi_ifname(svc, bsd, sizeof(bsd));
 
     char ssid_str[33] = {0};
     if (st.ssid_len > 0U && st.ssid_len <= 32U) {
@@ -187,7 +221,7 @@ static int cmd_status(io_connect_t conn, io_service_t svc) {
 }
 
 static int cmd_scan(io_connect_t conn) {
-    aic_wifi_scan_list_t list;
+    wifi_scan_list_t list;
     char err[160] = {0};
     if (run_scan_and_wait(conn, NULL, 0U, NULL, 0, &list, err, sizeof(err)) != 0) {
         return 1;
@@ -196,7 +230,7 @@ static int cmd_scan(io_connect_t conn) {
     printf("Scan %s: found %u BSS\n", list.scan_done ? "complete" : "partial", list.count);
     printf("%-32s  %-17s  %-5s  %-4s  %s\n", "SSID", "BSSID", "FREQ", "RSSI", "SECURITY");
     for (uint16_t i = 0U; i < list.count; ++i) {
-        const aic_wifi_scan_bss_t *b = &list.bss[i];
+        const wifi_scan_bss_t *b = &list.bss[i];
         char ssid_str[33] = "<hidden>";
         if (b->ssid_len > 0U && b->ssid_len <= 32U) {
             memcpy(ssid_str, b->ssid, b->ssid_len);
@@ -231,8 +265,8 @@ static int perform_connect(io_connect_t conn,
         return 1;
     }
 
-    aic_wifi_status_t st;
-    if (uc_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready) {
+    wifi_status_t st;
+    if (wifi_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready) {
         set_err(err_buf, err_cap, "LMAC firmware not ready");
         fprintf(stderr, "error: LMAC not ready\n");
         return 1;
@@ -244,10 +278,10 @@ static int perform_connect(io_connect_t conn,
     static uint16_t known_freqs[8];
     static int      n_known;
     const bool fast = n_known > 0 && strcmp(known_ssid, ssid_arg) == 0;
-    aic_wifi_scan_list_t list;
-    const aic_wifi_scan_bss_t *target = NULL;
+    wifi_scan_list_t list;
+    const wifi_scan_bss_t *target = NULL;
     /* reconnect to the BSS of the last successful join without scanning; cleared on any failure */
-    static aic_wifi_scan_bss_t last_bss;
+    static wifi_scan_bss_t last_bss;
     static bool have_last;
     if (fast && have_last && !getenv("AICD_ALWAYS_SCAN")) {
         printf("[1/4] Reusing last BSS for \"%s\" (no scan)...\n", ssid_arg);
@@ -265,7 +299,7 @@ static int perform_connect(io_connect_t conn,
         int best = -1000;
         n_known = 0;
         for (uint16_t i = 0U; i < list.count; ++i) {
-            const aic_wifi_scan_bss_t *b = &list.bss[i];
+            const wifi_scan_bss_t *b = &list.bss[i];
             if (b->ssid_len != ssid_len || memcmp(b->ssid, ssid_arg, ssid_len) != 0) continue;
             const int score = b->rssi + ((b->freq >= 5000U && b->rssi > -75) ? 15 : 0);
             if (score > best) { best = score; target = b; }
@@ -318,8 +352,8 @@ static int perform_connect(io_connect_t conn,
     }
 
     printf("[2/4] Associating via SM_CONNECT_REQ...\n");
-    aic_wifi_connect_req_t creq;
-    aic_wifi_connect_req_t cresp;
+    wifi_connect_req_t creq;
+    wifi_connect_req_t cresp;
     memset(&creq, 0, sizeof(creq));
     creq.ssid_len = target->ssid_len;
     memcpy(creq.ssid, target->ssid, target->ssid_len);
@@ -334,7 +368,7 @@ static int perform_connect(io_connect_t conn,
         memcpy(creq.ie_buf, rsn_ie, rsn_ie_len);
     }
 
-    kern_return_t kr = uc_connect(conn, &creq, &cresp);
+    kern_return_t kr = wifi_connect(conn, &creq, &cresp);
     if (kr != KERN_SUCCESS || cresp.out_status != 0U) {
         set_err(err_buf, err_cap, "SM_CONNECT_REQ failed (status=%u)", cresp.out_status);
         fprintf(stderr, "error: SM_CONNECT_REQ failed kr=0x%08x fw_status=%u\n", kr, cresp.out_status);
@@ -344,7 +378,7 @@ static int perform_connect(io_connect_t conn,
     bool assoc_ok = false;
     for (int i = 0; i < 3000; ++i) {
         usleep(2000);
-        if (uc_get_status(conn, &st) == KERN_SUCCESS) {
+        if (wifi_get_status(conn, &st) == KERN_SUCCESS) {
             if (st.associated) {
                 assoc_ok = true;
                 break;
@@ -376,9 +410,9 @@ static int perform_connect(io_connect_t conn,
         bool keys_installed = false;
         bool replied = false; /* msg2 sent: AP silence after it means its MIC (i.e. the PSK) was wrong */
         for (int i = 0; i < 3000 && !keys_installed; ++i) {
-            aic_wifi_eapol_frame_t rx_frame;
-            if (uc_poll_eapol(conn, &rx_frame) == KERN_SUCCESS && rx_frame.has_frame) {
-                uint8_t reply_eth[AIC_WIFI_EAPOL_MAX_FRAME];
+            wifi_eapol_frame_t rx_frame;
+            if (wifi_poll_eapol(conn, &rx_frame) == KERN_SUCCESS && rx_frame.has_frame) {
+                uint8_t reply_eth[WIFI_EAPOL_MAX_FRAME];
                 size_t reply_len = 0U;
                 bool keys_ready = false;
                 bool gtk_rekey  = false;
@@ -393,11 +427,11 @@ static int perform_connect(io_connect_t conn,
                 if (hrc < 0) {
                     set_err(err_buf, err_cap, "Wrong password");
                     fprintf(stderr, "error: EAPOL handshake/MIC failure\n");
-                    (void)uc_disconnect(conn, 3U);
+                    (void)wifi_disconnect(conn, 3U);
                     return 1;
                 }
                 if (hrc == 1 && reply_len > 0U) {
-                    kr = uc_send_eapol(conn, reply_eth, reply_len);
+                    kr = wifi_send_eapol(conn, reply_eth, reply_len);
                     replied = true;
                     if (kr != KERN_SUCCESS) {
                         set_err(err_buf, err_cap, "SEND_EAPOL failed: 0x%08x", kr);
@@ -407,7 +441,7 @@ static int perform_connect(io_connect_t conn,
                 }
                 if (keys_ready) {
                     uint8_t hw_idx = 0U;
-                    kr = uc_add_key(conn, 0U, true, wpa_ctx->pairwise_cipher, &wpa_ctx->ptk[32], 16U, &hw_idx);
+                    kr = wifi_add_key(conn, 0U, true, wpa_ctx->pairwise_cipher, &wpa_ctx->ptk[32], 16U, &hw_idx);
                     if (kr != KERN_SUCCESS) {
                         set_err(err_buf, err_cap, "Install PTK failed: 0x%08x", kr);
                         fprintf(stderr, "error: install PTK failed: 0x%08x\n", kr);
@@ -415,7 +449,7 @@ static int perform_connect(io_connect_t conn,
                     }
                     printf("      Installed PTK (hw_key_idx=%u)\n", hw_idx);
                     if (wpa_ctx->has_gtk) {
-                        kr = uc_add_key(conn, wpa_ctx->gtk_idx, false, wpa_ctx->group_cipher,
+                        kr = wifi_add_key(conn, wpa_ctx->gtk_idx, false, wpa_ctx->group_cipher,
                                         wpa_ctx->gtk, wpa_ctx->gtk_len, &hw_idx);
                         if (kr != KERN_SUCCESS) {
                             set_err(err_buf, err_cap, "Install GTK failed: 0x%08x", kr);
@@ -434,7 +468,7 @@ static int perform_connect(io_connect_t conn,
         if (!keys_installed) {
             set_err(err_buf, err_cap, replied ? "Wrong password" : "4-Way Handshake timed out (no reply from AP)");
             fprintf(stderr, "error: timed out waiting for 4-way handshake\n");
-            (void)uc_disconnect(conn, 3U);
+            (void)wifi_disconnect(conn, 3U);
             return 1;
         }
     } else {
@@ -442,9 +476,9 @@ static int perform_connect(io_connect_t conn,
     }
 
     char bsd[32];
-    get_bsd_name(svc, bsd, sizeof(bsd));
+    wifi_ifname(svc, bsd, sizeof(bsd));
     printf("[4/4] Opening LMAC control port & raising link on %s...\n", bsd);
-    kr = uc_set_port_link(conn, true, true);
+    kr = wifi_set_port_link(conn, true, true);
     if (kr != KERN_SUCCESS) {
         set_err(err_buf, err_cap, "SET_PORT_LINK failed: 0x%08x", kr);
         fprintf(stderr, "error: SET_PORT_LINK failed: 0x%08x\n", kr);
@@ -475,10 +509,10 @@ static int save_profile(const char *ssid, const char *pass) {
         return 1;
     }
 
-    (void)mkdir(AIC_WIFI_CONF_DIR, 0755);
-    const int fd = open(AIC_WIFI_CONF_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    (void)mkdir(WIFI_CONF_DIR, 0755);
+    const int fd = open(WIFI_CONF_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) {
-        fprintf(stderr, "error: failed to write %s: %s (try sudo?)\n", AIC_WIFI_CONF_PATH, strerror(errno));
+        fprintf(stderr, "error: failed to write %s: %s (try sudo?)\n", WIFI_CONF_PATH, strerror(errno));
         return 1;
     }
     (void)fchmod(fd, 0600);
@@ -493,7 +527,7 @@ static int save_profile(const char *ssid, const char *pass) {
         fprintf(fp, "psk=%s\n", pass);
     }
     fclose(fp);
-    printf("Saved Wi-Fi profile to %s (mode 0600)\n", AIC_WIFI_CONF_PATH);
+    printf("Saved Wi-Fi profile to %s (mode 0600)\n", WIFI_CONF_PATH);
     return 0;
 }
 
@@ -502,7 +536,7 @@ static bool load_profile(char *ssid_out, size_t ssid_cap, char *pass_out, size_t
     memset(ssid_out, 0, ssid_cap);
     memset(pass_out, 0, pass_cap);
 
-    FILE *fp = fopen(AIC_WIFI_CONF_PATH, "r");
+    FILE *fp = fopen(WIFI_CONF_PATH, "r");
     if (!fp) {
         return false;
     }
@@ -553,7 +587,7 @@ static int             g_wake_pipe[2]   = { -1, -1 };
 static gid_t           g_admin_gid      = 80U;
 static int             g_ctrl_listen_fd = -1;
 
-static aic_wifi_status_t g_snap_status;
+static wifi_status_t g_snap_status;
 static char              g_snap_bsd[32]        = "unknown";
 static bool              g_snap_present        = false;
 static bool              g_snap_connecting     = false;
@@ -617,14 +651,14 @@ static void sync_saved_ssid_snapshot(void) {
 }
 
 static void refresh_snapshot(io_connect_t conn, io_service_t svc) {
-    aic_wifi_status_t st;
+    wifi_status_t st;
     memset(&st, 0, sizeof(st));
     char bsd[32] = "unknown";
     bool present = false;
 
-    if (conn != IO_OBJECT_NULL && svc != IO_OBJECT_NULL && uc_get_status(conn, &st) == KERN_SUCCESS) {
+    if (conn != IO_OBJECT_NULL && svc != IO_OBJECT_NULL && wifi_get_status(conn, &st) == KERN_SUCCESS) {
         present = true;
-        get_bsd_name(svc, bsd, sizeof(bsd));
+        wifi_ifname(svc, bsd, sizeof(bsd));
     }
 
     pthread_mutex_lock(&g_state_lock);
@@ -714,7 +748,7 @@ static int hex_decode_str(const char *hex, char *out, size_t out_cap) {
 }
 
 static void build_status_json(char *out, size_t cap) {
-    aic_wifi_status_t st;
+    wifi_status_t st;
     char bsd[32];
     bool present;
     bool connecting;
@@ -750,7 +784,7 @@ static void build_status_json(char *out, size_t cap) {
     sb_appendf(&sb, ",\"bsd\":");       sb_append_json_str(&sb, bsd);
     sb_appendf(&sb, ",\"mac\":");       sb_append_json_str(&sb, mac_str);
     sb_appendf(&sb, ",\"fw\":");        sb_append_json_str(&sb, (const char *)st.fw_version);
-    sb_appendf(&sb, ",\"chip\":");      sb_append_json_str(&sb, uc_chip_name());
+    sb_appendf(&sb, ",\"chip\":");      sb_append_json_str(&sb, wifi_chip_name());
     sb_appendf(&sb, ",\"chip_id\":\"0x%08x\",\"lmac_version\":\"0x%08x\"", st.chip_id, st.lmac_version);
     sb_appendf(&sb, ",\"is_5g\":%s,\"lmac_ready\":%s,\"associated\":%s,\"link_up\":%s",
                st.is_5g_supported ? "true" : "false",
@@ -771,11 +805,11 @@ static void build_status_json(char *out, size_t cap) {
     sb_appendf(&sb, "}\n");
 }
 
-static void build_scan_json(const aic_wifi_scan_list_t *list, char *out, size_t cap) {
+static void build_scan_json(const wifi_scan_list_t *list, char *out, size_t cap) {
     str_builder_t sb = { out, cap, 0U };
     sb_appendf(&sb, "{\"ok\":true,\"scan_done\":%s,\"bss\":[", list->scan_done ? "true" : "false");
     for (uint16_t i = 0U; i < list->count; ++i) {
-        const aic_wifi_scan_bss_t *b = &list->bss[i];
+        const wifi_scan_bss_t *b = &list->bss[i];
         char ssid_str[33] = {0};
         const bool hidden = (b->ssid_len == 0U || b->ssid_len > 32U);
         if (!hidden) {
@@ -811,7 +845,7 @@ static void execute_pending_scan(io_connect_t conn) {
         build_err_json("Adapter not connected", g_pending_cmd.json_reply, sizeof(g_pending_cmd.json_reply));
         return;
     }
-    aic_wifi_scan_list_t list;
+    wifi_scan_list_t list;
     char err[160] = {0};
     if (run_scan_and_wait(conn, NULL, 0U, NULL, 0, &list, err, sizeof(err)) != 0) {
         build_err_json(err[0] ? err : "Scan failed", g_pending_cmd.json_reply, sizeof(g_pending_cmd.json_reply));
@@ -901,6 +935,8 @@ static void handle_ipc_client(int cfd) {
     while (used > 0U && (req_line[used - 1U] == '\n' || req_line[used - 1U] == '\r')) {
         req_line[--used] = '\0';
     }
+    if (strcmp(req_line, "STATUS") != 0) /* command word only: CONNECT_HEX carries the passphrase */
+        fprintf(stderr, "usbwifid: slot %d command %.*s\n", wifi_slot(), (int)strcspn(req_line, " "), req_line);
 
     char reply[AIC_IPC_BUF_SIZE];
     if (strcmp(req_line, "STATUS") == 0) {
@@ -999,7 +1035,7 @@ static int setup_control_socket(void) {
     const struct group *grp = getgrnam("admin");
     g_admin_gid = grp ? grp->gr_gid : 20U;
 
-    (void)unlink(AIC_WIFI_SOCK_PATH);
+    (void)unlink(WIFI_SOCK_PATH);
     const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         fprintf(stderr, "warning: control socket() failed: %s\n", strerror(errno));
@@ -1009,20 +1045,20 @@ static int setup_control_socket(void) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", AIC_WIFI_SOCK_PATH);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", WIFI_SOCK_PATH);
 
     if (bind(fd, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        fprintf(stderr, "warning: bind(%s) failed: %s\n", AIC_WIFI_SOCK_PATH, strerror(errno));
+        fprintf(stderr, "warning: bind(%s) failed: %s\n", WIFI_SOCK_PATH, strerror(errno));
         close(fd);
         return -1;
     }
-    (void)chown(AIC_WIFI_SOCK_PATH, 0, g_admin_gid);
-    (void)chmod(AIC_WIFI_SOCK_PATH, 0660);
+    (void)chown(WIFI_SOCK_PATH, 0, g_admin_gid);
+    (void)chmod(WIFI_SOCK_PATH, 0660);
 
     if (listen(fd, 8) != 0) {
-        fprintf(stderr, "warning: listen(%s) failed: %s\n", AIC_WIFI_SOCK_PATH, strerror(errno));
+        fprintf(stderr, "warning: listen(%s) failed: %s\n", WIFI_SOCK_PATH, strerror(errno));
         close(fd);
-        (void)unlink(AIC_WIFI_SOCK_PATH);
+        (void)unlink(WIFI_SOCK_PATH);
         return -1;
     }
     return fd;
@@ -1052,8 +1088,8 @@ static bool run_rekey_loop(io_connect_t conn,
             }
         }
 
-        aic_wifi_status_t st;
-        if (uc_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready || !st.associated) {
+        wifi_status_t st;
+        if (wifi_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready || !st.associated) {
             fprintf(stderr, "notice: Wi-Fi link lost/disconnected (reason=%u)\n", st.disconnect_reason);
             break;
         }
@@ -1062,9 +1098,9 @@ static bool run_rekey_loop(io_connect_t conn,
         }
 
         if (!is_open) {
-            aic_wifi_eapol_frame_t rx_frame;
-            if (uc_poll_eapol(conn, &rx_frame) == KERN_SUCCESS && rx_frame.has_frame) {
-                uint8_t reply_eth[AIC_WIFI_EAPOL_MAX_FRAME];
+            wifi_eapol_frame_t rx_frame;
+            if (wifi_poll_eapol(conn, &rx_frame) == KERN_SUCCESS && rx_frame.has_frame) {
+                uint8_t reply_eth[WIFI_EAPOL_MAX_FRAME];
                 size_t reply_len = 0U;
                 bool keys_ready = false;
                 bool gtk_rekey  = false;
@@ -1076,10 +1112,10 @@ static bool run_rekey_loop(io_connect_t conn,
                                              &reply_len,
                                              &keys_ready,
                                              &gtk_rekey) == 1) {
-                    (void)uc_send_eapol(conn, reply_eth, reply_len);
+                    (void)wifi_send_eapol(conn, reply_eth, reply_len);
                     if (gtk_rekey && wpa_ctx->has_gtk) {
                         uint8_t hw_idx = 0U;
-                        (void)uc_add_key(conn, wpa_ctx->gtk_idx, false, wpa_ctx->group_cipher,
+                        (void)wifi_add_key(conn, wpa_ctx->gtk_idx, false, wpa_ctx->group_cipher,
                                          wpa_ctx->gtk, wpa_ctx->gtk_len, &hw_idx);
                     }
                 }
@@ -1112,7 +1148,7 @@ static bool handle_daemon_pending_command(io_connect_t conn,
         if (conn == IO_OBJECT_NULL) {
             build_err_json("Adapter not connected", reply, sizeof(reply));
         } else {
-            aic_wifi_scan_list_t list;
+            wifi_scan_list_t list;
             char err[160] = {0};
             if (run_scan_and_wait(conn, NULL, 0U, NULL, 0, &list, err, sizeof(err)) != 0) {
                 build_err_json(err[0] ? err : "Scan failed", reply, sizeof(reply));
@@ -1130,13 +1166,13 @@ static bool handle_daemon_pending_command(io_connect_t conn,
         memset(g_active_pass, 0, sizeof(g_active_pass));
 
         if (conn != IO_OBJECT_NULL) {
-            (void)uc_disconnect(conn, 3U);
+            (void)wifi_disconnect(conn, 3U);
             refresh_snapshot(conn, svc);
         }
         *connected_now = false;
         finish_pending_cmd_locked("{\"ok\":true}\n");
     } else if (local.kind == CMD_FORGET) {
-        (void)unlink(AIC_WIFI_CONF_PATH);
+        (void)unlink(WIFI_CONF_PATH);
         sync_saved_ssid_snapshot();
         g_has_active_target = false;
         memset(g_active_pass, 0, sizeof(g_active_pass));
@@ -1147,7 +1183,7 @@ static bool handle_daemon_pending_command(io_connect_t conn,
         pthread_mutex_unlock(&g_state_lock);
 
         if (conn != IO_OBJECT_NULL) {
-            (void)uc_disconnect(conn, 3U);
+            (void)wifi_disconnect(conn, 3U);
             refresh_snapshot(conn, svc);
         }
         *connected_now = false;
@@ -1174,9 +1210,9 @@ static bool handle_daemon_pending_command(io_connect_t conn,
             return true;
         }
 
-        aic_wifi_status_t st;
-        if (uc_get_status(conn, &st) == KERN_SUCCESS && st.associated) {
-            (void)uc_disconnect(conn, 3U);
+        wifi_status_t st;
+        if (wifi_get_status(conn, &st) == KERN_SUCCESS && st.associated) {
+            (void)wifi_disconnect(conn, 3U);
             usleep(150000);
         }
 
@@ -1235,12 +1271,12 @@ static void on_power(void *ref, io_service_t svc, natural_t msg, void *arg) {
     } else if (msg == kIOMessageSystemWillSleep) {
         g_sys_sleeping = true;
         fprintf(stderr, "notice: system sleep, dropping Wi-Fi link\n");
-        (void)uc_disconnect(IO_OBJECT_NULL, 3U);
+        (void)wifi_disconnect(IO_OBJECT_NULL, 3U);
         IOAllowPowerChange(g_pm_root, (long)arg);
     } else if (msg == kIOMessageSystemHasPoweredOn && g_sys_sleeping) {
         g_sys_sleeping = false;
         fprintf(stderr, "notice: system wake, rejoining Wi-Fi\n");
-        uc_system_woke();
+        wifi_system_woke();
         wake_daemon_loop();
     }
 }
@@ -1259,7 +1295,45 @@ static void *power_thread(void *arg) {
     return NULL;
 }
 
-static int run_daemon(void) {
+/* First bind in a worker: take this dongle's slot paths, its network service and socket, then tell the
+   supervisor (fd 3) so it starts the next worker for the next dongle. */
+static pthread_t g_ctrl_thread;
+static bool      g_ctrl_thread_started = false;
+
+static void worker_bound(void) {
+    const int slot = wifi_slot() < 0 ? 0 : wifi_slot();
+    if (slot > 0) snprintf(g_conf_path, sizeof(g_conf_path), WIFI_CONF_DIR "/wifi-%d.conf", slot);
+    snprintf(g_sock_path, sizeof(g_sock_path), WIFI_RUN_DIR "/%d.sock", slot);
+
+    char self[PATH_MAX], netsvc[PATH_MAX], name[32];
+    uint32_t n = sizeof(self);
+    if (_NSGetExecutablePath(self, &n) == 0) {
+        char *slash = strrchr(self, '/');
+        snprintf(netsvc, sizeof(netsvc), "%.*s/usbwifi_netsvc", slash ? (int)(slash - self) : 0, self);
+        if (slot == 0) snprintf(name, sizeof(name), "USB Wi-Fi");
+        else snprintf(name, sizeof(name), "USB Wi-Fi %d", slot + 1);
+        char *av[] = { netsvc, "install", name, wifi_if_host, NULL };
+        pid_t pid;
+        if (access(netsvc, X_OK) == 0 && posix_spawn(&pid, netsvc, NULL, NULL, av, environ) == 0) {
+            int st;
+            while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+        }
+    }
+
+    g_ctrl_listen_fd = setup_control_socket();
+    if (g_ctrl_listen_fd >= 0 && pthread_create(&g_ctrl_thread, NULL, control_socket_thread, NULL) == 0)
+        g_ctrl_thread_started = true;
+    if (fcntl(3, F_GETFD) != -1) {
+        const uint8_t b = (uint8_t)slot;
+        (void)write(3, &b, 1);
+        close(3);
+    }
+    sync_saved_ssid_snapshot();
+    printf("usbwifid: slot %d up on %s (profile=%s, sock=%s)\n", slot, wifi_if_host, WIFI_CONF_PATH,
+           WIFI_SOCK_PATH);
+}
+
+static int run_worker(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
     signal(SIGPIPE, SIG_IGN);
@@ -1271,25 +1345,19 @@ static int run_daemon(void) {
         (void)fcntl(g_wake_pipe[1], F_SETFL, O_NONBLOCK);
     }
 
-    g_ctrl_listen_fd = setup_control_socket();
-    pthread_t ctrl_thread;
-    bool ctrl_thread_started = false;
-    if (g_ctrl_listen_fd >= 0 && pthread_create(&ctrl_thread, NULL, control_socket_thread, NULL) == 0) {
-        ctrl_thread_started = true;
-    }
-
     pthread_t pm_thread;
     if (pthread_create(&pm_thread, NULL, power_thread, NULL) == 0) pthread_detach(pm_thread);
 
-    sync_saved_ssid_snapshot();
-    printf("aic8800_wifi daemon starting (profile=%s, sock=%s)\n", AIC_WIFI_CONF_PATH, AIC_WIFI_SOCK_PATH);
-
     while (g_keep_running) {
-        sync_saved_ssid_snapshot();
-
         io_connect_t conn = IO_OBJECT_NULL;
         io_service_t svc  = IO_OBJECT_NULL;
-        if (open_wifi_client(&conn, &svc, true, NULL) != 0) {
+        if (wifi_open(&conn, &svc, true, NULL) == 0 && !g_ctrl_thread_started) worker_bound();
+        else if (!g_ctrl_thread_started) {
+            if (sleep_with_wake_ms(1500)) drain_wake_pipe();
+            continue; /* no free dongle yet */
+        }
+        sync_saved_ssid_snapshot();
+        if (conn == IO_OBJECT_NULL) {
             refresh_snapshot(IO_OBJECT_NULL, IO_OBJECT_NULL);
             aic_wpa2_ctx_t dummy_ctx;
             bool dummy_open = false;
@@ -1302,8 +1370,8 @@ static int run_daemon(void) {
         }
 
         refresh_snapshot(conn, svc);
-        aic_wifi_status_t st;
-        if (uc_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready) {
+        wifi_status_t st;
+        if (wifi_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready) {
             IOServiceClose(conn);
             IOObjectRelease(svc);
             if (sleep_with_wake_ms(800)) {
@@ -1405,16 +1473,126 @@ static int run_daemon(void) {
         IOObjectRelease(svc);
     }
 
-    if (ctrl_thread_started) {
-        pthread_join(ctrl_thread, NULL);
+    if (g_ctrl_thread_started) {
+        pthread_join(g_ctrl_thread, NULL);
     }
     if (g_ctrl_listen_fd >= 0) {
         close(g_ctrl_listen_fd);
-        (void)unlink(AIC_WIFI_SOCK_PATH);
+        (void)unlink(WIFI_SOCK_PATH);
     }
     if (g_wake_pipe[0] >= 0) close(g_wake_pipe[0]);
     if (g_wake_pipe[1] >= 0) close(g_wake_pipe[1]);
-    printf("aic8800_wifi daemon stopping.\n");
+    return 0;
+}
+
+/* ---------- Supervisor: one worker per dongle ---------- */
+static void unpeer_slot(int slot) {
+    char host[16];
+    snprintf(host, sizeof(host), "feth%d", 80 + 2 * slot);
+    if (if_nametoindex(host) == 0) return;
+    char *np[] = { "ifconfig", host, "-peer", NULL }, *dn[] = { "ifconfig", host, "down", NULL };
+    pid_t pid;
+    int st;
+    if (posix_spawn(&pid, "/sbin/ifconfig", NULL, NULL, np, environ) == 0) waitpid(pid, &st, 0);
+    if (posix_spawn(&pid, "/sbin/ifconfig", NULL, NULL, dn, environ) == 0) waitpid(pid, &st, 0);
+}
+
+static int run_daemon(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, on_sigterm);
+    signal(SIGTERM, on_sigterm);
+
+    (void)mkdir(WIFI_RUN_DIR, 0755);
+    DIR *d = opendir(WIFI_RUN_DIR); /* sockets left by a previous run */
+    for (struct dirent *e; d && (e = readdir(d));) {
+        char p[PATH_MAX];
+        if (e->d_name[0] == '.') continue;
+        snprintf(p, sizeof(p), WIFI_RUN_DIR "/%s", e->d_name);
+        (void)unlink(p);
+    }
+    if (d) closedir(d);
+    (void)unlink("/var/run/usbwifi.sock"); /* pre-multi-dongle socket */
+    /* a worker that died hard may have left its link peered: Network UI would show it live */
+    for (int s = 0; s < WIFI_MAX_SLOTS; s++) unpeer_slot(s);
+
+    struct stat fw_st;
+    pthread_t fw_thread;
+    if (stat(AIC_FWLOAD_DIR, &fw_st) == 0 && S_ISDIR(fw_st.st_mode) &&
+        pthread_create(&fw_thread, NULL, fwload_thread, NULL) == 0)
+        pthread_detach(fw_thread);
+
+    char self[PATH_MAX];
+    uint32_t sn = sizeof(self);
+    if (_NSGetExecutablePath(self, &sn) != 0) return 1;
+    char *av[] = { self, "--worker", NULL };
+    printf("usbwifid daemon starting\n");
+
+    /* fd: the bind notify pipe until the worker reports its slot, then -1 */
+    struct { pid_t pid; int fd; int slot; } w[WIFI_MAX_SLOTS + 1] = {0};
+    time_t last_spawn = 0;
+    while (g_keep_running) {
+        int searching = -1, free_i = -1;
+        for (int i = 0; i <= WIFI_MAX_SLOTS; i++) {
+            if (w[i].pid > 0 && w[i].fd >= 0) searching = i;
+            if (w[i].pid == 0 && free_i < 0) free_i = i;
+        }
+        /* throttle: a worker that keeps crashing before it binds is respawned at most every 2 s */
+        if (searching < 0 && free_i >= 0 && time(NULL) - last_spawn >= 2) {
+            int p[2];
+            posix_spawn_file_actions_t fa;
+            if (pipe(p) == 0) {
+                (void)fcntl(p[0], F_SETFD, FD_CLOEXEC);
+                (void)fcntl(p[1], F_SETFD, FD_CLOEXEC);
+                posix_spawn_file_actions_init(&fa);
+                posix_spawn_file_actions_adddup2(&fa, p[1], 3);
+                if (posix_spawn(&w[free_i].pid, self, &fa, NULL, av, environ) == 0) {
+                    w[free_i].fd = p[0];
+                    w[free_i].slot = -1;
+                    searching = free_i;
+                } else {
+                    w[free_i].pid = 0;
+                    close(p[0]);
+                }
+                posix_spawn_file_actions_destroy(&fa);
+                close(p[1]);
+            }
+            last_spawn = time(NULL);
+        }
+
+        struct pollfd pfd = { .fd = searching >= 0 ? w[searching].fd : -1, .events = POLLIN };
+        if (poll(&pfd, 1, 1000) > 0) {
+            uint8_t b;
+            if (read(pfd.fd, &b, 1) == 1) w[searching].slot = b;
+            close(pfd.fd);
+            w[searching].fd = -1; /* bound (or died before binding: reaped below) */
+        }
+        for (int i = 0; i <= WIFI_MAX_SLOTS; i++) {
+            int st;
+            if (w[i].pid <= 0 || waitpid(w[i].pid, &st, WNOHANG) != w[i].pid) continue;
+            if (w[i].fd >= 0) close(w[i].fd);
+            if (w[i].slot >= 0) {
+                char sock[64];
+                printf("usbwifid: slot %d worker exited (%d)\n", w[i].slot, st);
+                unpeer_slot(w[i].slot);
+                snprintf(sock, sizeof(sock), WIFI_RUN_DIR "/%d.sock", w[i].slot);
+                (void)unlink(sock);
+            }
+            w[i].pid = 0;
+            w[i].fd = -1;
+            w[i].slot = -1;
+        }
+    }
+
+    for (int i = 0; i <= WIFI_MAX_SLOTS; i++)
+        if (w[i].pid > 0) kill(w[i].pid, SIGTERM);
+    for (int i = 0; i <= WIFI_MAX_SLOTS; i++) {
+        int st;
+        if (w[i].pid > 0) while (waitpid(w[i].pid, &st, 0) < 0 && errno == EINTR) {}
+    }
+    if (g_fwload_pid > 0) kill(g_fwload_pid, SIGTERM);
+    printf("usbwifid daemon stopping.\n");
     return 0;
 }
 
@@ -1427,7 +1605,7 @@ static int query_daemon_socket(const char *cmd_line, char *out, size_t out_cap) 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", AIC_WIFI_SOCK_PATH);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", WIFI_SOCK_PATH);
     if (connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(fd);
         return -1;
@@ -1462,8 +1640,9 @@ static void print_usage(const char *prog) {
             "  sudo %s save <SSID> [passphrase]    (save auto-connect profile to wifi.conf)\n"
             "  sudo %s disconnect\n"
             "  %s cd-eject                         (switch a Realtek driver CD to Wi-Fi; as the console user)\n"
+            "  sudo %s fwload [--once|--daemon] --fw-dir <dir> ...  (AIC8800D80 firmware loader)\n"
             "  sudo %s --daemon\n",
-            prog, prog, prog, prog, prog, prog, prog);
+            prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -1475,8 +1654,14 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "--daemon") == 0) {
         return run_daemon();
     }
+    if (strcmp(argv[1], "--worker") == 0) {
+        return run_worker();
+    }
+    if (strcmp(argv[1], "fwload") == 0) {
+        return aic_fwload_main(argc - 1, argv + 1);
+    }
     if (strcmp(argv[1], "cd-eject") == 0) {
-        /* run by the com.aic8800mac.cdswitch LaunchAgent, which launchd starts when a Realtek driver CD
+        /* run by the com.usbwifi.cdswitch LaunchAgent, which launchd starts when a Realtek driver CD
            is plugged in; taking the IOKit event keeps launchd from relaunching the job for it */
         xpc_set_event_stream_handler("com.apple.iokit.matching", dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
                                      ^(xpc_object_t e) { (void)e; });
@@ -1490,7 +1675,7 @@ int main(int argc, char **argv) {
     io_connect_t conn = IO_OBJECT_NULL;
     io_service_t svc  = IO_OBJECT_NULL;
     kern_return_t open_kr = KERN_FAILURE;
-    if (open_wifi_client(&conn, &svc, false, &open_kr) != 0) {
+    if (wifi_open(&conn, &svc, false, &open_kr) != 0) {
         if (open_kr == kIOReturnNotPrivileged && strcmp(argv[1], "status") == 0) {
             char json[AIC_IPC_BUF_SIZE];
             if (query_daemon_socket("STATUS", json, sizeof(json)) == 0) {
@@ -1530,7 +1715,7 @@ int main(int argc, char **argv) {
             (void)run_rekey_loop(conn, svc, &wpa_ctx, is_open, false);
         }
     } else if (strcmp(argv[1], "disconnect") == 0) {
-        const kern_return_t kr = uc_disconnect(conn, 3U);
+        const kern_return_t kr = wifi_disconnect(conn, 3U);
         if (kr != KERN_SUCCESS) {
             fprintf(stderr, "error: DISCONNECT failed: 0x%08x\n", kr);
             rc = 1;

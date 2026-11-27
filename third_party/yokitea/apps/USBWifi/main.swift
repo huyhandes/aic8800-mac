@@ -2,8 +2,9 @@ import Cocoa
 import Darwin
 import Security
 
-private let kSockPath = "/var/run/aic8800_wifi.sock"
-private let kLoginAgentLabel = "com.aic8800mac.menu"
+/* one control socket per plugged dongle: <slot>.sock, created by its usbwifid worker */
+private let kRunDir = "/var/run/usbwifi"
+private let kLoginAgentLabel = "com.usbwifi.menu"
 
 struct WifiStatus: Decodable {
     let ok: Bool
@@ -59,7 +60,7 @@ struct BasicResponse: Decodable {
 // Per-SSID passphrases in the user's login keychain (the daemon only keeps the one auto-join profile).
 private func keychainQuery(_ ssid: String) -> [String: Any] {
     return [kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "com.aic8800mac.wifi",
+            kSecAttrService as String: "com.usbwifi.wifi",
             kSecAttrAccount as String: ssid]
 }
 
@@ -120,7 +121,7 @@ private func ipv4AddressForInterface(_ bsdName: String) -> String? {
     return nil
 }
 
-private func sendDaemonCommand(_ cmd: String, timeoutSec: Int = 5) -> Result<Data, Error> {
+private func sendDaemonCommand(_ sockPath: String, _ cmd: String, timeoutSec: Int = 5) -> Result<Data, Error> {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     if fd < 0 {
         return .failure(NSError(domain: NSPOSIXErrorDomain, code: Int(errno)))
@@ -133,7 +134,7 @@ private func sendDaemonCommand(_ cmd: String, timeoutSec: Int = 5) -> Result<Dat
 
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
-    let pathBytes = Array(kSockPath.utf8CString)
+    let pathBytes = Array(sockPath.utf8CString)
     let maxLen = MemoryLayout.size(ofValue: addr.sun_path)
     if pathBytes.count > maxLen {
         return .failure(NSError(domain: NSPOSIXErrorDomain, code: Int(ENAMETOOLONG)))
@@ -185,21 +186,46 @@ private func sendDaemonCommand(_ cmd: String, timeoutSec: Int = 5) -> Result<Dat
     return .success(reply)
 }
 
+/// One plugged dongle, driven by its own usbwifid worker. Touched on the main thread only.
+final class Adapter {
+    let slot: Int
+    let sock: String
+    var status: WifiStatus?
+    var ipv4: String?
+    var isScanning = false
+    var networks: [ScanBss] = []
+    var message: String?
+    var pendingAutoScan = false
+    var wasReady = false
+    var popAfterScan = false
+
+    init(slot: Int) {
+        self.slot = slot
+        self.sock = "\(kRunDir)/\(slot).sock"
+    }
+
+    /// same name as its network service in System Settings > Network
+    var name: String { slot == 0 ? "USB Wi-Fi" : "USB Wi-Fi \(slot + 1)" }
+    var ready: Bool { status.map { $0.present && $0.lmac_ready } ?? false }
+}
+
+/// (adapter, network) for a network menu item
+private final class NetChoice {
+    let adapter: Adapter
+    let bss: ScanBss
+    init(_ adapter: Adapter, _ bss: ScanBss) { self.adapter = adapter; self.bss = bss }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
-    private let ioQueue = DispatchQueue(label: "com.rush.AIC8800Menu.io", qos: .userInitiated)
+    private let ioQueue = DispatchQueue(label: "com.usbwifi.app.io", qos: .userInitiated, attributes: .concurrent)
 
     private var pollTimer: Timer?
-    private var currentStatus: WifiStatus?
-    private var currentIPv4: String?
     private var daemonOffline = true
-    private var isScanning = false
-    private var cachedNetworks: [ScanBss] = []
-    private var actionMessage: String?
-    private var pendingAutoScan = false
-    private var wasReady = false
-    private var popAfterScan = false
+    private var adapters: [Int: Adapter] = [:] /* by slot */
+
+    private var sortedAdapters: [Adapter] { adapters.values.sorted { $0.slot < $1.slot } }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -222,95 +248,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        guard menu === self.menu else { return }
         pollStatus()
-        if !daemonOffline, let st = currentStatus, st.present, st.lmac_ready, !isScanning {
-            triggerScan()
+        for a in sortedAdapters where a.ready && !a.isScanning {
+            triggerScan(a)
         }
         rebuildMenu()
     }
 
+    /// slots that have a worker socket right now
+    private func liveSlots() -> [Int]? {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: kRunDir) else { return nil }
+        return names.compactMap { n in n.hasSuffix(".sock") ? Int(n.dropLast(5)) : nil }
+    }
+
     private func pollStatus() {
+        guard let slots = liveSlots() else {
+            daemonOffline = true
+            adapters.removeAll()
+            updateIconAndTitle()
+            rebuildMenu()
+            return
+        }
+        daemonOffline = false
+        for s in Set(adapters.keys).subtracting(slots) { adapters.removeValue(forKey: s) }
+        for s in slots where adapters[s] == nil { adapters[s] = Adapter(slot: s) }
+        updateIconAndTitle()
+        rebuildMenu()
+        for a in sortedAdapters { pollStatus(a) }
+    }
+
+    private func pollStatus(_ a: Adapter) {
         ioQueue.async { [weak self] in
-            guard let self = self else { return }
-            switch sendDaemonCommand("STATUS", timeoutSec: 3) {
-            case .success(let data):
-                if let st = try? JSONDecoder().decode(WifiStatus.self, from: data), st.ok {
-                    let ip = (st.associated && st.link_up) ? ipv4AddressForInterface(st.bsd) : nil
-                    DispatchQueue.main.async {
-                        self.daemonOffline = false
-                        self.currentStatus = st
-                        self.currentIPv4 = ip
-                        // port: dongle just plugged in (ready edge) with no saved network -> open the picker
-                        let ready = st.present && st.lmac_ready
-                        if ready && !self.wasReady && st.saved_ssid.isEmpty && !st.associated && !st.connecting {
-                            self.popAfterScan = true
-                            self.cachedNetworks = []
-                            self.pendingAutoScan = false
-                        }
-                        self.wasReady = ready
-                        if !self.pendingAutoScan && st.present && st.lmac_ready && self.cachedNetworks.isEmpty {
-                            self.pendingAutoScan = true
-                            self.triggerScan()
-                        }
-                        self.updateIconAndTitle()
-                        self.rebuildMenu()
+            var st: WifiStatus?
+            if case .success(let data) = sendDaemonCommand(a.sock, "STATUS", timeoutSec: 3),
+               let s = try? JSONDecoder().decode(WifiStatus.self, from: data), s.ok {
+                st = s
+            }
+            let ip = st.flatMap { ($0.associated && $0.link_up) ? ipv4AddressForInterface($0.bsd) : nil }
+            DispatchQueue.main.async {
+                guard let self = self, self.adapters[a.slot] === a else { return }
+                a.status = st
+                a.ipv4 = ip
+                if let st = st {
+                    // dongle just came up with no saved network -> open the picker once its scan is in
+                    if a.ready && !a.wasReady && st.saved_ssid.isEmpty && !st.associated && !st.connecting {
+                        a.popAfterScan = true
+                        a.networks = []
+                        a.pendingAutoScan = false
                     }
-                    return
+                    if !a.pendingAutoScan && a.ready && a.networks.isEmpty {
+                        a.pendingAutoScan = true
+                        self.triggerScan(a)
+                    }
                 }
-                DispatchQueue.main.async {
-                    self.daemonOffline = true
-                    self.currentStatus = nil
-                    self.currentIPv4 = nil
-                    self.updateIconAndTitle()
-                    self.rebuildMenu()
-                }
-            case .failure:
-                DispatchQueue.main.async {
-                    self.daemonOffline = true
-                    self.currentStatus = nil
-                    self.currentIPv4 = nil
-                    self.updateIconAndTitle()
-                    self.rebuildMenu()
-                }
+                a.wasReady = a.ready
+                self.updateIconAndTitle()
+                self.rebuildMenu()
             }
         }
     }
 
-    private func triggerScan() {
-        guard !isScanning else { return }
-        isScanning = true
+    private func triggerScan(_ a: Adapter) {
+        guard !a.isScanning else { return }
+        a.isScanning = true
         rebuildMenu()
 
         ioQueue.async { [weak self] in
-            guard let self = self else { return }
-            let res = sendDaemonCommand("SCAN", timeoutSec: 15)
+            let res = sendDaemonCommand(a.sock, "SCAN", timeoutSec: 15)
             DispatchQueue.main.async {
-                self.isScanning = false
+                guard let self = self else { return }
+                a.isScanning = false
                 switch res {
                 case .success(let data):
                     if let resp = try? JSONDecoder().decode(ScanResponse.self, from: data),
                        resp.ok, let list = resp.bss {
-                        self.cachedNetworks = self.deduplicateAndSort(list)
-                        self.actionMessage = nil
-                        if self.popAfterScan {
-                            self.popAfterScan = false
+                        a.networks = self.deduplicateAndSort(list, active: a.status)
+                        a.message = nil
+                        if a.popAfterScan {
+                            a.popAfterScan = false
                             self.rebuildMenu()
                             NSApp.activate(ignoringOtherApps: true)
                             self.statusItem.button?.performClick(nil)
                         }
                     } else if let resp = try? JSONDecoder().decode(ScanResponse.self, from: data),
                               let err = resp.error {
-                        self.actionMessage = err
+                        a.message = err
                     }
                 case .failure(let err):
-                    self.actionMessage = err.localizedDescription
+                    a.message = err.localizedDescription
                 }
                 self.rebuildMenu()
             }
         }
     }
 
-    private func deduplicateAndSort(_ raw: [ScanBss]) -> [ScanBss] {
+    private func deduplicateAndSort(_ raw: [ScanBss], active st: WifiStatus?) -> [ScanBss] {
         var bestBySsid: [String: ScanBss] = [:]
         for item in raw where !item.hidden && !item.ssid.isEmpty {
             if let existing = bestBySsid[item.ssid] {
@@ -321,7 +354,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 bestBySsid[item.ssid] = item
             }
         }
-        let activeSsid = (currentStatus?.associated == true) ? currentStatus?.ssid : nil
+        let activeSsid = (st?.associated == true) ? st?.ssid : nil
         return bestBySsid.values.sorted { a, b in
             if a.ssid == activeSsid && b.ssid != activeSsid { return true }
             if b.ssid == activeSsid && a.ssid != activeSsid { return false }
@@ -329,70 +362,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func sendSimpleAction(_ cmd: String, timeoutSec: Int = 10) {
+    private func sendSimpleAction(_ a: Adapter, _ cmd: String, timeoutSec: Int = 10) {
         ioQueue.async { [weak self] in
-            let res = sendDaemonCommand(cmd, timeoutSec: timeoutSec)
+            let res = sendDaemonCommand(a.sock, cmd, timeoutSec: timeoutSec)
             DispatchQueue.main.async {
                 switch res {
                 case .success(let data):
                     if let resp = try? JSONDecoder().decode(BasicResponse.self, from: data), !resp.ok {
-                        self?.actionMessage = resp.error ?? "Command failed"
+                        a.message = resp.error ?? "Command failed"
                     } else {
-                        self?.actionMessage = nil
+                        a.message = nil
                     }
                 case .failure(let err):
-                    self?.actionMessage = err.localizedDescription
+                    a.message = err.localizedDescription
                 }
-                self?.pollStatus()
+                self?.pollStatus(a)
             }
         }
     }
 
     /// keychainSec != nil: passphrase came from the keychain; if it is rejected, drop it and ask again.
-    private func performConnect(ssid: String, passphrase: String?, save: Bool, keychainSec: String? = nil) {
+    private func performConnect(_ a: Adapter, ssid: String, passphrase: String?, save: Bool, keychainSec: String? = nil) {
         let ssidHex = hexEncode(ssid)
         let passHex = (passphrase != nil && !passphrase!.isEmpty) ? hexEncode(passphrase!) : "-"
         let saveFlag = save ? 1 : 0
-        actionMessage = nil
+        a.message = nil
         updateIconAndTitle()
         rebuildMenu()
 
         ioQueue.async { [weak self] in
-            let res = sendDaemonCommand("CONNECT_HEX \(ssidHex) \(passHex) \(saveFlag)", timeoutSec: 25)
+            let res = sendDaemonCommand(a.sock, "CONNECT_HEX \(ssidHex) \(passHex) \(saveFlag)", timeoutSec: 25)
             DispatchQueue.main.async {
                 switch res {
                 case .success(let data):
                     if let resp = try? JSONDecoder().decode(BasicResponse.self, from: data), !resp.ok {
                         let err = resp.error ?? "Connection failed"
-                        self?.actionMessage = err
+                        a.message = err
                         if err == "Wrong password", let sec = keychainSec {
                             keychainDelete(ssid)
-                            self?.actionMessage = "Wrong saved password for \"\(ssid)\""
-                            self?.promptForPassword(ssid: ssid, secLabel: sec, allowEditSsid: false)
+                            a.message = "Wrong saved password for \"\(ssid)\""
+                            self?.promptForPassword(a, ssid: ssid, secLabel: sec, allowEditSsid: false)
                         }
                     } else {
-                        self?.actionMessage = nil
+                        a.message = nil
                         if save, let p = passphrase, !p.isEmpty { keychainSave(ssid, p) }
                     }
                 case .failure(let err):
-                    self?.actionMessage = err.localizedDescription
+                    a.message = err.localizedDescription
                 }
-                self?.pollStatus()
+                self?.pollStatus(a)
             }
         }
     }
 
+    /// one icon for all adapters: connecting beats connected beats present-but-down
     private func updateIconAndTitle() {
         guard let button = statusItem.button else { return }
+        let sts = sortedAdapters.compactMap { $0.status }.filter { $0.present }
         let symbolName: String
         var title = ""
 
-        if daemonOffline || currentStatus == nil || currentStatus?.present == false {
+        if daemonOffline || sts.isEmpty {
             symbolName = "wifi.slash"
-        } else if let st = currentStatus, st.connecting {
+        } else if sts.contains(where: { $0.connecting }) {
             symbolName = "wifi"
             title = " …"
-        } else if let st = currentStatus, st.associated && st.link_up {
+        } else if sts.contains(where: { $0.associated && $0.link_up }) {
             symbolName = "wifi"
         } else {
             symbolName = "wifi.exclamationmark"
@@ -419,154 +454,169 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
+    private func actionItem(_ title: String, _ sel: Selector, _ obj: Any?, key: String = "") -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: sel, keyEquivalent: key)
+        item.target = self
+        item.representedObject = obj
+        return item
+    }
+
     private func rebuildMenu() {
         menu.removeAllItems()
+        let list = sortedAdapters.filter { $0.status?.present == true }
 
         if daemonOffline {
             menu.addItem(disabledInfoItem("USB Wi-Fi Driver Offline", bold: true))
             menu.addItem(disabledInfoItem("Driver daemon not running: reinstall USB Wifi"))
-        } else if let st = currentStatus {
-            if !st.present {
-                menu.addItem(disabledInfoItem("USB Wi-Fi Adapter Not Found", bold: true))
-                menu.addItem(disabledInfoItem("Plug in a supported adapter (AIC8800D80, RTL8852BU)"))
-            } else if !st.lmac_ready {
-                menu.addItem(disabledInfoItem("Initializing Adapter… (\(st.bsd))", bold: true))
-            } else if st.connecting {
-                menu.addItem(disabledInfoItem("Connecting… (\(st.bsd))", bold: true))
-            } else if st.associated && st.link_up {
-                let band = st.freq >= 5000 ? "5 GHz" : "2.4 GHz"
-                let ssidShow = st.ssid.isEmpty ? "(hidden)" : st.ssid
-                menu.addItem(disabledInfoItem("Connected: \(ssidShow)", bold: true))
-                let ipText = currentIPv4 ?? "DHCP pending…"
-                menu.addItem(disabledInfoItem("  \(band) (\(st.freq) MHz) • \(st.bsd) • IP \(ipText)"))
-                menu.addItem(disabledInfoItem("  BSSID \(st.bssid) • TX \(st.tx_packets) / RX \(st.rx_packets)"))
-            } else {
-                let extra = st.auto_paused ? " (paused)" : ""
-                menu.addItem(disabledInfoItem("Disconnected\(extra) • \(st.bsd)", bold: true))
-                if st.disc_reason != 0 {
-                    menu.addItem(disabledInfoItem("  Last disconnect reason: \(st.disc_reason)"))
-                }
-            }
-
-            if st.present, let chip = st.chip, !chip.isEmpty {
-                menu.addItem(disabledInfoItem("  Adapter: \(chip) • \(st.mac)"))
-            }
-
-            let err = actionMessage ?? (st.last_error.isEmpty ? nil : st.last_error)
-            if let e = err, !e.isEmpty {
-                menu.addItem(disabledInfoItem("⚠ \(e)"))
-            }
-
-            if st.present && st.lmac_ready {
-                menu.addItem(NSMenuItem.separator())
-
-                if st.associated || st.connecting {
-                    let discItem = NSMenuItem(title: "Disconnect", action: #selector(onDisconnect), keyEquivalent: "")
-                    discItem.target = self
-                    menu.addItem(discItem)
-                } else if !st.saved_ssid.isEmpty {
-                    let recItem = NSMenuItem(title: "Connect to Saved: \(st.saved_ssid)", action: #selector(onReconnect), keyEquivalent: "")
-                    recItem.target = self
-                    menu.addItem(recItem)
-                }
-
-                if !st.saved_ssid.isEmpty {
-                    let forgetItem = NSMenuItem(title: "Forget \"\(st.saved_ssid)\"", action: #selector(onForget), keyEquivalent: "")
-                    forgetItem.target = self
-                    menu.addItem(forgetItem)
-                }
-
-                menu.addItem(NSMenuItem.separator())
-                let scanTitle = isScanning ? "Scanning Networks…" : "Scan Networks"
-                let scanItem = NSMenuItem(title: scanTitle, action: #selector(onScan), keyEquivalent: "r")
-                scanItem.target = self
-                scanItem.isEnabled = !isScanning
-                menu.addItem(scanItem)
-
-                if cachedNetworks.isEmpty && !isScanning {
-                    menu.addItem(disabledInfoItem("  No networks scanned yet"))
-                } else {
-                    for bss in cachedNetworks {
-                        let isCurrent = (st.associated && st.ssid == bss.ssid)
-                        let band = bss.freq >= 5000 ? "5G" : "2.4G"
-                        let title = "\(bss.ssid)  [\(band) • \(bss.rssi) dBm • \(bss.sec)]"
-                        let netItem = NSMenuItem(title: title, action: #selector(onSelectNetwork(_:)), keyEquivalent: "")
-                        netItem.target = self
-                        netItem.representedObject = bss
-                        netItem.state = isCurrent ? .on : .off
-                        let sym = bss.open ? "wifi" : "lock.fill"
-                        if let icon = NSImage(systemSymbolName: sym, accessibilityDescription: bss.sec) {
-                            icon.isTemplate = true
-                            netItem.image = icon
-                        }
-                        menu.addItem(netItem)
-                    }
-                }
-
-                let hiddenItem = NSMenuItem(title: "Join Other / Hidden Network…", action: #selector(onJoinHidden), keyEquivalent: "")
-                hiddenItem.target = self
-                menu.addItem(hiddenItem)
+        } else if list.isEmpty {
+            menu.addItem(disabledInfoItem("USB Wi-Fi Adapter Not Found", bold: true))
+            menu.addItem(disabledInfoItem("Plug in a supported adapter (AIC8800D80, RTL8852BU)"))
+        } else {
+            // one adapter: the network list sits in the menu itself; several: one section each, with
+            // the networks in a submenu so every adapter's status stays in view
+            for (i, a) in list.enumerated() {
+                if i > 0 { menu.addItem(NSMenuItem.separator()) }
+                addAdapterSection(a, multi: list.count > 1)
             }
         }
 
         menu.addItem(NSMenuItem.separator())
 
-        let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(onToggleLogin), keyEquivalent: "")
-        loginItem.target = self
+        let loginItem = actionItem("Launch at Login", #selector(onToggleLogin), nil)
         loginItem.state = isLoginAgentEnabled() ? .on : .off
         menu.addItem(loginItem)
-
-        let logItem = NSMenuItem(title: "Open Wi-Fi Log", action: #selector(onOpenLog), keyEquivalent: "")
-        logItem.target = self
-        menu.addItem(logItem)
-
-        let quitItem = NSMenuItem(title: "Quit USB Wifi", action: #selector(onQuit), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(quitItem)
+        menu.addItem(actionItem("Open Wi-Fi Log", #selector(onOpenLog), nil))
+        menu.addItem(actionItem("Quit USB Wifi", #selector(onQuit), nil, key: "q"))
     }
 
-    @objc private func onScan() {
-        triggerScan()
+    private func addAdapterSection(_ a: Adapter, multi: Bool) {
+        guard let st = a.status else { return }
+        let chip = (st.chip?.isEmpty == false) ? st.chip! : "Adapter"
+        if multi {
+            menu.addItem(disabledInfoItem("\(a.name) — \(chip)", bold: true))
+        }
+        let ind = multi ? "  " : ""
+
+        if !st.lmac_ready {
+            menu.addItem(disabledInfoItem("\(ind)Initializing Adapter… (\(st.bsd))", bold: !multi))
+        } else if st.connecting {
+            menu.addItem(disabledInfoItem("\(ind)Connecting… (\(st.bsd))", bold: !multi))
+        } else if st.associated && st.link_up {
+            let band = st.freq >= 5000 ? "5 GHz" : "2.4 GHz"
+            let ssidShow = st.ssid.isEmpty ? "(hidden)" : st.ssid
+            menu.addItem(disabledInfoItem("\(ind)Connected: \(ssidShow)", bold: !multi))
+            let ipText = a.ipv4 ?? "DHCP pending…"
+            menu.addItem(disabledInfoItem("\(ind)  \(band) (\(st.freq) MHz) • \(st.bsd) • IP \(ipText)"))
+            menu.addItem(disabledInfoItem("\(ind)  BSSID \(st.bssid) • TX \(st.tx_packets) / RX \(st.rx_packets)"))
+        } else {
+            let extra = st.auto_paused ? " (paused)" : ""
+            menu.addItem(disabledInfoItem("\(ind)Disconnected\(extra) • \(st.bsd)", bold: !multi))
+            if st.disc_reason != 0 {
+                menu.addItem(disabledInfoItem("\(ind)  Last disconnect reason: \(st.disc_reason)"))
+            }
+        }
+        menu.addItem(disabledInfoItem(multi ? "\(ind)  \(st.mac)" : "  Adapter: \(chip) • \(st.mac)"))
+
+        let err = a.message ?? (st.last_error.isEmpty ? nil : st.last_error)
+        if let e = err, !e.isEmpty {
+            menu.addItem(disabledInfoItem("\(ind)⚠ \(e)"))
+        }
+        guard st.lmac_ready else { return }
+
+        if !multi { menu.addItem(NSMenuItem.separator()) }
+        if st.associated || st.connecting {
+            menu.addItem(actionItem("\(ind)Disconnect", #selector(onDisconnect(_:)), a))
+        } else if !st.saved_ssid.isEmpty {
+            menu.addItem(actionItem("\(ind)Connect to Saved: \(st.saved_ssid)", #selector(onReconnect(_:)), a))
+        }
+        if !st.saved_ssid.isEmpty {
+            menu.addItem(actionItem("\(ind)Forget \"\(st.saved_ssid)\"", #selector(onForget(_:)), a))
+        }
+
+        let nets: NSMenu
+        if multi {
+            nets = NSMenu()
+            nets.autoenablesItems = false
+            let sub = NSMenuItem(title: "\(ind)Choose Network", action: nil, keyEquivalent: "")
+            sub.submenu = nets
+            menu.addItem(sub)
+        } else {
+            nets = menu
+            menu.addItem(NSMenuItem.separator())
+        }
+
+        let scanItem = actionItem(a.isScanning ? "Scanning Networks…" : "Scan Networks", #selector(onScan(_:)), a,
+                                  key: multi ? "" : "r")
+        scanItem.isEnabled = !a.isScanning
+        nets.addItem(scanItem)
+
+        if a.networks.isEmpty && !a.isScanning {
+            nets.addItem(disabledInfoItem("  No networks scanned yet"))
+        } else {
+            for bss in a.networks {
+                let netItem = actionItem(bss.ssid, #selector(onSelectNetwork(_:)), NetChoice(a, bss))
+                netItem.state = (st.associated && st.ssid == bss.ssid) ? .on : .off
+                let sym = bss.open ? "wifi" : "lock.fill"
+                if let icon = NSImage(systemSymbolName: sym, accessibilityDescription: bss.sec) {
+                    icon.isTemplate = true
+                    netItem.image = icon
+                }
+                nets.addItem(netItem)
+            }
+        }
+        nets.addItem(actionItem("Join Other / Hidden Network…", #selector(onJoinHidden(_:)), a))
     }
 
-    @objc private func onDisconnect() {
-        sendSimpleAction("DISCONNECT", timeoutSec: 8)
+    @objc private func onScan(_ sender: NSMenuItem) {
+        if let a = sender.representedObject as? Adapter { triggerScan(a) }
     }
 
-    @objc private func onReconnect() {
-        sendSimpleAction("RECONNECT", timeoutSec: 8)
+    @objc private func onDisconnect(_ sender: NSMenuItem) {
+        if let a = sender.representedObject as? Adapter { sendSimpleAction(a, "DISCONNECT", timeoutSec: 8) }
     }
 
-    @objc private func onForget() {
-        if let s = currentStatus?.saved_ssid, !s.isEmpty { keychainDelete(s) }
-        sendSimpleAction("FORGET", timeoutSec: 8)
+    @objc private func onReconnect(_ sender: NSMenuItem) {
+        if let a = sender.representedObject as? Adapter { sendSimpleAction(a, "RECONNECT", timeoutSec: 8) }
+    }
+
+    @objc private func onForget(_ sender: NSMenuItem) {
+        guard let a = sender.representedObject as? Adapter else { return }
+        // the keychain password is shared by every adapter; keep it while another one still uses the network
+        if let s = a.status?.saved_ssid, !s.isEmpty,
+           !sortedAdapters.contains(where: { $0 !== a && $0.status?.saved_ssid == s }) {
+            keychainDelete(s)
+        }
+        sendSimpleAction(a, "FORGET", timeoutSec: 8)
     }
 
     @objc private func onSelectNetwork(_ sender: NSMenuItem) {
-        guard let bss = sender.representedObject as? ScanBss else { return }
+        guard let c = sender.representedObject as? NetChoice else { return }
+        let bss = c.bss
         if bss.open {
-            performConnect(ssid: bss.ssid, passphrase: nil, save: true)
+            performConnect(c.adapter, ssid: bss.ssid, passphrase: nil, save: true)
             return
         }
         if let pw = keychainPassword(bss.ssid) {
-            performConnect(ssid: bss.ssid, passphrase: pw, save: true, keychainSec: bss.sec)
+            performConnect(c.adapter, ssid: bss.ssid, passphrase: pw, save: true, keychainSec: bss.sec)
             return
         }
-        promptForPassword(ssid: bss.ssid, secLabel: bss.sec, allowEditSsid: false)
+        promptForPassword(c.adapter, ssid: bss.ssid, secLabel: bss.sec, allowEditSsid: false)
     }
 
-    @objc private func onJoinHidden() {
-        promptForPassword(ssid: "", secLabel: "WPA2-PSK or Open", allowEditSsid: true)
+    @objc private func onJoinHidden(_ sender: NSMenuItem) {
+        guard let a = sender.representedObject as? Adapter else { return }
+        promptForPassword(a, ssid: "", secLabel: "WPA2-PSK or Open", allowEditSsid: true)
     }
 
-    private func promptForPassword(ssid: String, secLabel: String, allowEditSsid: Bool) {
+    private func promptForPassword(_ a: Adapter, ssid: String, secLabel: String, allowEditSsid: Bool) {
         NSApp.activate(ignoringOtherApps: true)
 
         let alert = NSAlert()
         alert.alertStyle = .informational
+        let via = adapters.count > 1 ? " with \(a.name)" : ""
         alert.messageText = allowEditSsid
-            ? "Join Wi-Fi Network"
-            : "Connect to \"\(ssid)\""
+            ? "Join Wi-Fi Network\(via)"
+            : "Connect to \"\(ssid)\"\(via)"
         alert.informativeText = allowEditSsid
             ? "Enter the network SSID and optional WPA2 passphrase (leave password blank for Open):"
             : "Security: \(secLabel)"
@@ -608,17 +658,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !chosenSsid.isEmpty else { return }
 
         if !allowEditSsid && pass.count < 8 {
-            actionMessage = "Passphrase must be at least 8 characters"
+            a.message = "Passphrase must be at least 8 characters"
             rebuildMenu()
             return
         }
         if !pass.isEmpty && (pass.count < 8 || pass.count > 63) {
-            actionMessage = "Passphrase must be 8..63 characters"
+            a.message = "Passphrase must be 8..63 characters"
             rebuildMenu()
             return
         }
 
-        performConnect(ssid: chosenSsid,
+        performConnect(a,
+                       ssid: chosenSsid,
                        passphrase: pass.isEmpty ? nil : pass,
                        save: rememberCheck.state == .on)
     }
@@ -656,7 +707,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func onOpenLog() {
-        let url = URL(fileURLWithPath: "/var/log/com.aic8800mac.wifi.log")
+        let url = URL(fileURLWithPath: "/var/log/com.usbwifi.wifi.log")
         NSWorkspace.shared.open(url)
     }
 
@@ -666,7 +717,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 }
 
 @main
-enum AIC8800MenuMain {
+enum USBWifiMain {
     static func main() {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)

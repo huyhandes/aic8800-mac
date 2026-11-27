@@ -1035,7 +1035,7 @@ int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail, gfp_t gfp)
 }
 
 /* ---------- firmware files ---------- */
-#define LKPI_FW_DEFAULT_DIR "/Library/Application Support/AIC8800/fw"
+#define LKPI_FW_DEFAULT_DIR "/Library/Application Support/USB Wifi/fw"
 #define LKPI_FW_MAX (8u << 20)
 
 static int fw_load(const struct firmware **out, const char *name, bool warn)

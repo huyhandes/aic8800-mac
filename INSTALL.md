@@ -21,22 +21,22 @@ Requirements:
 5. System Settings → Network now shows **USB Wi-Fi** with an IP address.
 
 Installing a newer package over 1.0.x upgrades in place and keeps the saved
-network. Check the installed version with `pkgutil --pkg-info com.aic8800mac.pkg`.
+network. Check the installed version with `pkgutil --pkg-info com.usbwifi.pkg`.
 
 What gets installed:
 
 | Path | What |
 |---|---|
 | `/Applications/USB Wifi.app` | menu bar app |
-| `/Library/PrivilegedHelperTools/aic8800-mac/` | daemons, bundled libusb, `install.sh` |
-| `/Library/Application Support/AIC8800/` | firmware (`fw/aic8800D80`, `fw/rtw89`), licenses, saved profile (`wifi.conf`, root 0600) |
-| `/Library/LaunchDaemons/com.aic8800mac.{fwload,wifi}.plist` | auto-start on plug (`fwload` only with the AIC8800D80 driver) |
-| `~/Library/LaunchAgents/com.aic8800mac.menu.plist` | menu app at login |
+| `/Library/PrivilegedHelperTools/usbwifi/` | daemons, bundled libusb, `install.sh` |
+| `/Library/Application Support/USB Wifi/` | firmware (`fw/aic8800D80`, `fw/rtw89`), licenses, saved profiles (`wifi.conf`, `wifi-N.conf` for the Nth extra dongle, root 0600), `adapters` (dongle MAC → slot) |
+| `/Library/LaunchDaemons/com.usbwifi.wifi.plist` | auto-start on plug |
+| `~/Library/LaunchAgents/com.usbwifi.menu.plist` | menu app at login |
 
 ## Uninstall
 
 ```sh
-sudo /Library/PrivilegedHelperTools/aic8800-mac/install.sh --uninstall
+sudo /Library/PrivilegedHelperTools/usbwifi/install.sh --uninstall
 ```
 
 ## Build from source
@@ -57,16 +57,17 @@ sudo installer -pkg build/USBWifi.pkg -target /
   dongle and scans (an AIC8800D80 only if its firmware is already running; an RTL8852BU
   needs the RTL8852BU driver installed, or `LKPI_FW_DIR=<dir holding rtw89/>`).
 - `sudo scripts/install.sh` installs straight from `build/`, without a package.
-- `sudo scripts/aic-up.sh <SSID>` runs the driver in the foreground for
+- `sudo scripts/usbwifi-up.sh <SSID>` runs the driver in the foreground for
   debugging. Do not run it while the daemon is installed, because both claim
   the USB interface.
 
 ## Troubleshooting
 
-- Logs are in `/var/log/com.aic8800mac.fwload.log` and `/var/log/com.aic8800mac.wifi.log`.
-- `scripts/bench-connect.sh [rounds]` measures reconnect time and needs no root.
+- The log is `/var/log/com.usbwifi.wifi.log` (AIC8800D80 firmware loader lines start with `[fwload]`).
+- `scripts/bench-connect.sh [rounds]` measures reconnect time and needs no root. Set `SLOT=N` to test another dongle.
+- `usbwifid status|scan|connect` and `scripts/usbwifi-up.sh` talk to slot 0 only. Use the menu app for other dongles.
 - The daemon reads these switches from the `EnvironmentVariables` of
-  `/Library/LaunchDaemons/com.aic8800mac.wifi.plist` (set any value, e.g. `1`,
+  `/Library/LaunchDaemons/com.usbwifi.wifi.plist` (set any value, e.g. `1`,
   then reload the daemon). Use them if a network misbehaves. All but `AICD_ALWAYS_SCAN` apply to the
   AIC8800D80 only:
 
@@ -82,7 +83,7 @@ sudo installer -pkg build/USBWifi.pkg -target /
   a little more power while connected.
 - A TX20U Nano that stays a "DISK" in System Information is still in driver-CD mode. The switch to
   Wi-Fi runs in your login session, so it needs a user logged in to the desktop; at the login window
-  or on a headless Mac, unplug and replug after logging in. `aic8800_wifi cd-eject` (as your user, not
+  or on a headless Mac, unplug and replug after logging in. `usbwifid cd-eject` (as your user, not
   root) does the switch by hand.
 - The dongle becomes the default route when it is first in the service order.
   If you want another service first, reorder services in System Settings → Network.

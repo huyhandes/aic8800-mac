@@ -13,6 +13,9 @@ Network.
 
 - WPA2-PSK and open networks on 2.4 and 5 GHz (WPA2/WPA3 transition networks join over WPA2). It prefers 5 GHz when the signal is good enough.
 - Menu bar app (**USB Wifi**) that shows the adapter chip and lets you scan, pick and forget networks. Passwords are stored in the login Keychain.
+- Several dongles at once, each on its own network. Every dongle gets its own network service
+  ("USB Wi-Fi", "USB Wi-Fi 2", ...) and its own section in the menu. Routing between them is left to you
+  (service order in System Settings, or `route`).
 - One installer: pick the AIC8800D80 driver, the RTL8852BU driver, or both.
 - A wrong password is reported as "Wrong password" and is not retried forever.
 - Starts automatically when the dongle is plugged in: launchd loads the firmware and joins the saved network.
@@ -52,20 +55,42 @@ daemon: `AICD_NO_VHT`, `AICD_NO_HE`, `AICD_PS` (power save back on),
 ## How it works
 
 ```
-dongle ──USB (libusb)── aic8800_wifi daemon ──BPF── feth81 ⇄ feth80 ── macOS network stack
+dongle ──USB (libusb)── usbwifid daemon ──BPF── feth81 ⇄ feth80 ── macOS network stack
 ```
 
-- `aic8800_fwload` pushes the AIC8800 firmware when that dongle appears in its mass-storage mode.
-- `aic8800_wifi --daemon` runs the WPA2 4-way handshake and the data path for either chip. It bridges Ethernet frames to a `feth` pair.
+- `usbwifid fwload` pushes the AIC8800 firmware when that dongle appears in its mass-storage mode. The daemon keeps it running as a child process when the AIC8800D80 driver is installed.
+- `usbwifid --daemon` runs the WPA2 4-way handshake and the data path for either chip. It bridges Ethernet frames to a `feth` pair.
   - AIC8800D80: the dongle firmware runs the MAC (LMAC); the daemon talks its USB message protocol.
   - RTL8852BU: the upstream Linux **rtw89** driver (`third_party/rtw89/`, unmodified) is compiled against
     `src/lkpi/`, a small userspace stand-in for the Linux kernel, USB and mac80211 APIs it uses, plus a
     station MLME (`src/lkpi/mlme.c`: scan, auth/assoc, keys, CCMP replay check, A-MPDU/BlockAck).
     The dongle first shows up as a Realtek "driver CD" (`0bda:1a2b`). Windows' WifiAutoInstallSrv sends it a
     SCSI eject on every plug; here the daemon detaches macOS's storage driver, and a per-user LaunchAgent
-    (`com.aic8800mac.cdswitch`, started by launchd on plug-in) sends the same eject, because macOS gives
+    (`com.usbwifi.cdswitch`, started by launchd on plug-in) sends the same eject, because macOS gives
     access to removable-media interfaces only to the logged-in user. Wi-Fi mode follows in about 2 s.
-- `aic_netsvc` creates the "USB Wi-Fi" network service.
+- `usbwifi_netsvc` creates the "USB Wi-Fi" network service.
+
+### Several dongles
+
+`usbwifid --daemon` is a supervisor. It runs one `usbwifid --worker` process per dongle, plus one idle
+worker that waits for the next dongle. macOS gives a USB interface to one process at a time, so each worker
+binds the first dongle that no other worker holds. A dongle's slot N is its line in
+`/Library/Application Support/USB Wifi/adapters`, keyed by MAC, so a dongle keeps its slot across replugs:
+
+| | slot 0 | slot N |
+|---|---|---|
+| network service | USB Wi-Fi | USB Wi-Fi N+1 |
+| interface | `feth80` (peer `feth81`) | `feth(80+2N)` (peer `feth(81+2N)`) |
+| control socket | `/var/run/usbwifi/0.sock` | `/var/run/usbwifi/N.sock` |
+| saved network | `wifi.conf` | `wifi-N.conf` |
+
+### Adding a chip driver
+
+`src/wifi_drv.h` is the contract between the chip-independent station core (`src/usbwifi_core.c`: scan list,
+connection state, WPA2 EAPOL, the `feth`/BPF side, slots) and a chip driver (`src/drv_aic8800.c`,
+`src/drv_rtw89.c`). To add a chip, implement `struct wifi_drv` (open, scan, connect, disconnect, add_key,
+set_authorized, tx) in `src/drv_<chip>.c`. Report results through `struct wifi_drv_events`, then add the
+driver to `wifi_drivers[]` in `usbwifi_core.c` and to `CORE_SRC` in the Makefile.
 
 ## Credits
 

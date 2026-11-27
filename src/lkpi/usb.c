@@ -5,6 +5,7 @@
  */
 #include "lkpi_usb.h"
 #include <libusb.h>
+#include "../wifi_drv.h"
 unsigned int geteuid(void); /* <unistd.h> clashes with the Linux uuid_t */
 #include <pthread/qos.h>
 
@@ -22,6 +23,7 @@ static int errno_of(int r)
 	case LIBUSB_ERROR_OVERFLOW: return -EOVERFLOW;
 	case LIBUSB_ERROR_NO_MEM: return -ENOMEM;
 	case LIBUSB_ERROR_BUSY: return -EBUSY;
+	case LIBUSB_ERROR_ACCESS: return -EACCES;
 	case LIBUSB_ERROR_INVALID_PARAM: return -EINVAL;
 	default: return -EIO;
 	}
@@ -328,8 +330,9 @@ static enum usb_device_speed speed_of(int s)
 	}
 }
 
-/* the matching device and its interface 0, or NULL; *cd is set if a Realtek driver CD is present */
-static libusb_device *find(const struct usb_device_id **idp, libusb_device **cd)
+/* the matching device after the first `skip` ones and its interface 0, or NULL; *cd is set if a
+   Realtek driver CD is present */
+static libusb_device *find(const struct usb_device_id **idp, libusb_device **cd, int skip)
 {
 	libusb_device **list, *found = NULL;
 	ssize_t n = libusb_get_device_list(ctx, &list);
@@ -346,7 +349,7 @@ static libusb_device *find(const struct usb_device_id **idp, libusb_device **cd)
 		if (libusb_get_active_config_descriptor(list[i], &cfg))
 			continue;
 		if (cfg->bNumInterfaces && cfg->interface[0].num_altsetting &&
-		    (*idp = match(&dd, &cfg->interface[0].altsetting[0])))
+		    (*idp = match(&dd, &cfg->interface[0].altsetting[0])) && skip-- == 0)
 			found = libusb_ref_device(list[i]);
 		libusb_free_config_descriptor(cfg);
 	}
@@ -433,10 +436,13 @@ static int bind_dev(libusb_device *dev, const struct usb_device_id *id, struct u
 	int r;
 
 	*out = NULL;
+	if (wifi_usb_lock(dev))
+		return -EACCES; /* bound by another worker: the caller moves on to the next one */
 	if ((r = libusb_open(dev, &h)))
 		return errno_of(r);
 	if ((r = libusb_claim_interface(h, 0))) {
-		lkpi_log(3, "usb: claim interface failed: %s\n", libusb_error_name(r));
+		/* ACCESS: another usbwifid process drives this dongle; the caller moves on to the next one */
+		lkpi_log(r == LIBUSB_ERROR_ACCESS ? 7 : 3, "usb: claim interface failed: %s\n", libusb_error_name(r));
 		libusb_close(h);
 		return errno_of(r);
 	}
@@ -503,16 +509,23 @@ struct usb_interface *lkpi_usb_probe(int timeout_ms)
 {
 	u64 end = lkpi_now_ns() + (u64)timeout_ms * NSEC_PER_MSEC;
 	struct usb_interface *intf = NULL;
-	int ejected = 0, switches = 0, r;
+	int ejected = 0, switches = 0, skip = 0, r;
 
 	if (!lkpi_usb_driver || usb_init_once())
 		return NULL;
 	for (;;) {
 		const struct usb_device_id *id;
-		libusb_device *cd, *dev = find(&id, &cd);
+		libusb_device *cd, *dev = find(&id, &cd, skip);
 
 		if (dev) {
 			r = bind_dev(dev, id, &intf);
+			if (r == -EACCES) {
+				skip++;
+				libusb_unref_device(dev);
+				if (cd)
+					libusb_unref_device(cd);
+				continue;
+			}
 			if (intf || r || ++switches > 2) {
 				if (r)
 					lkpi_log(3, "usb: probe failed: %d\n", r);
@@ -527,7 +540,7 @@ struct usb_interface *lkpi_usb_probe(int timeout_ms)
 				lkpi_sleep_us(100000);
 			end = max(end, lkpi_now_ns() + 10 * NSEC_PER_SEC);
 			libusb_unref_device(dev);
-		} else if (cd && !geteuid()) {
+		} else if ((skip = 0), cd && !geteuid()) { /* every match is taken: look for a driver CD */
 			detach_cd();
 		} else if (cd && ejected++ < 3) {
 			eject_cd(cd);

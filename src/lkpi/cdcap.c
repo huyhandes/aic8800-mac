@@ -115,7 +115,7 @@ static kern_return_t eject(io_service_t s)
 	return r;
 }
 
-/* Console-user half of plug-in (the com.aic8800mac.cdswitch LaunchAgent): macOS gates the CD's interface
+/* Console-user half of plug-in (the com.usbwifi.cdswitch LaunchAgent): macOS gates the CD's interface
    behind the per-user Removable Volumes permission, which a launchd daemon can never hold. IOKit's interface
    client, not libusb: libusb lists a device only through its device client, which the kernel refuses to
    non-root callers after the root half's capture (NeedsDeviceAccessEntitlement). 0 once no CD is left. */
