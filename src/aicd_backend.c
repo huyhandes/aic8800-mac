@@ -31,7 +31,7 @@
 extern char **environ;
 
 #define RX_BUF_BYTES  32768
-#define BPF_BUF_BYTES 65536
+#define BPF_BUF_BYTES 524288 /* = debug.bpf_maxbufsize; a small buffer drops TX bursts while the USB pool is full */
 
 typedef struct {
     bool started;
@@ -97,9 +97,12 @@ static void reord_reset(void);
 /* Host side link state mirrors the WiFi link so configd (Network UI) runs DHCP / shows status. */
 /* feth link status follows peering, not up/down: unpeer on WiFi loss so configd sees link-down and
    re-runs DHCP on the next network (otherwise it keeps the previous SSID's lease). */
+static bool host_up = true; /* unknown at start: the first down always runs */
 static void set_host_link(bool up) {
     if (!up) reord_reset(); /* frames buffered for the old link must not leak into the next one */
     if (g.bpf_fd < 0) return;
+    if (!up && !host_up) return; /* each ifconfig spawn costs connect time; already down */
+    host_up = up;
     char *p[] = { "ifconfig", AICD_IF_HOST, "peer", AICD_IF_PEER, NULL };
     char *np[] = { "ifconfig", AICD_IF_HOST, "-peer", NULL };
     char *a[] = { "ifconfig", AICD_IF_HOST, up ? "up" : "down", NULL };
@@ -165,6 +168,7 @@ static void reord_reset(void) {
     pthread_mutex_unlock(&rx_lock);
 }
 
+static struct timespec conn_t0; /* uc_connect start, for connect timing logs */
 static double since_ms(const struct timespec *t) {
     struct timespec n;
     clock_gettime(CLOCK_MONOTONIC, &n);
@@ -209,7 +213,7 @@ static void on_eth(const uint8_t *eth, size_t len, const aic_rx_frame_meta_t *me
 }
 
 /* RX diagnostics: where data chunks go (logged every 10 s when changed) */
-static struct { uint64_t chunks, emitted, zero, err, mpdu, ga, decr[8], last_sum; time_t last_log; } rxs;
+static struct { uint64_t chunks, emitted, zero, err, mpdu, ga, decr[8], last_sum, xfers, bytes; time_t last_log; } rxs;
 
 static void log_rx_stats(void) {
     time_t now = time(NULL);
@@ -217,8 +221,8 @@ static void log_rx_stats(void) {
     if (now - rxs.last_log < 10 || sum == rxs.last_sum) return;
     rxs.last_log = now;
     rxs.last_sum = sum;
-    fprintf(stderr, "aicd: rx chunks=%llu eth=%llu skip=%llu err=%llu mpdu=%llu group=%llu decr[unenc/tkip/ccmp]=%llu/%llu/%llu eth_out=%llu eapol=%llu tx=%llu reord[buf/dup/tmo]=%llu/%llu/%llu\n",
-            rxs.chunks, rxs.emitted, rxs.zero, rxs.err, rxs.mpdu, rxs.ga,
+    fprintf(stderr, "aicd: rx xfers=%llu bytes=%llu chunks=%llu eth=%llu skip=%llu err=%llu mpdu=%llu group=%llu decr[unenc/tkip/ccmp]=%llu/%llu/%llu eth_out=%llu eapol=%llu tx=%llu reord[buf/dup/tmo]=%llu/%llu/%llu\n",
+            rxs.xfers, rxs.bytes, rxs.chunks, rxs.emitted, rxs.zero, rxs.err, rxs.mpdu, rxs.ga,
             rxs.decr[AIC_RX_HD_DECR_UNENC], rxs.decr[AIC_RX_HD_DECR_TKIP], rxs.decr[AIC_RX_HD_DECR_CCMP128],
             g.rx_pkts, g.eapol_total, g.tx_pkts, reord.buffered_reorders, reord.dup_drops, reord.timeout_flushes);
 }
@@ -265,9 +269,10 @@ static void device_gone(void) {
 /* Several IN transfers stay queued so the dongle can push the next chunk while we process the last one
    (a single synchronous read left the bus idle between frames and capped RX near 25 Mbit/s).
    libusb completes transfers of one endpoint in submission order, so the stream stays ordered. */
-#define RX_XFERS 4
+#define RX_XFERS 16
 static void LIBUSB_CALL rx_done(struct libusb_transfer *t) {
     if (t->status == LIBUSB_TRANSFER_NO_DEVICE) device_gone();
+    if (t->status == LIBUSB_TRANSFER_COMPLETED) { rxs.xfers++; rxs.bytes += (uint64_t)t->actual_length; }
     if (t->status == LIBUSB_TRANSFER_COMPLETED && t->actual_length >= 4)
         (void)aic_rx_demux_usb_aggr(t->buffer, (size_t)t->actual_length, on_data_chunk, on_cfg_pkt, NULL);
     else if (t->status != LIBUSB_TRANSFER_COMPLETED) usleep(10000); /* transient error: don't spin */
@@ -406,6 +411,12 @@ static int bring_up_lmac(void) {
 
     aic_me_config_req_t me = {0};
     aic_build_d80_me_config_req(&me, g.fw_features, g.is_5g);
+    /* without vht_supp the LMAC ignores the AP's VHT Operation IE and caps the link at HT40 */
+    if (g.is_5g && !getenv("AICD_NO_VHT")) me.vht_supp = 1;
+    /* AIC firmware does not set the rwnx HE feature bit either; D80 is an 11ax chip */
+    if (!getenv("AICD_NO_HE")) me.he_supp = me.he_ul_on = 1;
+    /* power save lets the AP hold our frames until the next beacon (~100 ms spikes); latency wins */
+    if (!getenv("AICD_PS")) me.ps_on = me.dpsm = 0;
     CMD(AIC_ME_CONFIG_REQ, AIC_TASK_ME, &me, AIC_ME_CONFIG_CFM, (uint8_t *)NULL);
 
     aic_me_chan_config_req_t ch = {0};
@@ -437,6 +448,8 @@ static int bring_up_lmac(void) {
     CMD(AIC_MM_SET_AGG_DISABLE_REQ, AIC_TASK_MM, &agg, AIC_MM_SET_AGG_DISABLE_CFM, (uint8_t *)NULL);
 
     g.lmac_ready = true;
+    fprintf(stderr, "aicd: features=0x%08x ht=%u vht=%u he=%u ps=%u dpsm=%u bw_max=%u\n", g.fw_features,
+            me.ht_supp, me.vht_supp, me.he_supp, me.ps_on, me.dpsm, me.phy_bw_max);
     fprintf(stderr, "aicd: LMAC ready chip=0x%08x fw=%s lmac=0x%08x 5G=%u mac=%02x:%02x:%02x:%02x:%02x:%02x vif=%u\n",
             g.chip_id, (char *)g.fw_version, g.lmac_ver, g.is_5g,
             g.mac[0], g.mac[1], g.mac[2], g.mac[3], g.mac[4], g.mac[5], g.vif_idx);
@@ -493,7 +506,8 @@ static void on_async_ind(uint16_t id, const uint8_t *param, uint16_t len, void *
             g.associated = g.link_up = false;
         }
         pthread_mutex_unlock(&g.state_lock);
-        fprintf(stderr, "aicd: SM_CONNECT_IND status=%u ap_idx=%u freq=%u\n", ind.status_code, ind.ap_idx, ind.center_freq);
+        fprintf(stderr, "aicd: SM_CONNECT_IND status=%u ap_idx=%u freq=%u width=%u cf1=%u qos=%u at=%.1fms\n", ind.status_code,
+                ind.ap_idx, ind.center_freq, ind.width, ind.center_freq1, ind.qos, since_ms(&conn_t0));
     } else if (id == AIC_SM_DISCONNECT_IND) {
         if (!param || len < sizeof(aic_sm_disconnect_ind_t)) return;
         aic_sm_disconnect_ind_t ind;
@@ -510,17 +524,64 @@ static void on_async_ind(uint16_t id, const uint8_t *param, uint16_t len, void *
 
 /* -------------------------------------------------------------- TX path */
 
+/* Async TX pool: a synchronous bulk write per frame waits a full USB round trip, which capped upload
+   near 1 frame per 125 us microframe (~96 Mbit/s). Keeping TX_XFERS frames queued lets the host
+   controller stream them back to back; one endpoint completes in submission order, so order holds. */
+#define TX_XFERS 64
+static struct libusb_transfer *tx_free[TX_XFERS];
+static int tx_nfree = -1; /* -1 = pool not built yet */
+static pthread_cond_t tx_cond = PTHREAD_COND_INITIALIZER;
+
+static void LIBUSB_CALL tx_done(struct libusb_transfer *t) {
+    pthread_mutex_lock(&g.tx_lock);
+    if (t->status == LIBUSB_TRANSFER_COMPLETED) g.tx_pkts++;
+    tx_free[tx_nfree++] = t;
+    pthread_cond_signal(&tx_cond);
+    pthread_mutex_unlock(&g.tx_lock);
+}
+
+static pthread_mutex_t tx_serial = PTHREAD_MUTEX_INITIALIZER; /* submit order; tx_lock guards only the pool */
+
 static int tx_eth(const uint8_t *eth, size_t len, uint8_t sta_idx) {
-    uint8_t wire[AIC_DATA_BUF_MAX + 64];
+    pthread_mutex_lock(&tx_serial);
+    pthread_mutex_lock(&g.tx_lock);
+    if (tx_nfree < 0) {
+        for (tx_nfree = 0; tx_nfree < TX_XFERS; ++tx_nfree) {
+            struct libusb_transfer *t = libusb_alloc_transfer(0);
+            uint8_t *buf = malloc(AIC_DATA_BUF_MAX + 64);
+            if (!t || !buf) exit(1);
+            libusb_fill_bulk_transfer(t, g.h, g.ep_out_data, buf, 0, tx_done, NULL, 1000);
+            tx_free[tx_nfree] = t;
+        }
+    }
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 1;
+    while (tx_nfree == 0 && !g.stopping)
+        if (pthread_cond_timedwait(&tx_cond, &g.tx_lock, &dl) == ETIMEDOUT) break;
+    struct libusb_transfer *t = tx_nfree > 0 ? tx_free[--tx_nfree] : NULL;
+    pthread_mutex_unlock(&g.tx_lock);
+    if (!t) { pthread_mutex_unlock(&tx_serial); return LIBUSB_ERROR_TIMEOUT; }
+
     size_t wlen = 0;
     uint8_t tid = g.ap_qos ? AIC_STA_DEFAULT_TID : AIC_STA_NONQOS_TID;
-    if (aic_tx_encode_eth_frame(eth, len, sta_idx, g.vif_idx, tid, AIC_RWNX_HWQ_BE, 0U, true,
-                                wire, sizeof(wire), &wlen) != 0)
-        return -1;
-    pthread_mutex_lock(&g.tx_lock);
-    int rc = usb_bulk_out(g.ep_out_data, g.mps_data, wire, (int)wlen, 1000);
-    pthread_mutex_unlock(&g.tx_lock);
-    if (rc == 0) g.tx_pkts++;
+    int rc = aic_tx_encode_eth_frame(eth, len, sta_idx, g.vif_idx, tid, AIC_RWNX_HWQ_BE, 0U, true,
+                                     t->buffer, AIC_DATA_BUF_MAX + 64, &wlen) != 0 ? -1 : 0;
+    if (rc == 0) {
+        t->length = (int)wlen;
+        rc = libusb_submit_transfer(t);
+        /* rare (len % 512 == 0): the ZLP queues behind the data on the same pipe, so order holds */
+        if (rc == 0 && aic_usb_needs_zlp((uint32_t)wlen, g.mps_data)) {
+            int done = 0;
+            (void)libusb_bulk_transfer(g.h, g.ep_out_data, NULL, 0, &done, 1000);
+        }
+    }
+    if (rc != 0) {
+        pthread_mutex_lock(&g.tx_lock);
+        tx_free[tx_nfree++] = t;
+        pthread_mutex_unlock(&g.tx_lock);
+    }
+    pthread_mutex_unlock(&tx_serial);
     return rc;
 }
 
@@ -770,6 +831,7 @@ kern_return_t uc_connect(io_connect_t conn, const aic_wifi_connect_req_t *in, ai
         return kIOReturnBadArgument;
     *out = *in;
     out->out_status = 0xFF;
+    clock_gettime(CLOCK_MONOTONIC, &conn_t0);
 
     /* stale keys from the previous association make the next 4-way handshake fail (AP never sends msg3);
        Linux deletes them via wpa_supplicant del_key on disconnect */
@@ -789,7 +851,9 @@ kern_return_t uc_connect(io_connect_t conn, const aic_wifi_connect_req_t *in, ai
     memcpy(g.target_ssid, in->ssid, in->ssid_len);
     memset(g.ap_bssid, 0, 6);
     pthread_mutex_unlock(&g.state_lock);
+    double t_keys = since_ms(&conn_t0);
     set_host_link(false);
+    fprintf(stderr, "aicd: connect timing keydel=%.1fms hostlink=%.1fms\n", t_keys, since_ms(&conn_t0) - t_keys);
 
     aic_sm_connect_req_t r;
     memset(&r, 0, sizeof(r));
@@ -811,6 +875,7 @@ kern_return_t uc_connect(io_connect_t conn, const aic_wifi_connect_req_t *in, ai
     kern_return_t ret = send_cmd(AIC_SM_CONNECT_REQ, AIC_TASK_SM, &r, sizeof(r),
                                  AIC_SM_CONNECT_CFM, &cfm, sizeof(cfm), &l);
     if (ret == KERN_SUCCESS) out->out_status = l >= sizeof(cfm) ? cfm.status : 0;
+    fprintf(stderr, "aicd: connect timing cfm=%.1fms\n", since_ms(&conn_t0));
     return ret;
 }
 

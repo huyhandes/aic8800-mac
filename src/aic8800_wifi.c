@@ -129,8 +129,8 @@ static int run_scan_and_wait(io_connect_t conn,
         return -1;
     }
 
-    for (int i = 0; i < 300; ++i) {
-        usleep(20000);
+    for (int i = 0; i < 3000; ++i) {
+        usleep(2000);
         kr = uc_get_scan_results(conn, out_list);
         if (kr != KERN_SUCCESS) {
             set_err(err_buf, err_cap, "GET_SCAN_RESULTS failed: 0x%08x", kr);
@@ -244,6 +244,14 @@ static int perform_connect(io_connect_t conn,
     const bool fast = n_known > 0 && strcmp(known_ssid, ssid_arg) == 0;
     aic_wifi_scan_list_t list;
     const aic_wifi_scan_bss_t *target = NULL;
+    /* reconnect to the BSS of the last successful join without scanning; cleared on any failure */
+    static aic_wifi_scan_bss_t last_bss;
+    static bool have_last;
+    if (fast && have_last && !getenv("AICD_ALWAYS_SCAN")) {
+        printf("[1/4] Reusing last BSS for \"%s\" (no scan)...\n", ssid_arg);
+        target = &last_bss;
+    }
+    have_last = false;
     for (int pass = fast ? 0 : 1; pass < 2 && !target; ++pass) {
         printf("[1/4] Scanning for \"%s\"%s...\n", ssid_arg, pass == 0 ? " (known channels)" : "");
         if (run_scan_and_wait(conn, (const uint8_t *)ssid_arg, (uint8_t)ssid_len,
@@ -332,8 +340,8 @@ static int perform_connect(io_connect_t conn,
     }
 
     bool assoc_ok = false;
-    for (int i = 0; i < 300; ++i) {
-        usleep(20000);
+    for (int i = 0; i < 3000; ++i) {
+        usleep(2000);
         if (uc_get_status(conn, &st) == KERN_SUCCESS) {
             if (st.associated) {
                 assoc_ok = true;
@@ -365,7 +373,7 @@ static int perform_connect(io_connect_t conn,
 
         bool keys_installed = false;
         bool replied = false; /* msg2 sent: AP silence after it means its MIC (i.e. the PSK) was wrong */
-        for (int i = 0; i < 600 && !keys_installed; ++i) {
+        for (int i = 0; i < 3000 && !keys_installed; ++i) {
             aic_wifi_eapol_frame_t rx_frame;
             if (uc_poll_eapol(conn, &rx_frame) == KERN_SUCCESS && rx_frame.has_frame) {
                 uint8_t reply_eth[AIC_WIFI_EAPOL_MAX_FRAME];
@@ -417,7 +425,7 @@ static int perform_connect(io_connect_t conn,
                     keys_installed = true;
                 }
             } else {
-                usleep(10000);
+                usleep(2000);
             }
         }
 
@@ -449,6 +457,8 @@ static int perform_connect(io_connect_t conn,
     if (out_is_open) {
         *out_is_open = is_open;
     }
+    if (target != &last_bss) last_bss = *target;
+    have_last = true;
     return 0;
 }
 
