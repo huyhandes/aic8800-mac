@@ -499,7 +499,9 @@ static libusb_device_handle *open_free_aic(void) {
 }
 
 static int usb_open(void) {
-    if (libusb_init(&a.ctx) != 0) return -1;
+    /* one context for the process: a new one re-reads every USB device's descriptors over EP0, which
+       every 1.5 s (the idle worker's retry) stalls the register I/O of a dongle another worker drives */
+    if (!a.ctx && libusb_init(&a.ctx) != 0) return -1;
     a.h = open_free_aic();
     if (!a.h) goto fail;
     struct libusb_config_descriptor *cfg = NULL;
@@ -524,8 +526,6 @@ static int usb_open(void) {
 fail:
     if (a.h) libusb_close(a.h);
     a.h = NULL;
-    libusb_exit(a.ctx);
-    a.ctx = NULL;
     return -1;
 }
 
