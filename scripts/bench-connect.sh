@@ -18,10 +18,10 @@ for r in $(seq 1 "$N"); do
   tp=$!
   cmd RECONNECT >/dev/null
   t_ip=""; t_ping=""
-  for _ in {1..300}; do
+  for _ in {1..1500}; do
     if [[ -z "$t_ip" && -n "$(ip4)" ]]; then t_ip=$(now); fi
     if [[ -n "$t_ip" ]] && ping -c1 -t1 -b feth80 1.1.1.1 >/dev/null 2>&1; then t_ping=$(now); break; fi
-    sleep 0.1
+    sleep 0.02
   done
   sleep 0.3; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null || true
   echo "round $r: ip=$(awk "BEGIN{print ${t_ip:-0}-$start}")s ping=$(awk "BEGIN{print ${t_ping:-0}-$start}")s ($(ip4))"

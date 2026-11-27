@@ -17,10 +17,37 @@ Network.
 - A wrong password is reported as "Wrong password" and is not retried forever.
 - Starts automatically when the dongle is plugged in: launchd loads the firmware and joins the saved network.
 - macOS (configd) handles DHCP and IPv6. The link state follows Wi-Fi, so DHCP runs again after a network change.
-- AIC8800D80: reconnects and gets an IP in about 1.3 s. Download speed is about 65–70 Mbit/s with RX A-MPDU and BlockAck reorder.
+- AIC8800D80: 802.11ax at 80 MHz on 5 GHz, with TX/RX A-MPDU and BlockAck reorder. Power save is off for low latency.
+  Reconnects to the saved network in about 0.5 s (see [Performance](#performance)).
 - Drops the Wi-Fi link on system sleep, so the dongle does not keep waking the Mac.
 
 See [INSTALL.md](INSTALL.md) to install or build.
+
+## Performance
+
+Measured with v1.0.2 on an Apple Silicon MacBook, 5 GHz 80 MHz 802.11ax AP. The
+built-in Wi-Fi was on the same AP. LAN numbers are `iperf3` to another host on
+the same network.
+
+| | Dongle (`feth80`) | Built-in Wi-Fi (`en0`) |
+|---|---|---|
+| Ping to the AP (idle) | ~2 ms | ~9 ms |
+| Reconnect → IP / first ping | 0.48–0.53 s / 0.53–0.59 s | — / 1.4–1.6 s (radio off → on) |
+| LAN TCP upload / download | ~250 / ~240 Mbit/s | 457 / 317 Mbit/s |
+| LAN UDP, both directions | ~310 Mbit/s | not measured |
+| Internet, `networkQuality` up / down | 250 / 234 Mbit/s | 240 / 232 Mbit/s |
+
+- Throughput is capped by USB 2.0 (480 Mbit/s raw, about 310 Mbit/s of
+  payload here) and by the dongle having one spatial stream. Most built-in
+  Wi-Fi has two.
+- About 390 ms of each reconnect is the firmware's own wait between the connect
+  request and the association result. The driver cannot shorten it.
+- The 1.4–1.6 s for the built-in Wi-Fi includes powering the radio back on, so
+  it is not an exact like-for-like comparison.
+
+Each optimization can be turned off with an environment variable on the
+daemon: `AICD_NO_VHT`, `AICD_NO_HE`, `AICD_PS` (power save back on),
+`AICD_ALWAYS_SCAN`.
 
 ## How it works
 

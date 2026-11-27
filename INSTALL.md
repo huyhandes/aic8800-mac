@@ -20,6 +20,9 @@ Requirements:
    saved in your login Keychain, and the network is joined automatically next time.
 5. System Settings → Network now shows **USB Wi-Fi** with an IP address.
 
+Installing a newer package over 1.0.x upgrades in place and keeps the saved
+network. Check the installed version with `pkgutil --pkg-info com.aic8800mac.pkg`.
+
 What gets installed:
 
 | Path | What |
@@ -62,9 +65,21 @@ sudo installer -pkg build/USBWifi.pkg -target /
 
 - Logs are in `/var/log/com.aic8800mac.fwload.log` and `/var/log/com.aic8800mac.wifi.log`.
 - `scripts/bench-connect.sh [rounds]` measures reconnect time and needs no root.
-- If the link is unstable under load, turn off RX aggregation: set
-  `AICD_NO_RX_AGG=1` in the `EnvironmentVariables` of
-  `/Library/LaunchDaemons/com.aic8800mac.wifi.plist`, then reload the daemon.
+- The daemon reads these switches from the `EnvironmentVariables` of
+  `/Library/LaunchDaemons/com.aic8800mac.wifi.plist` (set any value, e.g. `1`,
+  then reload the daemon). Use them if a network misbehaves. All but `AICD_ALWAYS_SCAN` apply to the
+  AIC8800D80 only:
+
+  | Variable | Effect |
+  |---|---|
+  | `AICD_NO_RX_AGG` | turn off RX aggregation, if the link is unstable under load |
+  | `AICD_NO_VHT` | do not offer 802.11ac (5 GHz falls back to HT40) |
+  | `AICD_NO_HE` | do not offer 802.11ax |
+  | `AICD_PS` | turn power save back on: less power, higher and spikier latency |
+  | `AICD_ALWAYS_SCAN` | always scan before reconnecting, instead of reusing the last network |
+
+- Since 1.0.2, power save is off by default for low latency, so the dongle draws
+  a little more power while connected.
 - A TX20U Nano that stays a "DISK" in System Information is still in driver-CD mode. The switch to
   Wi-Fi runs in your login session, so it needs a user logged in to the desktop; at the login window
   or on a headless Mac, unplug and replug after logging in. `aic8800_wifi cd-eject` (as your user, not
