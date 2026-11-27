@@ -18,6 +18,9 @@ Requirements:
    saved in your login Keychain, and the network is joined automatically next time.
 5. System Settings → Network now shows **UGREEN WiFi** with an IP address.
 
+Installing a newer package over 1.0.x upgrades in place and keeps the saved
+network. Check the installed version with `pkgutil --pkg-info com.aic8800mac.pkg`.
+
 What gets installed:
 
 | Path | What |
@@ -57,8 +60,19 @@ sudo installer -pkg build/AIC8800-mac.pkg -target /
 
 - Logs are in `/var/log/com.aic8800mac.fwload.log` and `/var/log/com.aic8800mac.wifi.log`.
 - `scripts/bench-connect.sh [rounds]` measures reconnect time and needs no root.
-- If the link is unstable under load, turn off RX aggregation: set
-  `AICD_NO_RX_AGG=1` in the `EnvironmentVariables` of
-  `/Library/LaunchDaemons/com.aic8800mac.wifi.plist`, then reload the daemon.
+- The daemon reads these switches from the `EnvironmentVariables` of
+  `/Library/LaunchDaemons/com.aic8800mac.wifi.plist` (set any value, e.g. `1`,
+  then reload the daemon). Use them if a network misbehaves:
+
+  | Variable | Effect |
+  |---|---|
+  | `AICD_NO_RX_AGG` | turn off RX aggregation, if the link is unstable under load |
+  | `AICD_NO_VHT` | do not offer 802.11ac (5 GHz falls back to HT40) |
+  | `AICD_NO_HE` | do not offer 802.11ax |
+  | `AICD_PS` | turn power save back on: less power, higher and spikier latency |
+  | `AICD_ALWAYS_SCAN` | always scan before reconnecting, instead of reusing the last network |
+
+- Since 1.0.2, power save is off by default for low latency, so the dongle draws
+  a little more power while connected.
 - The dongle becomes the default route when it is first in the service order.
   If you want another service first, reorder services in System Settings → Network.
