@@ -23,7 +23,7 @@
 #include "aic8800_framing.h"
 #include "aic8800_fwload_ctl.h"
 
-#define AIC_FW_DEFAULT_DIR "fw/aic8800D80" /* dev fallback, relative to the repo root */
+#define AIC_FW_DEFAULT_DIR "/Users/rush/.gemini/antigravity/brain/3af3af06-ee65-4085-960c-f78f553e3493/scratch/aic8800d80/fw/aic8800D80"
 
 #define AIC_BTMODE_BT_ONLY_COANT    0x05U
 #define AIC_BTPORT_MB               0x01U
