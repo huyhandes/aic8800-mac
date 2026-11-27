@@ -27,6 +27,7 @@
 #include "aic8800_framing.h"
 #include "aic8800_lmac.h"
 #include "aic8800_reord.h"
+#include "rtwd.h"
 
 extern char **environ;
 
@@ -443,31 +444,35 @@ static int bring_up_lmac(void) {
     return 0;
 }
 
+static void scan_add(aic_wifi_scan_bss_t bss) {
+    pthread_mutex_lock(&g.state_lock);
+    int match = -1, weakest = 0;
+    for (uint16_t i = 0; i < g.scan_count; i++) {
+        if (memcmp(g.scan_bss[i].bssid, bss.bssid, 6) == 0) { match = i; break; }
+        if (g.scan_bss[i].rssi < g.scan_bss[weakest].rssi) weakest = i;
+    }
+    if (match >= 0) {
+        aic_wifi_scan_bss_t *o = &g.scan_bss[match];
+        if (bss.ssid_len == 0 && o->ssid_len) { bss.ssid_len = o->ssid_len; memcpy(bss.ssid, o->ssid, AIC_MAC_SSID_LEN); }
+        if (bss.sec_mask == 0 && o->sec_mask) {
+            bss.sec_mask = o->sec_mask; bss.pairwise_cipher = o->pairwise_cipher;
+            bss.group_cipher = o->group_cipher; bss.rsn_capab = o->rsn_capab;
+        }
+        *o = bss;
+    } else if (g.scan_count < AIC_WIFI_MAX_SCAN_BSS) {
+        g.scan_bss[g.scan_count++] = bss;
+    } else if (bss.rssi > g.scan_bss[weakest].rssi) {
+        g.scan_bss[weakest] = bss;
+    }
+    pthread_mutex_unlock(&g.state_lock);
+}
+
 static void on_async_ind(uint16_t id, const uint8_t *param, uint16_t len, void *ctx) {
     (void)ctx;
     if (id == AIC_SCANU_RESULT_IND) {
         aic_wifi_scan_bss_t bss;
         if (aic_parse_scanu_result_ind(param, len, &bss) != 0) return;
-        pthread_mutex_lock(&g.state_lock);
-        int match = -1, weakest = 0;
-        for (uint16_t i = 0; i < g.scan_count; i++) {
-            if (memcmp(g.scan_bss[i].bssid, bss.bssid, 6) == 0) { match = i; break; }
-            if (g.scan_bss[i].rssi < g.scan_bss[weakest].rssi) weakest = i;
-        }
-        if (match >= 0) {
-            aic_wifi_scan_bss_t *o = &g.scan_bss[match];
-            if (bss.ssid_len == 0 && o->ssid_len) { bss.ssid_len = o->ssid_len; memcpy(bss.ssid, o->ssid, AIC_MAC_SSID_LEN); }
-            if (bss.sec_mask == 0 && o->sec_mask) {
-                bss.sec_mask = o->sec_mask; bss.pairwise_cipher = o->pairwise_cipher;
-                bss.group_cipher = o->group_cipher; bss.rsn_capab = o->rsn_capab;
-            }
-            *o = bss;
-        } else if (g.scan_count < AIC_WIFI_MAX_SCAN_BSS) {
-            g.scan_bss[g.scan_count++] = bss;
-        } else if (bss.rssi > g.scan_bss[weakest].rssi) {
-            g.scan_bss[weakest] = bss;
-        }
-        pthread_mutex_unlock(&g.state_lock);
+        scan_add(bss);
     } else if (id == AIC_SCANU_START_CFM) {
         pthread_mutex_lock(&g.state_lock);
         g.scanning = false;
@@ -508,9 +513,54 @@ static void on_async_ind(uint16_t id, const uint8_t *param, uint16_t len, void *
     }
 }
 
+/* ------------------------------------------------ rtw89 (Realtek) mode */
+/* No AIC8800 on the bus: drive a Realtek dongle through the ported rtw89 driver (src/lkpi, rtwd.h).
+   The uc_* calls below keep their contract; only the device side changes. */
+static bool rtw;
+
+static void rtw_bss(const uint8_t *mgmt, size_t len, uint16_t freq, int8_t rssi) {
+    uint8_t buf[sizeof(aic_scanu_result_ind_hdr_t) + 2400];
+    aic_scanu_result_ind_hdr_t h = { .length = (uint16_t)len, .center_freq = freq,
+                                     .band = freq > 4000 ? AIC_PHY_BAND_5G : AIC_PHY_BAND_2G4, .rssi = rssi };
+    aic_wifi_scan_bss_t bss;
+    if (len > sizeof(buf) - sizeof(h)) return;
+    memcpy(buf, &h, sizeof(h));
+    memcpy(buf + sizeof(h), mgmt, len);
+    if (aic_parse_scanu_result_ind(buf, sizeof(h) + len, &bss) == 0) scan_add(bss);
+}
+
+static void rtw_scan_done(bool aborted) {
+    pthread_mutex_lock(&g.state_lock);
+    g.scanning = false;
+    g.scan_done = true;
+    pthread_mutex_unlock(&g.state_lock);
+}
+
+static void rtw_rx(const uint8_t *eth, size_t len, bool is_eapol) {
+    if (is_eapol) enqueue_eapol(eth, len);
+    else deliver_eth(eth, len);
+}
+
+static void rtw_disconnected(uint16_t reason) {
+    pthread_mutex_lock(&g.state_lock);
+    g.associated = g.link_up = false;
+    g.disconnect_reason = reason;
+    g.eapol_head = g.eapol_tail = g.eapol_count = 0;
+    pthread_mutex_unlock(&g.state_lock);
+    fprintf(stderr, "aicd: rtw disconnected reason=%u\n", reason);
+    set_host_link(false);
+}
+
+static const struct rtwd_cb rtw_cb = { rtw_bss, rtw_scan_done, rtw_rx, rtw_disconnected };
+
 /* -------------------------------------------------------------- TX path */
 
 static int tx_eth(const uint8_t *eth, size_t len, uint8_t sta_idx) {
+    if (rtw) {
+        int rc = rtwd_tx_eth(eth, len);
+        if (rc == 0) g.tx_pkts++;
+        return rc;
+    }
     uint8_t wire[AIC_DATA_BUF_MAX + 64];
     size_t wlen = 0;
     uint8_t tid = g.ap_qos ? AIC_STA_DEFAULT_TID : AIC_STA_NONQOS_TID;
@@ -657,13 +707,24 @@ int open_wifi_client(io_connect_t *out_conn, io_service_t *out_svc, bool quiet, 
         inited = true;
     }
 
-    if (usb_open(quiet) != 0) return -1; /* not plugged / firmware not loaded yet: caller retries */
-    for (int i = 0; i < REORD_POOL; ++i) { rpool[i].next = rfree; rfree = &rpool[i]; }
-    reord_reset();
-    if (pthread_create(&g.rx_thr, NULL, rx_thread, NULL) != 0) exit(1);
-    if (bring_up_lmac() != 0) {
-        fprintf(stderr, "error: LMAC bring-up failed (replug dongle and reload firmware)\n");
-        exit(1);
+    if (usb_open(true) == 0) {
+        for (int i = 0; i < REORD_POOL; ++i) { rpool[i].next = rfree; rfree = &rpool[i]; }
+        reord_reset();
+        if (pthread_create(&g.rx_thr, NULL, rx_thread, NULL) != 0) exit(1);
+        if (bring_up_lmac() != 0) {
+            fprintf(stderr, "error: LMAC bring-up failed (replug dongle and reload firmware)\n");
+            exit(1);
+        }
+    } else if (rtwd_open(&rtw_cb, g.mac, 1000) == 0) {
+        rtw = true;
+        g.lmac_ready = true;
+        g.is_5g = 1;
+        snprintf((char *)g.fw_version, sizeof(g.fw_version), "%s", rtwd_chip());
+        fprintf(stderr, "aicd: %s up, mac %02x:%02x:%02x:%02x:%02x:%02x\n", rtwd_chip(),
+                g.mac[0], g.mac[1], g.mac[2], g.mac[3], g.mac[4], g.mac[5]);
+    } else {
+        if (!quiet) fprintf(stderr, "error: no supported USB WiFi dongle found (AIC8800 or RTL8852BU)\n");
+        return -1; /* not plugged / firmware not loaded yet: caller retries */
     }
     if (getenv("AICD_NO_NET") == NULL) {
         if (setup_feth() != 0) exit(1);
@@ -684,8 +745,16 @@ void get_bsd_name(io_service_t svc, char *buf, size_t cap) {
 
 /* --------------------------------------------------- control operations */
 
+/* RTL8852BU loses MAC power state across system sleep (rtw89 "mac preinit fail" -60 after wake);
+   restart like an unplug so launchd re-binds and reloads firmware.
+   shortcut: full ~3 s re-probe on every wake, upgrade to rtw89 suspend/resume ops if wake latency matters */
+void uc_system_woke(void) { if (rtw) device_gone(); }
+
+const char *uc_chip_name(void) { return rtw ? rtwd_chip() : g.lmac_ready ? "AIC8800D80" : ""; }
+
 kern_return_t uc_get_status(io_connect_t conn, aic_wifi_status_t *o) {
     (void)conn;
+    if (rtw && rtwd_gone()) device_gone();
     memset(o, 0, sizeof(*o));
     o->version = AIC_WIFI_CTL_VERSION;
     pthread_mutex_lock(&g.state_lock);
@@ -732,6 +801,15 @@ kern_return_t uc_start_scan(io_connect_t conn, const uint8_t *ssid, uint8_t ssid
     memset(g.scan_bss, 0, sizeof(g.scan_bss));
     pthread_mutex_unlock(&g.state_lock);
 
+    if (rtw) {
+        int rc = rtwd_scan(ssid_len ? ssid : NULL, ssid_len, freqs, n_freqs);
+        if (rc) {
+            pthread_mutex_lock(&g.state_lock);
+            g.scanning = g.scan_done = false;
+            pthread_mutex_unlock(&g.state_lock);
+        }
+        return rc == 0 ? KERN_SUCCESS : rc == -EBUSY ? kIOReturnBusy : kIOReturnError;
+    }
     aic_scanu_start_req_t req;
     aic_build_scanu_start_req(&req, g.vif_idx, g.is_5g != 0, ssid_len ? ssid : NULL, ssid_len, false);
     if (n_freqs > 0) { /* keep only the requested channels (with their band/flags from the full list) */
@@ -773,7 +851,7 @@ kern_return_t uc_connect(io_connect_t conn, const aic_wifi_connect_req_t *in, ai
 
     /* stale keys from the previous association make the next 4-way handshake fail (AP never sends msg3);
        Linux deletes them via wpa_supplicant del_key on disconnect */
-    for (uint8_t i = 0; i < g.n_hw_keys; ++i) {
+    for (uint8_t i = 0; i < g.n_hw_keys && !rtw; ++i) {
         aic_mm_key_del_req_t d = { g.hw_keys[i] };
         (void)send_cmd(AIC_MM_KEY_DEL_REQ, AIC_TASK_MM, &d, sizeof(d), AIC_MM_KEY_DEL_CFM, NULL, 0, NULL);
     }
@@ -790,6 +868,23 @@ kern_return_t uc_connect(io_connect_t conn, const aic_wifi_connect_req_t *in, ai
     memset(g.ap_bssid, 0, 6);
     pthread_mutex_unlock(&g.state_lock);
     set_host_link(false);
+
+    if (rtw) { /* synchronous: auth + assoc are done when this returns */
+        int rc = rtwd_connect(in->bssid, in->freq, in->ssid, in->ssid_len, in->ie_len ? in->ie_buf : NULL, in->ie_len);
+        pthread_mutex_lock(&g.state_lock);
+        g.assoc_status = rc == 0 ? 0 : 1; /* any non-zero status reads as "rejected" upstream */
+        g.associated = rc == 0;
+        if (rc == 0) {
+            memcpy(g.ap_bssid, in->bssid, 6);
+            g.ap_center_freq = in->freq;
+            g.ap_band = in->band;
+            g.ap_qos = 1;
+        }
+        pthread_mutex_unlock(&g.state_lock);
+        if (rc) fprintf(stderr, "aicd: rtw connect failed: %d\n", rc);
+        out->out_status = 0;
+        return KERN_SUCCESS;
+    }
 
     aic_sm_connect_req_t r;
     memset(&r, 0, sizeof(r));
@@ -824,6 +919,10 @@ kern_return_t uc_disconnect(io_connect_t conn, uint16_t reason) {
     g.eapol_head = g.eapol_tail = g.eapol_count = 0;
     pthread_mutex_unlock(&g.state_lock);
     set_host_link(false);
+    if (rtw) {
+        rtwd_disconnect(reason ? reason : 3);
+        return KERN_SUCCESS;
+    }
     if (was) {
         aic_me_set_control_port_req_t p = { sta, 0 };
         (void)send_cmd(AIC_ME_SET_CONTROL_PORT_REQ, AIC_TASK_ME, &p, sizeof(p), AIC_ME_SET_CONTROL_PORT_CFM, NULL, 0, NULL);
@@ -859,6 +958,12 @@ kern_return_t uc_add_key(io_connect_t conn, uint8_t key_idx, bool pairwise, uint
     (void)conn;
     if (!g.lmac_ready || !g.associated) return kIOReturnNotReady;
     if (key_len > AIC_MAC_SEC_KEY_LEN) return kIOReturnBadArgument;
+    if (rtw) {
+        if (cipher != AIC_CIPHER_CCMP) return kIOReturnUnsupported;
+        if (out_hw_idx) *out_hw_idx = pairwise ? 0 : key_idx;
+        return rtwd_add_key(pairwise, pairwise ? 0 : key_idx, 0x000FAC04 /* CCMP-128 */, key, key_len) == 0
+                   ? KERN_SUCCESS : kIOReturnIOError;
+    }
     aic_mm_key_add_req_t r;
     memset(&r, 0, sizeof(r));
     r.sta_idx = pairwise ? g.ap_sta_idx : 0xFF;
@@ -884,9 +989,14 @@ kern_return_t uc_set_port_link(io_connect_t conn, bool open_port, bool link_up) 
     (void)conn;
     if (!g.lmac_ready) return kIOReturnNotReady;
     if (!g.associated && (open_port || link_up)) return kIOReturnNotReady;
-    aic_me_set_control_port_req_t p = { g.ap_sta_idx, open_port ? 1 : 0 };
-    kern_return_t ret = send_cmd(AIC_ME_SET_CONTROL_PORT_REQ, AIC_TASK_ME, &p, sizeof(p),
-                                 AIC_ME_SET_CONTROL_PORT_CFM, NULL, 0, NULL);
+    kern_return_t ret;
+    if (rtw) {
+        ret = rtwd_set_authorized(open_port) == 0 ? KERN_SUCCESS : kIOReturnNotReady;
+    } else {
+        aic_me_set_control_port_req_t p = { g.ap_sta_idx, open_port ? 1 : 0 };
+        ret = send_cmd(AIC_ME_SET_CONTROL_PORT_REQ, AIC_TASK_ME, &p, sizeof(p),
+                       AIC_ME_SET_CONTROL_PORT_CFM, NULL, 0, NULL);
+    }
     if (ret != KERN_SUCCESS) return ret;
     pthread_mutex_lock(&g.state_lock);
     g.link_up = link_up && g.associated;

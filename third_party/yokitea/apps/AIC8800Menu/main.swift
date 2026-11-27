@@ -12,6 +12,7 @@ struct WifiStatus: Decodable {
     let mac: String
     let fw: String
     let chip_id: String
+    let chip: String? /* absent from pre-1.1 daemons */
     let lmac_version: String
     let is_5g: Bool
     let lmac_ready: Bool
@@ -75,7 +76,7 @@ private func keychainSave(_ ssid: String, _ pass: String) {
     SecItemDelete(keychainQuery(ssid) as CFDictionary)
     var q = keychainQuery(ssid)
     q[kSecValueData as String] = Data(pass.utf8)
-    q[kSecAttrLabel as String] = "AIC8800 Wi-Fi: \(ssid)"
+    q[kSecAttrLabel as String] = "USB Wi-Fi: \(ssid)"
     SecItemAdd(q as CFDictionary, nil)
 }
 
@@ -397,7 +398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             symbolName = "wifi.exclamationmark"
         }
 
-        if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "AIC8800 Wi-Fi") {
+        if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "USB Wi-Fi") {
             img.isTemplate = true
             button.image = img
         } else {
@@ -422,14 +423,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
 
         if daemonOffline {
-            menu.addItem(disabledInfoItem("AIC8800 Daemon Offline", bold: true))
-            menu.addItem(disabledInfoItem("Daemon not running: run scripts/install.sh"))
+            menu.addItem(disabledInfoItem("USB Wi-Fi Driver Offline", bold: true))
+            menu.addItem(disabledInfoItem("Driver daemon not running: reinstall USB Wifi"))
         } else if let st = currentStatus {
             if !st.present {
-                menu.addItem(disabledInfoItem("AIC8800 Adapter Not Found", bold: true))
-                menu.addItem(disabledInfoItem("Plug in AIC8800D80 USB adapter"))
+                menu.addItem(disabledInfoItem("USB Wi-Fi Adapter Not Found", bold: true))
+                menu.addItem(disabledInfoItem("Plug in a supported adapter (AIC8800D80, RTL8852BU)"))
             } else if !st.lmac_ready {
-                menu.addItem(disabledInfoItem("AIC8800 Initializing Firmware… (\(st.bsd))", bold: true))
+                menu.addItem(disabledInfoItem("Initializing Adapter… (\(st.bsd))", bold: true))
             } else if st.connecting {
                 menu.addItem(disabledInfoItem("Connecting… (\(st.bsd))", bold: true))
             } else if st.associated && st.link_up {
@@ -445,6 +446,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if st.disc_reason != 0 {
                     menu.addItem(disabledInfoItem("  Last disconnect reason: \(st.disc_reason)"))
                 }
+            }
+
+            if st.present, let chip = st.chip, !chip.isEmpty {
+                menu.addItem(disabledInfoItem("  Adapter: \(chip) • \(st.mac)"))
             }
 
             let err = actionMessage ?? (st.last_error.isEmpty ? nil : st.last_error)
@@ -515,7 +520,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         logItem.target = self
         menu.addItem(logItem)
 
-        let quitItem = NSMenuItem(title: "Quit AIC8800Menu", action: #selector(onQuit), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit USB Wifi", action: #selector(onQuit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
     }
@@ -636,7 +641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        let exePath = Bundle.main.executablePath ?? "/Applications/AIC8800Menu.app/Contents/MacOS/AIC8800Menu"
+        let exePath = Bundle.main.executablePath ?? "/Applications/USB Wifi.app/Contents/MacOS/USBWifi"
         let plist: [String: Any] = [
             "Label": kLoginAgentLabel,
             "ProgramArguments": [exePath],

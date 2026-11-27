@@ -339,6 +339,7 @@ typedef struct {
     uint64_t last_replay;
     bool     has_ptk;
     bool     has_gtk;
+    bool     ptk_done; /* M3 accepted: the next M1 starts a new handshake */
 } aic_wpa2_ctx_t;
 
 static inline void aic_wpa2_ctx_init(aic_wpa2_ctx_t *ctx,
@@ -472,9 +473,13 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
 
     /* 1. Pairwise M1: Pairwise=1, Ack=1, MIC=0 */
     if (is_pw && !is_mic) {
-        if (CCRandomGenerateBytes(ctx->snonce, sizeof(ctx->snonce)) != kCCSuccess) {
+        /* a retransmitted M1 (AP missed/was slow to see our M2) keeps the SNonce, as wpa_supplicant does,
+           so whichever M2 the AP accepts yields the PTK we hold */
+        const bool resend = ctx->has_ptk && !ctx->ptk_done && memcmp(ctx->anonce, &key_body[13], 32U) == 0;
+        if (!resend && CCRandomGenerateBytes(ctx->snonce, sizeof(ctx->snonce)) != kCCSuccess) {
             return -1;
         }
+        ctx->ptk_done = false;
         memcpy(ctx->anonce, &key_body[13], 32U);
         ctx->key_ver     = key_ver;
         ctx->last_replay = replay;
@@ -525,6 +530,7 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
                                             AIC_KEY_INFO_MIC | AIC_KEY_INFO_SECURE);
         const int rc = aic_wpa2_build_eapol_reply(ctx, pdu[0], desc_type, key_ver, m4_info, replay,
                                                   NULL, NULL, 0U, out_eth, out_cap, out_len);
+        if (rc == 1) ctx->ptk_done = true;
         if (rc == 1 && out_keys_ready) {
             *out_keys_ready = ctx->has_ptk;
         }

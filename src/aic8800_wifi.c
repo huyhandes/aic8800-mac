@@ -35,11 +35,13 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <xpc/xpc.h>
 
 #include "aic8800_abi.h"
 #include "aic8800_wifi_ctl.h"
 #include "aic8800_wpa2.h"
 #include "aicd_backend.h" /* port: in-process libusb backend replaces the kext */
+#include "rtwd.h"
 
 #define AIC_WIFI_CONF_DIR  "/Library/Application Support/AIC8800"
 #define AIC_WIFI_CONF_PATH "/Library/Application Support/AIC8800/wifi.conf"
@@ -738,6 +740,7 @@ static void build_status_json(char *out, size_t cap) {
     sb_appendf(&sb, ",\"bsd\":");       sb_append_json_str(&sb, bsd);
     sb_appendf(&sb, ",\"mac\":");       sb_append_json_str(&sb, mac_str);
     sb_appendf(&sb, ",\"fw\":");        sb_append_json_str(&sb, (const char *)st.fw_version);
+    sb_appendf(&sb, ",\"chip\":");      sb_append_json_str(&sb, uc_chip_name());
     sb_appendf(&sb, ",\"chip_id\":\"0x%08x\",\"lmac_version\":\"0x%08x\"", st.chip_id, st.lmac_version);
     sb_appendf(&sb, ",\"is_5g\":%s,\"lmac_ready\":%s,\"associated\":%s,\"link_up\":%s",
                st.is_5g_supported ? "true" : "false",
@@ -1227,6 +1230,7 @@ static void on_power(void *ref, io_service_t svc, natural_t msg, void *arg) {
     } else if (msg == kIOMessageSystemHasPoweredOn && g_sys_sleeping) {
         g_sys_sleeping = false;
         fprintf(stderr, "notice: system wake, rejoining Wi-Fi\n");
+        uc_system_woke();
         wake_daemon_loop();
     }
 }
@@ -1447,8 +1451,9 @@ static void print_usage(const char *prog) {
             "  sudo %s connect <SSID> [passphrase] [--no-dhcp] [--stay]\n"
             "  sudo %s save <SSID> [passphrase]    (save auto-connect profile to wifi.conf)\n"
             "  sudo %s disconnect\n"
+            "  %s cd-eject                         (switch a Realtek driver CD to Wi-Fi; as the console user)\n"
             "  sudo %s --daemon\n",
-            prog, prog, prog, prog, prog, prog);
+            prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -1459,6 +1464,13 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "--daemon") == 0) {
         return run_daemon();
+    }
+    if (strcmp(argv[1], "cd-eject") == 0) {
+        /* run by the com.aic8800mac.cdswitch LaunchAgent, which launchd starts when a Realtek driver CD
+           is plugged in; taking the IOKit event keeps launchd from relaunching the job for it */
+        xpc_set_event_stream_handler("com.apple.iokit.matching", dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+                                     ^(xpc_object_t e) { (void)e; });
+        return lkpi_usb_eject_cd(30000) ? 1 : 0;
     }
     if (strcmp(argv[1], "save") == 0 && argc >= 3) {
         const char *pass = (argc >= 4) ? argv[3] : NULL;

@@ -29,6 +29,8 @@ kern_return_t uc_connect(io_connect_t conn, const aic_wifi_connect_req_t *in_req
 kern_return_t uc_disconnect(io_connect_t conn, uint16_t reason);
 kern_return_t uc_poll_eapol(io_connect_t conn, aic_wifi_eapol_frame_t *out);
 kern_return_t uc_send_eapol(io_connect_t conn, const uint8_t *eth, size_t len);
+const char *uc_chip_name(void); /* "" until an adapter is up */
+void uc_system_woke(void);
 kern_return_t uc_add_key(io_connect_t conn, uint8_t key_idx, bool pairwise, uint8_t cipher,
                          const uint8_t *key, uint8_t key_len, uint8_t *out_hw_idx);
 kern_return_t uc_set_port_link(io_connect_t conn, bool open_port, bool link_up);

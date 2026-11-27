@@ -32,7 +32,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s install|remove|dry-run [service name]\n", argv[0]);
         return 2;
     }
-    CFStringRef name = CFStringCreateWithCString(NULL, argc > 2 ? argv[2] : "UGREEN WiFi", kCFStringEncodingUTF8);
+    CFStringRef name = CFStringCreateWithCString(NULL, argc > 2 ? argv[2] : "USB Wi-Fi", kCFStringEncodingUTF8);
     CFStringRef bsd = CFSTR(AICD_IF_HOST);
 
     SCPreferencesRef prefs = SCPreferencesCreate(NULL, CFSTR("aic_netsvc"), NULL);
