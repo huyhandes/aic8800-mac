@@ -246,6 +246,53 @@ static int cmd_scan(io_connect_t conn) {
     return 0;
 }
 
+/* one per dongle, named like its profile (band, band-N): "5", "2.4", anything else (or none) = auto */
+static char g_band_path[PATH_MAX] = WIFI_CONF_DIR "/band";
+#define WIFI_BAND_PATH g_band_path
+static const char *band_pref(void) {
+    char v[8] = "";
+    FILE *f = fopen(WIFI_BAND_PATH, "r");
+    if (f) { (void)fscanf(f, "%7s", v); fclose(f); }
+    return strcmp(v, "5") == 0 ? "5" : strcmp(v, "2.4") == 0 ? "2.4" : "auto";
+}
+
+/* one per dongle (powersave, powersave-N): "on" turns the chip's power save on, anything else = off */
+static char g_ps_path[PATH_MAX] = WIFI_CONF_DIR "/powersave";
+static bool ps_pref(void) {
+    char v[8] = "";
+    FILE *f = fopen(g_ps_path, "r");
+    if (f) { (void)fscanf(f, "%7s", v); fclose(f); }
+    return strcmp(v, "on") == 0;
+}
+static void apply_power_save(void) {
+    const bool on = ps_pref();
+    const int r = wifi_set_power_save(on);
+    if (r && r != -EOPNOTSUPP) fprintf(stderr, "warn: power save %s failed (%d)\n", on ? "on" : "off", r);
+}
+
+/* each slot runs its own worker: write and rename so two commands never interleave */
+static bool write_pref(const char *path, const char *v) {
+    (void)mkdir(WIFI_CONF_DIR, 0755);
+    char tmp[PATH_MAX + 16];
+    snprintf(tmp, sizeof(tmp), "%s.%d", path, (int)getpid());
+    FILE *f = fopen(tmp, "w");
+    bool ok = f != NULL;
+    if (f) {
+        ok = fprintf(f, "%s\n", v) > 0;
+        ok = fclose(f) == 0 && ok;
+    }
+    ok = ok && rename(tmp, path) == 0;
+    if (!ok) (void)unlink(tmp);
+    return ok;
+}
+
+/* auto: 5 GHz unless it is >15 dB weaker or below -75 dBm; a chosen band wins while above -80 dBm */
+static int band_score(const wifi_scan_bss_t *b, const char *pref) {
+    const bool is5 = b->freq >= 5000U;
+    if (strcmp(pref, "auto") == 0) return b->rssi + ((is5 && b->rssi > -75) ? 15 : 0);
+    return b->rssi + (((pref[0] == '5') == is5 && b->rssi > -80) ? 100 : 0);
+}
+
 static int perform_connect(io_connect_t conn,
                            io_service_t svc,
                            const char *ssid_arg,
@@ -283,7 +330,11 @@ static int perform_connect(io_connect_t conn,
     /* reconnect to the BSS of the last successful join without scanning; cleared on any failure */
     static wifi_scan_bss_t last_bss;
     static bool have_last;
-    if (fast && have_last && !getenv("AICD_ALWAYS_SCAN")) {
+    const char *pref = band_pref();
+    const bool last_band_ok = strcmp(pref, "auto") == 0 || (pref[0] == '5') == (last_bss.freq >= 5000U);
+    /* with a passphrase only a WPA2 BSS will do: a same-named open AP must not get the traffic */
+    const bool sec_ok = !passphrase || (last_bss.sec_mask & AIC_SEC_WPA2_PSK) != 0U;
+    if (fast && have_last && last_band_ok && sec_ok && !getenv("AICD_ALWAYS_SCAN")) {
         printf("[1/4] Reusing last BSS for \"%s\" (no scan)...\n", ssid_arg);
         target = &last_bss;
     }
@@ -295,13 +346,13 @@ static int perform_connect(io_connect_t conn,
                               &list, err_buf, err_cap) != 0) {
             return 1;
         }
-        /* list is RSSI-sorted; prefer 5 GHz unless it is >15 dB weaker or below -75 dBm */
         int best = -1000;
         n_known = 0;
         for (uint16_t i = 0U; i < list.count; ++i) {
             const wifi_scan_bss_t *b = &list.bss[i];
             if (b->ssid_len != ssid_len || memcmp(b->ssid, ssid_arg, ssid_len) != 0) continue;
-            const int score = b->rssi + ((b->freq >= 5000U && b->rssi > -75) ? 15 : 0);
+            if (passphrase && !(b->sec_mask & AIC_SEC_WPA2_PSK)) continue;
+            const int score = band_score(b, pref);
             if (score > best) { best = score; target = b; }
             bool dup = false;
             for (int k = 0; k < n_known; ++k) dup |= known_freqs[k] == b->freq;
@@ -354,6 +405,7 @@ static int perform_connect(io_connect_t conn,
     printf("[2/4] Associating via SM_CONNECT_REQ...\n");
     wifi_connect_req_t creq;
     wifi_connect_req_t cresp;
+    memset(&cresp, 0, sizeof(cresp)); /* read in the error message even when wifi_connect fails early */
     memset(&creq, 0, sizeof(creq));
     creq.ssid_len = target->ssid_len;
     memcpy(creq.ssid, target->ssid, target->ssid_len);
@@ -424,9 +476,9 @@ static int perform_connect(io_connect_t conn,
                                                          &reply_len,
                                                          &keys_ready,
                                                          &gtk_rekey);
-                if (hrc < 0) {
-                    set_err(err_buf, err_cap, "Wrong password");
-                    fprintf(stderr, "error: EAPOL handshake/MIC failure\n");
+                if (hrc < 0) { /* a bad MIC is dropped (0): -1 is a local crypto or key-unwrap failure */
+                    set_err(err_buf, err_cap, "4-Way Handshake failed");
+                    fprintf(stderr, "error: EAPOL key derivation/unwrap failure\n");
                     (void)wifi_disconnect(conn, 3U);
                     return 1;
                 }
@@ -510,7 +562,10 @@ static int save_profile(const char *ssid, const char *pass) {
     }
 
     (void)mkdir(WIFI_CONF_DIR, 0755);
-    const int fd = open(WIFI_CONF_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    /* write a temp file and rename it, so a crash or full disk never leaves a truncated profile */
+    char tmp[sizeof(g_conf_path) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", WIFI_CONF_PATH);
+    const int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) {
         fprintf(stderr, "error: failed to write %s: %s (try sudo?)\n", WIFI_CONF_PATH, strerror(errno));
         return 1;
@@ -526,7 +581,12 @@ static int save_profile(const char *ssid, const char *pass) {
     if (pass) {
         fprintf(fp, "psk=%s\n", pass);
     }
-    fclose(fp);
+    const bool wrote = fflush(fp) == 0 && fsync(fd) == 0;
+    if (fclose(fp) != 0 || !wrote || rename(tmp, WIFI_CONF_PATH) != 0) {
+        fprintf(stderr, "error: failed to write %s: %s\n", WIFI_CONF_PATH, strerror(errno));
+        (void)unlink(tmp);
+        return 1;
+    }
     printf("Saved Wi-Fi profile to %s (mode 0600)\n", WIFI_CONF_PATH);
     return 0;
 }
@@ -565,7 +625,8 @@ typedef enum {
     CMD_CONNECT,
     CMD_DISCONNECT,
     CMD_FORGET,
-    CMD_RECONNECT
+    CMD_RECONNECT,
+    CMD_POWERSAVE /* the driver is only called from the main loop */
 } aic_daemon_cmd_kind_t;
 
 typedef struct {
@@ -575,6 +636,7 @@ typedef struct {
     bool                  has_pass;
     bool                  save_profile;
     bool                  done;
+    uint32_t              seq; /* a reply for an older, timed-out command must not finish this one */
     char                  json_reply[AIC_IPC_BUF_SIZE];
 } aic_daemon_pending_cmd_t;
 
@@ -802,6 +864,8 @@ static void build_status_json(char *out, size_t cap) {
                auto_paused ? "true" : "false");
     sb_appendf(&sb, ",\"saved_ssid\":"); sb_append_json_str(&sb, saved_ssid);
     sb_appendf(&sb, ",\"last_error\":"); sb_append_json_str(&sb, last_error);
+    sb_appendf(&sb, ",\"band_pref\":\"%s\"", band_pref());
+    if (wifi_has_power_save()) sb_appendf(&sb, ",\"power_save\":%s", ps_pref() ? "true" : "false");
     sb_appendf(&sb, "}\n");
 }
 
@@ -840,27 +904,30 @@ static void build_err_json(const char *msg, char *out, size_t cap) {
     sb_appendf(&sb, "}\n");
 }
 
-static void execute_pending_scan(io_connect_t conn) {
-    if (conn == IO_OBJECT_NULL) {
-        build_err_json("Adapter not connected", g_pending_cmd.json_reply, sizeof(g_pending_cmd.json_reply));
-        return;
-    }
+static void finish_pending_cmd_locked(uint32_t seq, const char *json_msg);
+
+static void execute_pending_scan(io_connect_t conn, uint32_t seq) {
+    static char reply[AIC_IPC_BUF_SIZE]; /* only the daemon loop thread scans */
     wifi_scan_list_t list;
     char err[160] = {0};
-    if (run_scan_and_wait(conn, NULL, 0U, NULL, 0, &list, err, sizeof(err)) != 0) {
-        build_err_json(err[0] ? err : "Scan failed", g_pending_cmd.json_reply, sizeof(g_pending_cmd.json_reply));
-        return;
+    if (conn == IO_OBJECT_NULL) {
+        build_err_json("Adapter not connected", reply, sizeof(reply));
+    } else if (run_scan_and_wait(conn, NULL, 0U, NULL, 0, &list, err, sizeof(err)) != 0) {
+        build_err_json(err[0] ? err : "Scan failed", reply, sizeof(reply));
+    } else {
+        build_scan_json(&list, reply, sizeof(reply));
     }
-    build_scan_json(&list, g_pending_cmd.json_reply, sizeof(g_pending_cmd.json_reply));
+    finish_pending_cmd_locked(seq, reply);
 }
 
 static bool dispatch_daemon_cmd_sync(const aic_daemon_pending_cmd_t *req, char *reply_out, size_t reply_cap) {
     pthread_mutex_lock(&g_req_lock);
 
     pthread_mutex_lock(&g_req_wait_lock);
-    memset(&g_pending_cmd, 0, sizeof(g_pending_cmd));
+    static uint32_t next_seq;
     g_pending_cmd = *req;
     g_pending_cmd.done = false;
+    g_pending_cmd.seq = ++next_seq;
     wake_daemon_loop();
 
     struct timespec ts;
@@ -883,13 +950,13 @@ static bool dispatch_daemon_cmd_sync(const aic_daemon_pending_cmd_t *req, char *
     return ok;
 }
 
-static void finish_pending_cmd_locked(const char *json_msg) {
+static void finish_pending_cmd_locked(uint32_t seq, const char *json_msg) {
     pthread_mutex_lock(&g_req_wait_lock);
-    if (json_msg) {
+    if (g_pending_cmd.seq == seq && g_pending_cmd.kind != CMD_NONE && !g_pending_cmd.done) {
         snprintf(g_pending_cmd.json_reply, sizeof(g_pending_cmd.json_reply), "%s", json_msg);
+        g_pending_cmd.done = true;
+        pthread_cond_signal(&g_req_done_cond);
     }
-    g_pending_cmd.done = true;
-    pthread_cond_signal(&g_req_done_cond);
     pthread_mutex_unlock(&g_req_wait_lock);
 }
 
@@ -919,7 +986,7 @@ static void handle_ipc_client(int cfd) {
         return;
     }
 
-    char req_line[512];
+    char req_line[512] = ""; /* a client that closes before sending anything must not leave garbage */
     size_t used = 0U;
     while (used + 1U < sizeof(req_line)) {
         const ssize_t n = read(cfd, req_line + used, sizeof(req_line) - 1U - used);
@@ -961,6 +1028,26 @@ static void handle_ipc_client(int cfd) {
         memset(&req, 0, sizeof(req));
         req.kind = CMD_RECONNECT;
         (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
+    } else if (strncmp(req_line, "BAND ", 5U) == 0) { /* takes effect at the next connect */
+        const char *v = req_line + 5U;
+        if (strcmp(v, "auto") != 0 && strcmp(v, "5") != 0 && strcmp(v, "2.4") != 0) {
+            build_err_json("Band must be auto, 5 or 2.4", reply, sizeof(reply));
+        } else {
+            if (!write_pref(WIFI_BAND_PATH, v)) build_err_json(strerror(errno), reply, sizeof(reply));
+            else snprintf(reply, sizeof(reply), "{\"ok\":true}\n");
+        }
+    } else if (strncmp(req_line, "POWERSAVE ", 10U) == 0) { /* saved, then applied by the main loop */
+        const char *v = req_line + 10U;
+        if (strcmp(v, "on") != 0 && strcmp(v, "off") != 0) {
+            build_err_json("Power save must be on or off", reply, sizeof(reply));
+        } else if (!write_pref(g_ps_path, v)) {
+            build_err_json(strerror(errno), reply, sizeof(reply));
+        } else {
+            aic_daemon_pending_cmd_t req;
+            memset(&req, 0, sizeof(req));
+            req.kind = CMD_POWERSAVE;
+            (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
+        }
     } else if (strncmp(req_line, "CONNECT_HEX ", 12U) == 0) {
         char *p = req_line + 12U;
         char *sp1 = strchr(p, ' ');
@@ -1009,6 +1096,15 @@ static void handle_ipc_client(int cfd) {
     }
 }
 
+static void *ipc_client_thread(void *arg) {
+    const int cfd = (int)(intptr_t)arg;
+    handle_ipc_client(cfd);
+    close(cfd);
+    return NULL;
+}
+
+/* one thread per client: a SCAN or CONNECT holds its client for seconds, and the app's STATUS polls
+   behind it would time out and show the adapter as unplugged */
 static void *control_socket_thread(void *arg) {
     (void)arg;
     while (g_keep_running && g_ctrl_listen_fd >= 0) {
@@ -1022,9 +1118,16 @@ static void *control_socket_thread(void *arg) {
         }
         if (pfd.revents & POLLIN) {
             const int cfd = accept(g_ctrl_listen_fd, NULL, NULL);
+            pthread_t t;
+            const struct timeval rto = { .tv_sec = 5 }; /* a client that never sends its line */
             if (cfd >= 0) {
-                handle_ipc_client(cfd);
-                close(cfd);
+                (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof(rto));
+                if (pthread_create(&t, NULL, ipc_client_thread, (void *)(intptr_t)cfd) == 0) {
+                    pthread_detach(t);
+                } else {
+                    handle_ipc_client(cfd);
+                    close(cfd);
+                }
             }
         }
     }
@@ -1076,14 +1179,27 @@ static bool run_rekey_loop(io_connect_t conn,
             aic_daemon_cmd_kind_t k = CMD_NONE;
             pthread_mutex_lock(&g_req_wait_lock);
             k = g_pending_cmd.done ? CMD_NONE : g_pending_cmd.kind;
+            const uint32_t seq = g_pending_cmd.seq;
             pthread_mutex_unlock(&g_req_wait_lock);
 
             if (k == CMD_SCAN) {
-                execute_pending_scan(conn);
-                finish_pending_cmd_locked(NULL);
+                execute_pending_scan(conn, seq);
                 continue;
             }
-            if (k == CMD_CONNECT || k == CMD_DISCONNECT || k == CMD_FORGET || k == CMD_RECONNECT) {
+            if (k == CMD_POWERSAVE) {
+                apply_power_save();
+                finish_pending_cmd_locked(seq, "{\"ok\":true}\n");
+                continue;
+            }
+            if (k == CMD_RECONNECT) { /* already up: leaving here would stop rekey handling until the link drops */
+                pthread_mutex_lock(&g_state_lock);
+                g_snap_auto_paused = false;
+                g_snap_last_error[0] = '\0';
+                pthread_mutex_unlock(&g_state_lock);
+                finish_pending_cmd_locked(seq, "{\"ok\":true}\n");
+                continue;
+            }
+            if (k == CMD_CONNECT || k == CMD_DISCONNECT || k == CMD_FORGET) {
                 return true;
             }
         }
@@ -1113,6 +1229,10 @@ static bool run_rekey_loop(io_connect_t conn,
                                              &keys_ready,
                                              &gtk_rekey) == 1) {
                     (void)wifi_send_eapol(conn, reply_eth, reply_len);
+                    if (keys_ready) { /* the AP renewed the PTK with a fresh 4-way handshake */
+                        uint8_t hw_idx = 0U;
+                        (void)wifi_add_key(conn, 0U, true, wpa_ctx->pairwise_cipher, &wpa_ctx->ptk[32], 16U, &hw_idx);
+                    }
                     if (gtk_rekey && wpa_ctx->has_gtk) {
                         uint8_t hw_idx = 0U;
                         (void)wifi_add_key(conn, wpa_ctx->gtk_idx, false, wpa_ctx->group_cipher,
@@ -1145,18 +1265,7 @@ static bool handle_daemon_pending_command(io_connect_t conn,
 
     char reply[AIC_IPC_BUF_SIZE];
     if (local.kind == CMD_SCAN) {
-        if (conn == IO_OBJECT_NULL) {
-            build_err_json("Adapter not connected", reply, sizeof(reply));
-        } else {
-            wifi_scan_list_t list;
-            char err[160] = {0};
-            if (run_scan_and_wait(conn, NULL, 0U, NULL, 0, &list, err, sizeof(err)) != 0) {
-                build_err_json(err[0] ? err : "Scan failed", reply, sizeof(reply));
-            } else {
-                build_scan_json(&list, reply, sizeof(reply));
-            }
-        }
-        finish_pending_cmd_locked(reply);
+        execute_pending_scan(conn, local.seq);
     } else if (local.kind == CMD_DISCONNECT) {
         pthread_mutex_lock(&g_state_lock);
         g_snap_auto_paused = true;
@@ -1170,7 +1279,7 @@ static bool handle_daemon_pending_command(io_connect_t conn,
             refresh_snapshot(conn, svc);
         }
         *connected_now = false;
-        finish_pending_cmd_locked("{\"ok\":true}\n");
+        finish_pending_cmd_locked(local.seq, "{\"ok\":true}\n");
     } else if (local.kind == CMD_FORGET) {
         (void)unlink(WIFI_CONF_PATH);
         sync_saved_ssid_snapshot();
@@ -1187,13 +1296,16 @@ static bool handle_daemon_pending_command(io_connect_t conn,
             refresh_snapshot(conn, svc);
         }
         *connected_now = false;
-        finish_pending_cmd_locked("{\"ok\":true}\n");
+        finish_pending_cmd_locked(local.seq, "{\"ok\":true}\n");
+    } else if (local.kind == CMD_POWERSAVE) {
+        if (conn != IO_OBJECT_NULL) apply_power_save();
+        finish_pending_cmd_locked(local.seq, "{\"ok\":true}\n");
     } else if (local.kind == CMD_RECONNECT) {
         pthread_mutex_lock(&g_state_lock);
         g_snap_auto_paused = false;
         g_snap_last_error[0] = '\0';
         pthread_mutex_unlock(&g_state_lock);
-        finish_pending_cmd_locked("{\"ok\":true}\n");
+        finish_pending_cmd_locked(local.seq, "{\"ok\":true}\n");
     } else if (local.kind == CMD_CONNECT) {
         snprintf(g_active_ssid, sizeof(g_active_ssid), "%s", local.ssid);
         if (local.has_pass) {
@@ -1206,7 +1318,7 @@ static bool handle_daemon_pending_command(io_connect_t conn,
 
         if (conn == IO_OBJECT_NULL) {
             build_err_json("Adapter not connected", reply, sizeof(reply));
-            finish_pending_cmd_locked(reply);
+            finish_pending_cmd_locked(local.seq, reply);
             return true;
         }
 
@@ -1249,11 +1361,11 @@ static bool handle_daemon_pending_command(io_connect_t conn,
                 sync_saved_ssid_snapshot();
             }
             *connected_now = true;
-            finish_pending_cmd_locked("{\"ok\":true}\n");
+            finish_pending_cmd_locked(local.seq, "{\"ok\":true}\n");
         } else {
             if (strcmp(err, "Wrong password") == 0) g_has_active_target = false; /* retrying cannot help */
             build_err_json(err[0] ? err : "Connection failed", reply, sizeof(reply));
-            finish_pending_cmd_locked(reply);
+            finish_pending_cmd_locked(local.seq, reply);
         }
     }
     return true;
@@ -1302,7 +1414,11 @@ static bool      g_ctrl_thread_started = false;
 
 static void worker_bound(void) {
     const int slot = wifi_slot() < 0 ? 0 : wifi_slot();
-    if (slot > 0) snprintf(g_conf_path, sizeof(g_conf_path), WIFI_CONF_DIR "/wifi-%d.conf", slot);
+    if (slot > 0) {
+        snprintf(g_conf_path, sizeof(g_conf_path), WIFI_CONF_DIR "/wifi-%d.conf", slot);
+        snprintf(g_band_path, sizeof(g_band_path), WIFI_CONF_DIR "/band-%d", slot);
+        snprintf(g_ps_path, sizeof(g_ps_path), WIFI_CONF_DIR "/powersave-%d", slot);
+    }
     snprintf(g_sock_path, sizeof(g_sock_path), WIFI_RUN_DIR "/%d.sock", slot);
 
     char self[PATH_MAX], netsvc[PATH_MAX], name[32];
@@ -1370,6 +1486,7 @@ static int run_worker(void) {
         }
 
         refresh_snapshot(conn, svc);
+        apply_power_save(); /* every open starts with it off */
         wifi_status_t st;
         if (wifi_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready) {
             IOServiceClose(conn);

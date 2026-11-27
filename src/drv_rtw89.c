@@ -2,6 +2,7 @@
  * src/lkpi mac80211 shim, reached through its station API (rtwd.h). */
 #include "wifi_drv.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -9,6 +10,7 @@
 #include <unistd.h>
 
 #include "rtwd.h"
+#include "usbwifi_core.h"
 
 static const struct wifi_drv_events *ev;
 
@@ -27,11 +29,24 @@ static void *gone_watch(void *arg) {
 	return NULL;
 }
 
+/* Realtek's world and ETSI (VN) tables hold 5 GHz ch112-128 to 7 dBm, too weak for the AP to hear;
+   FCC's limits keep those links up. Another country: its two letters in WIFI_CONF_DIR/country */
+static void country(char cc[3]) {
+	FILE *f = fopen(WIFI_CONF_DIR "/country", "r");
+	if (!f || fscanf(f, "%2[A-Za-z]", cc) != 1 || cc[1] == '\0')
+		snprintf(cc, 3, "US");
+	if (f)
+		fclose(f);
+	cc[0] = (char)toupper(cc[0]), cc[1] = (char)toupper(cc[1]);
+}
+
 static int rtw_open(const struct wifi_drv_events *events, struct wifi_drv_info *info, int timeout_ms) {
 	ev = events;
-	int rc = rtwd_open(&cb, info->mac, timeout_ms);
-	if (rc)
-		return -ENODEV; /* rtwd_open fails the same way for "not plugged" and "probe hiccup": retry both */
+	char cc[3];
+	country(cc);
+	int rc = rtwd_open(&cb, info->mac, timeout_ms, cc);
+	if (rc) /* -ENODEV: not plugged or a probe hiccup, retried; anything else left it half-bound */
+		return rc;
 	pthread_t t;
 	if (pthread_create(&t, NULL, gone_watch, NULL) == 0)
 		pthread_detach(t);
@@ -61,6 +76,8 @@ static int rtw_connect(const struct wifi_connect_params *p) {
    shortcut: full ~3 s re-probe on every wake, upgrade to rtw89 suspend/resume ops if wake latency matters */
 static void rtw_woke(void) { ev->gone(); }
 
+static void rtw_led(enum wifi_led s) { rtwd_led((int)s); }
+
 const struct wifi_drv wifi_drv_rtw89 = {
 	.name = "rtw89",
 	.open = rtw_open,
@@ -71,4 +88,6 @@ const struct wifi_drv wifi_drv_rtw89 = {
 	.set_authorized = rtwd_set_authorized,
 	.tx = rtwd_tx_eth,
 	.system_woke = rtw_woke,
+	.led = rtw_led,
+	.power_save = rtwd_power_save,
 };

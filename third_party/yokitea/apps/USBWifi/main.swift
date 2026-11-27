@@ -6,39 +6,30 @@ import Security
 private let kRunDir = "/var/run/usbwifi"
 private let kLoginAgentLabel = "com.usbwifi.menu"
 
+/* only the fields the menu reads: a required key the daemon stops sending would fail the whole decode */
 struct WifiStatus: Decodable {
     let ok: Bool
     let present: Bool
     let bsd: String
     let mac: String
-    let fw: String
-    let chip_id: String
     let chip: String? /* absent from pre-1.1 daemons */
-    let lmac_version: String
-    let is_5g: Bool
     let lmac_ready: Bool
     let associated: Bool
     let link_up: Bool
-    let assoc_status: UInt32
     let disc_reason: UInt32
     let ssid: String
-    let bssid: String
     let freq: UInt32
-    let sta_idx: UInt32
-    let tx_packets: UInt64
-    let rx_packets: UInt64
-    let eapol_rx_total: UInt64
-    let eapol_rx_queued: UInt32
     let connecting: Bool
     let auto_paused: Bool
     let saved_ssid: String
     let last_error: String
+    let band_pref: String? /* "auto", "5" or "2.4"; absent from older daemons */
+    let power_save: Bool? /* absent when the dongle's driver has no power save */
 }
 
 struct ScanBss: Decodable {
     let ssid: String
     let hidden: Bool
-    let bssid: String
     let freq: UInt32
     let rssi: Int
     let sec: String
@@ -47,7 +38,6 @@ struct ScanBss: Decodable {
 
 struct ScanResponse: Decodable {
     let ok: Bool
-    let scan_done: Bool?
     let bss: [ScanBss]?
     let error: String?
 }
@@ -74,11 +64,16 @@ private func keychainPassword(_ ssid: String) -> String? {
 }
 
 private func keychainSave(_ ssid: String, _ pass: String) {
-    SecItemDelete(keychainQuery(ssid) as CFDictionary)
-    var q = keychainQuery(ssid)
-    q[kSecValueData as String] = Data(pass.utf8)
-    q[kSecAttrLabel as String] = "USB Wi-Fi: \(ssid)"
-    SecItemAdd(q as CFDictionary, nil)
+    /* update in place: delete-then-add loses the old password when the add fails */
+    let data = Data(pass.utf8)
+    var st = SecItemUpdate(keychainQuery(ssid) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+    if st == errSecItemNotFound {
+        var q = keychainQuery(ssid)
+        q[kSecValueData as String] = data
+        q[kSecAttrLabel as String] = "USB Wi-Fi: \(ssid)"
+        st = SecItemAdd(q as CFDictionary, nil)
+    }
+    if st != errSecSuccess { NSLog("USBWifi: keychain save for %@ failed: %d", ssid, st) }
 }
 
 private func keychainDelete(_ ssid: String) {
@@ -88,6 +83,31 @@ private func keychainDelete(_ ssid: String) {
 private func hexEncode(_ s: String) -> String {
     return Data(s.utf8).map { String(format: "%02x", $0) }.joined()
 }
+
+/// (in, out) byte counters of an interface; if_data keeps them in 32 bits, so they wrap every 4 GB
+private func interfaceBytes(_ bsdName: String) -> (UInt32, UInt32)? {
+    var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ifaddrPtr) == 0, let first = ifaddrPtr else { return nil }
+    defer { freeifaddrs(first) }
+    var cur: UnsafeMutablePointer<ifaddrs>? = first
+    while let node = cur {
+        let i = node.pointee
+        if i.ifa_addr?.pointee.sa_family == UInt8(AF_LINK), String(cString: i.ifa_name) == bsdName,
+           let d = i.ifa_data?.assumingMemoryBound(to: if_data.self).pointee {
+            return (d.ifi_ibytes, d.ifi_obytes)
+        }
+        cur = i.ifa_next
+    }
+    return nil
+}
+
+private let rateFormatter: ByteCountFormatter = {
+    let f = ByteCountFormatter()
+    f.countStyle = .file
+    f.allowsNonnumericFormatting = false
+    return f
+}()
+private func perSec(_ bytes: Double) -> String { rateFormatter.string(fromByteCount: Int64(bytes)) + "/s" }
 
 private func ipv4AddressForInterface(_ bsdName: String) -> String? {
     guard !bsdName.isEmpty && bsdName != "unknown" else { return nil }
@@ -183,7 +203,8 @@ private func sendDaemonCommand(_ sockPath: String, _ cmd: String, timeoutSec: In
             break
         }
     }
-    return .success(reply)
+    /* SSIDs are raw bytes: replace invalid UTF-8 so one odd neighbour SSID cannot fail the JSON decode */
+    return .success(Data(String(decoding: reply, as: UTF8.self).utf8))
 }
 
 /// One plugged dongle, driven by its own usbwifid worker. Touched on the main thread only.
@@ -198,6 +219,10 @@ final class Adapter {
     var pendingAutoScan = false
     var wasReady = false
     var popAfterScan = false
+    var scannedAt = Date.distantPast
+    var rate: (down: Double, up: Double)? /* bytes/s on the network interface */
+    var lastBytes: (UInt32, UInt32)?
+    var lastAt = Date.distantPast
 
     init(slot: Int) {
         self.slot = slot
@@ -210,6 +235,12 @@ final class Adapter {
 }
 
 /// (adapter, network) for a network menu item
+private final class BandChoice {
+    let adapter: Adapter
+    let band: String
+    init(_ adapter: Adapter, _ band: String) { self.adapter = adapter; self.band = band }
+}
+
 private final class NetChoice {
     let adapter: Adapter
     let bss: ScanBss
@@ -237,9 +268,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
 
         pollStatus()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.pollStatus()
-        }
+        let t = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in self?.pollStatus() }
+        RunLoop.main.add(t, forMode: .common) /* .common: keeps polling while the menu is open */
+        pollTimer = t
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -250,7 +281,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         guard menu === self.menu else { return }
         pollStatus()
+        // a scan while associated takes the radio off-channel for ~5 s (traffic stalls), so a connected
+        // adapter keeps a list under a minute old; "Scan Networks" in its section still forces one
         for a in sortedAdapters where a.ready && !a.isScanning {
+            if a.status?.associated == true && Date().timeIntervalSince(a.scannedAt) < 60 { continue }
             triggerScan(a)
         }
         rebuildMenu()
@@ -286,10 +320,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 st = s
             }
             let ip = st.flatMap { ($0.associated && $0.link_up) ? ipv4AddressForInterface($0.bsd) : nil }
+            let bytes = st.flatMap { ($0.associated && $0.link_up) ? interfaceBytes($0.bsd) : nil }
             DispatchQueue.main.async {
                 guard let self = self, self.adapters[a.slot] === a else { return }
                 a.status = st
                 a.ipv4 = ip
+                // speed over the last >= 1 s: action replies poll again sooner, which would give noisy rates
+                let now = Date(), dt = now.timeIntervalSince(a.lastAt)
+                if bytes == nil {
+                    a.lastBytes = nil
+                    a.rate = nil
+                } else if a.lastBytes == nil || dt >= 1 {
+                    if let p = a.lastBytes, let b = bytes {
+                        a.rate = (Double(b.0 &- p.0) / dt, Double(b.1 &- p.1) / dt)
+                    }
+                    a.lastBytes = bytes
+                    a.lastAt = now
+                }
                 if let st = st {
                     // dongle just came up with no saved network -> open the picker once its scan is in
                     if a.ready && !a.wasReady && st.saved_ssid.isEmpty && !st.associated && !st.connecting {
@@ -324,6 +371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     if let resp = try? JSONDecoder().decode(ScanResponse.self, from: data),
                        resp.ok, let list = resp.bss {
                         a.networks = self.deduplicateAndSort(list, active: a.status)
+                        a.scannedAt = Date()
                         a.message = nil
                         if a.popAfterScan {
                             a.popAfterScan = false
@@ -368,10 +416,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 switch res {
                 case .success(let data):
-                    if let resp = try? JSONDecoder().decode(BasicResponse.self, from: data), !resp.ok {
-                        a.message = resp.error ?? "Command failed"
+                    if let resp = try? JSONDecoder().decode(BasicResponse.self, from: data) {
+                        a.message = resp.ok ? nil : (resp.error ?? "Command failed")
                     } else {
-                        a.message = nil
+                        a.message = "No reply from usbwifid"
                     }
                 case .failure(let err):
                     a.message = err.localizedDescription
@@ -391,11 +439,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
 
         ioQueue.async { [weak self] in
-            let res = sendDaemonCommand(a.sock, "CONNECT_HEX \(ssidHex) \(passHex) \(saveFlag)", timeoutSec: 25)
+            /* longer than the daemon's own 25 s limit, so its timeout reply arrives instead of a socket error */
+            let res = sendDaemonCommand(a.sock, "CONNECT_HEX \(ssidHex) \(passHex) \(saveFlag)", timeoutSec: 40)
             DispatchQueue.main.async {
                 switch res {
                 case .success(let data):
-                    if let resp = try? JSONDecoder().decode(BasicResponse.self, from: data), !resp.ok {
+                    guard let resp = try? JSONDecoder().decode(BasicResponse.self, from: data) else {
+                        a.message = "No reply from usbwifid" /* never save a password the daemon did not confirm */
+                        break
+                    }
+                    if !resp.ok {
                         let err = resp.error ?? "Connection failed"
                         a.message = err
                         if err == "Wrong password", let sec = keychainSec {
@@ -461,8 +514,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
+    /// copies `src` onto `dst` item by item while the layout matches, so an open menu keeps its
+    /// highlighted row and open submenu across refreshes
+    private func sync(_ dst: NSMenu, _ src: NSMenu) {
+        let same = dst.items.count == src.items.count && zip(dst.items, src.items).allSatisfy {
+            $0.isSeparatorItem == $1.isSeparatorItem && ($0.submenu == nil) == ($1.submenu == nil)
+        }
+        guard same else {
+            let items = src.items
+            src.removeAllItems()
+            dst.removeAllItems()
+            items.forEach { dst.addItem($0) }
+            return
+        }
+        for (d, s) in zip(dst.items, src.items) where !s.isSeparatorItem {
+            d.title = s.title
+            d.attributedTitle = s.attributedTitle
+            d.action = s.action
+            d.target = s.target
+            d.representedObject = s.representedObject
+            d.keyEquivalent = s.keyEquivalent
+            d.isEnabled = s.isEnabled
+            d.state = s.state
+            d.image = s.image
+            if let ds = d.submenu, let ss = s.submenu { sync(ds, ss) }
+        }
+    }
+
     private func rebuildMenu() {
-        menu.removeAllItems()
+        let menu = NSMenu()
+        defer { sync(self.menu, menu) }
         let list = sortedAdapters.filter { $0.status?.present == true }
 
         if daemonOffline {
@@ -476,7 +557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // the networks in a submenu so every adapter's status stays in view
             for (i, a) in list.enumerated() {
                 if i > 0 { menu.addItem(NSMenuItem.separator()) }
-                addAdapterSection(a, multi: list.count > 1)
+                addAdapterSection(a, multi: list.count > 1, menu)
             }
         }
 
@@ -489,7 +570,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(actionItem("Quit USB Wifi", #selector(onQuit), nil, key: "q"))
     }
 
-    private func addAdapterSection(_ a: Adapter, multi: Bool) {
+    private func addAdapterSection(_ a: Adapter, multi: Bool, _ menu: NSMenu) {
         guard let st = a.status else { return }
         let chip = (st.chip?.isEmpty == false) ? st.chip! : "Adapter"
         if multi {
@@ -506,16 +587,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let ssidShow = st.ssid.isEmpty ? "(hidden)" : st.ssid
             menu.addItem(disabledInfoItem("\(ind)Connected: \(ssidShow)", bold: !multi))
             let ipText = a.ipv4 ?? "DHCP pending…"
-            menu.addItem(disabledInfoItem("\(ind)  \(band) (\(st.freq) MHz) • \(st.bsd) • IP \(ipText)"))
-            menu.addItem(disabledInfoItem("\(ind)  BSSID \(st.bssid) • TX \(st.tx_packets) / RX \(st.rx_packets)"))
+            menu.addItem(disabledInfoItem("\(ind)  \(band) | \(st.bsd) | IP \(ipText)"))
+            let speed = a.rate.map { "↓ \(perSec($0.down))   ↑ \(perSec($0.up))" } ?? "↓ …   ↑ …"
+            menu.addItem(disabledInfoItem("\(ind)  \(speed)"))
         } else {
             let extra = st.auto_paused ? " (paused)" : ""
-            menu.addItem(disabledInfoItem("\(ind)Disconnected\(extra) • \(st.bsd)", bold: !multi))
+            menu.addItem(disabledInfoItem("\(ind)Disconnected\(extra) | \(st.bsd)", bold: !multi))
             if st.disc_reason != 0 {
                 menu.addItem(disabledInfoItem("\(ind)  Last disconnect reason: \(st.disc_reason)"))
             }
         }
-        menu.addItem(disabledInfoItem(multi ? "\(ind)  \(st.mac)" : "  Adapter: \(chip) • \(st.mac)"))
+        menu.addItem(disabledInfoItem(multi ? "\(ind)  \(st.mac)" : "  Adapter: \(chip) | \(st.mac)"))
 
         let err = a.message ?? (st.last_error.isEmpty ? nil : st.last_error)
         if let e = err, !e.isEmpty {
@@ -526,11 +608,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !multi { menu.addItem(NSMenuItem.separator()) }
         if st.associated || st.connecting {
             menu.addItem(actionItem("\(ind)Disconnect", #selector(onDisconnect(_:)), a))
-        } else if !st.saved_ssid.isEmpty {
-            menu.addItem(actionItem("\(ind)Connect to Saved: \(st.saved_ssid)", #selector(onReconnect(_:)), a))
         }
         if !st.saved_ssid.isEmpty {
             menu.addItem(actionItem("\(ind)Forget \"\(st.saved_ssid)\"", #selector(onForget(_:)), a))
+        }
+        if let pref = st.band_pref { /* each dongle keeps its own, applied at its next connect */
+            let bands = NSMenu()
+            bands.autoenablesItems = false
+            for (title, v) in [("Auto", "auto"), ("5 GHz", "5"), ("2.4 GHz", "2.4")] {
+                let it = actionItem(title, #selector(onBand(_:)), BandChoice(a, v))
+                it.state = pref == v ? .on : .off
+                bands.addItem(it)
+            }
+            let sub = NSMenuItem(title: "\(ind)Preferred Band", action: nil, keyEquivalent: "")
+            sub.submenu = bands
+            menu.addItem(sub)
+        }
+        if let ps = st.power_save { /* off by default: less heat and power, but higher latency */
+            let it = actionItem("\(ind)Power Saving", #selector(onPowerSave(_:)), a)
+            it.state = ps ? .on : .off
+            menu.addItem(it)
         }
 
         let nets: NSMenu
@@ -573,10 +670,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func onDisconnect(_ sender: NSMenuItem) {
         if let a = sender.representedObject as? Adapter { sendSimpleAction(a, "DISCONNECT", timeoutSec: 8) }
-    }
-
-    @objc private func onReconnect(_ sender: NSMenuItem) {
-        if let a = sender.representedObject as? Adapter { sendSimpleAction(a, "RECONNECT", timeoutSec: 8) }
     }
 
     @objc private func onForget(_ sender: NSMenuItem) {
@@ -704,6 +797,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try? data.write(to: url)
         }
         rebuildMenu()
+    }
+
+    @objc private func onBand(_ sender: NSMenuItem) {
+        guard let c = sender.representedObject as? BandChoice else { return }
+        sendSimpleAction(c.adapter, "BAND \(c.band)")
+    }
+
+    @objc private func onPowerSave(_ sender: NSMenuItem) {
+        guard let a = sender.representedObject as? Adapter else { return }
+        sendSimpleAction(a, sender.state == .on ? "POWERSAVE off" : "POWERSAVE on")
     }
 
     @objc private func onOpenLog() {

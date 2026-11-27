@@ -79,15 +79,26 @@ int wifi_slot(void) { return g_slot; }
 /* feth link status follows peering, not up/down: unpeer on WiFi loss so configd sees link-down and
    re-runs DHCP on the next network (otherwise it keeps the previous SSID's lease). */
 static bool host_up = true; /* unknown at start: the first down always runs */
+static pthread_mutex_t host_lock = PTHREAD_MUTEX_INITIALIZER;
 static void set_host_link(bool up) {
     if (g.bpf_fd < 0) return;
-    if (!up && !host_up) return; /* each ifconfig spawn costs connect time; already down */
-    host_up = up;
-    char *p[] = { "ifconfig", wifi_if_host, "peer", wifi_if_peer, NULL };
-    char *np[] = { "ifconfig", wifi_if_host, "-peer", NULL };
-    char *a[] = { "ifconfig", wifi_if_host, up ? "up" : "down", NULL };
-    (void)run_cmd("/sbin/ifconfig", up ? p : np);
-    (void)run_cmd("/sbin/ifconfig", a);
+    /* the driver thread can report a disconnect between a caller's read of link_up and this call:
+       serialize and re-read, so a late "up" never peers feth after the link already dropped */
+    pthread_mutex_lock(&host_lock);
+    if (up) {
+        pthread_mutex_lock(&g.state_lock);
+        up = g.link_up;
+        pthread_mutex_unlock(&g.state_lock);
+    }
+    if (up || host_up) { /* each ifconfig spawn costs connect time; skip when already down */
+        host_up = up;
+        char *p[] = { "ifconfig", wifi_if_host, "peer", wifi_if_peer, NULL };
+        char *np[] = { "ifconfig", wifi_if_host, "-peer", NULL };
+        char *a[] = { "ifconfig", wifi_if_host, up ? "up" : "down", NULL };
+        (void)run_cmd("/sbin/ifconfig", up ? p : np);
+        (void)run_cmd("/sbin/ifconfig", a);
+    }
+    pthread_mutex_unlock(&host_lock);
 }
 
 /* ------------------------------------------------------- driver events */
@@ -157,6 +168,13 @@ static void ev_rx(const uint8_t *eth, size_t len, bool is_eapol) {
     if (g.link_up && g.bpf_fd >= 0 && write(g.bpf_fd, eth, len) == (ssize_t)len) g.rx_pkts++;
 }
 
+static void led(enum wifi_led s) {
+    if (drv && drv->led) drv->led(s);
+}
+
+bool wifi_has_power_save(void) { return drv && drv->power_save; }
+int wifi_set_power_save(bool on) { return wifi_has_power_save() ? drv->power_save(on) : -EOPNOTSUPP; }
+
 static void ev_assoc(const struct wifi_drv_assoc *a) {
     pthread_mutex_lock(&g.state_lock);
     g.assoc_status = a->status;
@@ -170,6 +188,7 @@ static void ev_assoc(const struct wifi_drv_assoc *a) {
         memcpy(g.ap_bssid, a->bssid, 6);
     } else {
         g.associated = g.link_up = false;
+        led(WIFI_LED_IDLE);
     }
     pthread_mutex_unlock(&g.state_lock);
     fprintf(stderr, "usbwifi: assoc status=%u freq=%u at=%.1fms\n", a->status, a->freq, since_ms(&conn_t0));
@@ -181,6 +200,7 @@ static void ev_disconnected(uint16_t reason) {
     g.disconnect_reason = reason;
     g.eapol_head = g.eapol_tail = g.eapol_count = 0;
     pthread_mutex_unlock(&g.state_lock);
+    led(WIFI_LED_IDLE);
     fprintf(stderr, "usbwifi: disconnected reason=%u\n", reason);
     set_host_link(false);
 }
@@ -320,11 +340,27 @@ static void *bpf_thread(void *arg) {
 int wifi_open(io_connect_t *out_conn, io_service_t *out_svc, bool quiet, kern_return_t *out_kr) {
     if (out_kr) *out_kr = KERN_FAILURE;
     if (!g.started) {
-        for (size_t i = 0; i < sizeof(wifi_drivers) / sizeof(wifi_drivers[0]) && !drv; i++) {
+        /* a dongle that fails to bind ends this process; the next worker tries that driver last, so a stuck
+           AIC8800D80 that fails every time cannot keep a plugged RTL8852BU from ever being tried */
+        const size_t n = sizeof(wifi_drivers) / sizeof(wifi_drivers[0]);
+        size_t first = 0;
+        unsigned bad = 0;
+        FILE *bf = fopen(WIFI_RUN_DIR "/bad-driver", "r");
+        if (bf) {
+            if (fscanf(bf, "%u", &bad) == 1 && bad < n) first = (bad + 1U) % n;
+            fclose(bf);
+        }
+        for (size_t k = 0; k < n && !drv; k++) {
+            const size_t i = (first + k) % n;
             memset(&g.info, 0, sizeof(g.info));
             int rc = wifi_drivers[i]->open(&events, &g.info, 1000);
-            if (rc == 0) drv = wifi_drivers[i];
-            else if (rc != -ENODEV) exit(1); /* half-bound dongle: start over in a fresh process */
+            if (rc == 0) drv = wifi_drivers[i], led(WIFI_LED_IDLE);
+            else if (rc != -ENODEV) { /* half-bound dongle: start over in a fresh process */
+                if ((bf = fopen(WIFI_RUN_DIR "/bad-driver", "w"))) fprintf(bf, "%zu\n", i), fclose(bf);
+                fprintf(stderr, "usbwifi: %s driver failed to bind (%d), trying it last next time\n",
+                        wifi_drivers[i]->name, rc);
+                exit(1);
+            }
         }
         if (!drv) {
             wifi_usb_unlock();
@@ -443,6 +479,7 @@ kern_return_t wifi_connect(io_connect_t conn, const wifi_connect_req_t *in, wifi
     memset(g.ap_bssid, 0, 6);
     pthread_mutex_unlock(&g.state_lock);
     set_host_link(false);
+    led(WIFI_LED_CONNECTING);
     fprintf(stderr, "usbwifi: connect timing hostlink=%.1fms\n", since_ms(&conn_t0));
 
     struct wifi_connect_params p = {
@@ -452,6 +489,7 @@ kern_return_t wifi_connect(io_connect_t conn, const wifi_connect_req_t *in, wifi
     };
     memcpy(p.bssid, in->bssid, 6);
     int rc = drv->connect(&p);
+    if (rc != 0) led(WIFI_LED_IDLE);
     if (rc < 0) return kIOReturnIOError;
     out->out_status = (uint8_t)rc;
     return KERN_SUCCESS;
@@ -465,6 +503,7 @@ kern_return_t wifi_disconnect(io_connect_t conn, uint16_t reason) {
     g.eapol_head = g.eapol_tail = g.eapol_count = 0;
     pthread_mutex_unlock(&g.state_lock);
     set_host_link(false);
+    led(WIFI_LED_IDLE);
     drv->disconnect(reason ? reason : 3);
     return KERN_SUCCESS;
 }
@@ -520,5 +559,6 @@ kern_return_t wifi_set_port_link(io_connect_t conn, bool open_port, bool link_up
     bool up = g.link_up;
     pthread_mutex_unlock(&g.state_lock);
     set_host_link(up);
+    if (up) led(WIFI_LED_CONNECTED);
     return KERN_SUCCESS;
 }

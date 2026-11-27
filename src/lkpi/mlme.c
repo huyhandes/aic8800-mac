@@ -47,7 +47,9 @@ static struct {
 	struct ieee80211_chanctx_conf *ctx;
 	u8 bssid[ETH_ALEN];
 	enum nl80211_band band;
-	bool assoc, authorized, rsn, wme, scanning, txblock;
+	bool assoc, authorized, rsn, wme, scanning, txblock, ps;
+	u64 scan_since;
+	int scan_fails;
 	struct ieee80211_scan_request *sreq;
 	u8 scan_ies[NUM_NL80211_BANDS][20];
 	struct bss bss[NBSS];
@@ -76,6 +78,11 @@ static struct {
 	struct wiphy_work ba_work, mgmt_work;
 	struct delayed_work reord_dw;
 	struct sk_buff_head mgmt_q;
+	/* LED: rtwd_led() mode, led_dw blinks it while led_alive (open .. close) */
+	struct delayed_work led_dw;
+	volatile int led_mode;
+	volatile bool led_alive;
+	bool led_lit;
 } M;
 
 static const u8 rfc1042[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
@@ -209,6 +216,8 @@ static void mgmt_tx(const void *frame, size_t len)
 
 static void txq_purge(struct ieee80211_txq *tq)
 {
+	if (!tq) /* txq_alloc failed partway through a connect */
+		return;
 	struct lkpi_txq *t = to_lt(tq);
 
 	spin_lock(&t->q.lock);
@@ -794,7 +803,8 @@ static void teardown(u16 reason, bool send)
 	if (was_assoc) {
 		VIF()->cfg.assoc = false;
 		VIF()->cfg.aid = 0;
-		OPS()->vif_cfg_changed(HW(), VIF(), BSS_CHANGED_ASSOC);
+		VIF()->cfg.ps = false; /* mac80211 never keeps PS on without an AP */
+		OPS()->vif_cfg_changed(HW(), VIF(), BSS_CHANGED_ASSOC | BSS_CHANGED_PS);
 	}
 	sta_move(IEEE80211_STA_NOTEXIST);
 	M.l->ap = NULL;
@@ -809,8 +819,6 @@ static void teardown(u16 reason, bool send)
 	kfree(M.ctx);
 	M.ctx = NULL;
 	memset(&VIF()->bss_conf.chanreq, 0, sizeof(VIF()->bss_conf.chanreq));
-	HW()->conf.flags |= IEEE80211_CONF_IDLE;
-	OPS()->config(HW(), -1, IEEE80211_CONF_CHANGE_IDLE);
 
 	__skb_queue_head_init(&o.q);
 	mutex_lock(&rx_lock);
@@ -865,17 +873,42 @@ void ieee80211_connection_loss(struct ieee80211_vif *vif)
 
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 
+/* mode 0: slow blink (not connected), 1: fast blink (connecting), 2: steady on (connected) */
+static void led_fn(struct work_struct *w)
+{
+	int m = M.led_mode;
+
+	if (!M.led_alive)
+		return;
+	M.led_lit = m == 2 || !M.led_lit;
+	/* rtw89's register access shares one USB request buffer, unlocked: the driver's calls are
+	   serialized by the wiphy lock, so ours must be too or both writes land corrupted */
+	wiphy_lock(WIPHY());
+	rtwd_led_set(&M.l->hw, M.led_lit);
+	wiphy_unlock(WIPHY());
+	if (m != 2)
+		schedule_delayed_work(&M.led_dw, msecs_to_jiffies(m ? 120 : 1000));
+}
+
+void rtwd_led(int mode)
+{
+	M.led_mode = mode;
+	if (M.led_alive)
+		mod_delayed_work(system_wq, &M.led_dw, 0);
+}
+
 static void init_once(void)
 {
 	INIT_WORK(&M.loss_work, loss_work_fn);
 	wiphy_work_init(&M.ba_work, ba_work_fn);
 	wiphy_work_init(&M.mgmt_work, mgmt_work_fn);
 	INIT_DELAYED_WORK(&M.reord_dw, reord_timeout);
+	INIT_DELAYED_WORK(&M.led_dw, led_fn);
 	skb_queue_head_init(&M.mgmt_q);
 	init_completion(&M.jc);
 }
 
-int rtwd_open(const struct rtwd_cb *cb, uint8_t mac[6], int timeout_ms)
+int rtwd_open(const struct rtwd_cb *cb, uint8_t mac[6], int timeout_ms, const char *country)
 {
 	struct ieee80211_hw *hw;
 	int r;
@@ -899,6 +932,11 @@ int rtwd_open(const struct rtwd_cb *cb, uint8_t mac[6], int timeout_ms)
 		goto err;
 	M.l = hw_to_local(hw);
 	M.sta->lv = M.l->lv;
+	regulatory_hint(WIPHY(), country);
+	wiphy_lock(WIPHY());
+	rtwd_led_init(hw);
+	wiphy_unlock(WIPHY());
+	M.led_alive = true;
 	aic_rx_reord_init(&M.reord);
 	memset(M.last_seq, 0xff, sizeof(M.last_seq));
 	memcpy(mac, VIF()->addr, ETH_ALEN);
@@ -914,39 +952,22 @@ out:
 	return r;
 }
 
-void rtwd_close(void)
+/* A wedged chip can keep the link looking up while TX is dead, and as the primary service it then
+   blackholes the Mac's traffic. Report it as unplugged: the worker exits (the service goes
+   inactive, macOS falls back to the next one) and a fresh worker rebinds the dongle. */
+static void wedged(const char *why)
 {
-	struct usb_interface *intf;
-
-	mutex_lock(&op_lock);
-	if (!M.l) {
-		mutex_unlock(&op_lock);
-		return;
-	}
-	wiphy_lock(WIPHY());
-	lkpi_mlme_down(M.l);
-	wiphy_unlock(WIPHY());
-	M.token++;
-	mutex_unlock(&op_lock);
-	flush_work(&M.loss_work);
-	cancel_delayed_work_sync(&M.reord_dw);
-	mutex_lock(&op_lock);
-	intf = M.intf;
-	lkpi_usb_remove(intf); /* -> lkpi80211_down() -> lkpi_mlme_down(): nothing left */
-	M.l = NULL;
-	M.intf = NULL;
-	kfree(M.sta);
-	M.sta = NULL;
-	for (struct mkey *k = M.retired, *n; k; k = n) {
-		n = k->next;
-		kfree(k);
-	}
-	M.retired = NULL;
-	mutex_unlock(&op_lock);
+	pr_err("mlme: %s, rebinding the dongle\n", why);
+	__atomic_store_n(&M.intf->udev->gone, true, __ATOMIC_RELAXED);
 }
 
+/* polled every 0.5 s by drv_rtw89 */
 bool rtwd_gone(void)
 {
+	/* a full scan takes ~5 s: a scan-done this late is lost, the firmware is wedged */
+	if (M.intf && __atomic_load_n(&M.scanning, __ATOMIC_ACQUIRE) &&
+	    lkpi_now_ns() - __atomic_load_n(&M.scan_since, __ATOMIC_RELAXED) > 20 * NSEC_PER_SEC)
+		wedged("scan stuck for 20 s");
 	return M.intf && !lkpi_usb_present(M.intf);
 }
 
@@ -1018,12 +1039,17 @@ int rtwd_scan(const uint8_t *ssid, uint8_t ssid_len, const uint16_t *freqs, int 
 	M.nbss = 0;
 	mutex_unlock(&rx_lock);
 	M.sreq = sr;
-	M.scanning = true;
+	__atomic_store_n(&M.scan_since, lkpi_now_ns(), __ATOMIC_RELAXED);
+	__atomic_store_n(&M.scanning, true, __ATOMIC_RELEASE); /* after scan_since: rtwd_gone() reads both */
 	r = OPS()->hw_scan(HW(), VIF(), sr);
 	if (r) {
 		M.scanning = false;
 		if (r == 1)
 			r = -EOPNOTSUPP;
+		else if (++M.scan_fails >= 3) /* "Update probe request failed": the H2C pipe is dead */
+			wedged("3 scan starts failed");
+	} else {
+		M.scan_fails = 0;
 	}
 unlock:
 	wiphy_unlock(WIPHY());
@@ -1112,11 +1138,16 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 	r = -EBUSY;
 	if (M.scanning)
 		goto out;
-	if (M.ctx) {
-		wiphy_lock(WIPHY());
+	wiphy_lock(WIPHY());
+	if (M.ctx)
 		teardown(WLAN_REASON_DEAUTH_LEAVING, true);
-		wiphy_unlock(WIPHY());
+	/* torn down: rtw89 holds none of the retired keys now */
+	for (struct mkey *k = M.retired, *n; k; k = n) {
+		n = k->next;
+		kfree(k);
 	}
+	M.retired = NULL;
+	wiphy_unlock(WIPHY());
 	M.token++;
 	mutex_lock(&rx_lock);
 	for (int i = 0; i < M.nbss; i++)
@@ -1179,8 +1210,6 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 	memcpy(M.bssid, bssid, ETH_ALEN);
 	mutex_unlock(&rx_lock);
 	wiphy_lock(WIPHY());
-	HW()->conf.flags &= ~IEEE80211_CONF_IDLE;
-	OPS()->config(HW(), -1, IEEE80211_CONF_CHANGE_IDLE);
 	r = -ENOMEM;
 	M.ctx = kzalloc(sizeof(*M.ctx) + HW()->chanctx_data_size, GFP_KERNEL);
 	if (!M.ctx)
@@ -1190,8 +1219,6 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 	if (r) {
 		kfree(M.ctx);
 		M.ctx = NULL;
-		HW()->conf.flags |= IEEE80211_CONF_IDLE;
-		OPS()->config(HW(), -1, IEEE80211_CONF_CHANGE_IDLE);
 		goto fail_locked;
 	}
 	VIF()->bss_conf.chanreq.oper = cd;
@@ -1200,8 +1227,6 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 		OPS()->remove_chanctx(HW(), M.ctx);
 		kfree(M.ctx);
 		M.ctx = NULL;
-		HW()->conf.flags |= IEEE80211_CONF_IDLE;
-		OPS()->config(HW(), -1, IEEE80211_CONF_CHANGE_IDLE);
 		goto fail_locked;
 	}
 	rate_masks(ies, ilen, sb, &supp, &basic);
@@ -1374,7 +1399,8 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 	memset(M.seq, 0, sizeof(M.seq));
 	mutex_unlock(&tx_lock);
 	mutex_unlock(&rx_lock);
-	OPS()->vif_cfg_changed(HW(), VIF(), BSS_CHANGED_ASSOC);
+	VIF()->cfg.ps = M.ps;
+	OPS()->vif_cfg_changed(HW(), VIF(), BSS_CHANGED_ASSOC | BSS_CHANGED_PS);
 	if (!M.rsn) {
 		r = sta_move(IEEE80211_STA_AUTHORIZED);
 		if (r)
@@ -1406,6 +1432,20 @@ void rtwd_disconnect(uint16_t reason)
 		wiphy_unlock(WIPHY());
 	}
 	mutex_unlock(&op_lock);
+}
+
+int rtwd_power_save(bool on)
+{
+	mutex_lock(&op_lock);
+	M.ps = on;
+	if (M.l && M.assoc) {
+		wiphy_lock(WIPHY());
+		VIF()->cfg.ps = on;
+		OPS()->vif_cfg_changed(HW(), VIF(), BSS_CHANGED_PS);
+		wiphy_unlock(WIPHY());
+	}
+	mutex_unlock(&op_lock);
+	return 0;
 }
 
 int rtwd_set_authorized(bool on)
@@ -1478,7 +1518,7 @@ int rtwd_add_key(bool pairwise, uint8_t idx, uint32_t cipher_suite, const uint8_
 	mutex_unlock(&tx_lock);
 	mutex_unlock(&rx_lock);
 	wiphy_unlock(WIPHY());
-	key_retire(old); /* shortcut: retired keys are freed at close (rtw89 may still point at them) */
+	key_retire(old); /* rtw89 may still point at it: freed at the next connect, after teardown */
 	if (r)
 		goto out;
 	k = NULL;

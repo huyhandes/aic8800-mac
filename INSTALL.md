@@ -29,8 +29,10 @@ What gets installed:
 |---|---|
 | `/Applications/USB Wifi.app` | menu bar app |
 | `/Library/PrivilegedHelperTools/usbwifi/` | daemons, bundled libusb, `install.sh` |
-| `/Library/Application Support/USB Wifi/` | firmware (`fw/aic8800D80`, `fw/rtw89`), licenses, saved profiles (`wifi.conf`, `wifi-N.conf` for the Nth extra dongle, root 0600), `adapters` (dongle MAC → slot) |
+| `/Library/Application Support/USB Wifi/` | firmware (`fw/aic8800D80`, `fw/rtw89`), licenses, saved profiles (`wifi.conf`, `wifi-N.conf` for the Nth extra dongle, root 0600), `adapters` (dongle MAC → slot), optional `country` (two letters, e.g. `VN`: the Realtek dongle's TX-power table; default `US`, since Realtek's VN/ETSI table holds 5 GHz ch112-128 to 7 dBm), `band`, `band-N` (`auto`, `5` or `2.4`: each dongle's preferred band, set from its Preferred Band menu) |
 | `/Library/LaunchDaemons/com.usbwifi.wifi.plist` | auto-start on plug |
+| `/Library/LaunchDaemons/com.usbwifi.logtrim.plist` | empties the log once a day |
+| `/Library/LaunchAgents/com.usbwifi.cdswitch.plist` | switches a plugged RTL8852BU out of driver-CD mode (only with the RTL8852BU driver) |
 | `~/Library/LaunchAgents/com.usbwifi.menu.plist` | menu app at login |
 
 ## Uninstall
@@ -68,7 +70,7 @@ sudo installer -pkg build/USBWifi.pkg -target /
 - `usbwifid status|scan|connect` and `scripts/usbwifi-up.sh` talk to slot 0 only. Use the menu app for other dongles.
 - The daemon reads these switches from the `EnvironmentVariables` of
   `/Library/LaunchDaemons/com.usbwifi.wifi.plist` (set any value, e.g. `1`,
-  then reload the daemon). Use them if a network misbehaves. All but `AICD_ALWAYS_SCAN` apply to the
+  then reload the daemon). Use them if a network misbehaves. An upgrade rewrites that plist, so set them again after it. All but `AICD_ALWAYS_SCAN` apply to the
   AIC8800D80 only:
 
   | Variable | Effect |
@@ -76,11 +78,11 @@ sudo installer -pkg build/USBWifi.pkg -target /
   | `AICD_NO_RX_AGG` | turn off RX aggregation, if the link is unstable under load |
   | `AICD_NO_VHT` | do not offer 802.11ac (5 GHz falls back to HT40) |
   | `AICD_NO_HE` | do not offer 802.11ax |
-  | `AICD_PS` | turn power save back on: less power, higher and spikier latency |
   | `AICD_ALWAYS_SCAN` | always scan before reconnecting, instead of reusing the last network |
 
-- Since 1.0.2, power save is off by default for low latency, so the dongle draws
-  a little more power while connected.
+- Power save is off by default for low latency, so the dongle draws a little more power and runs
+  warmer. Turn it on per dongle with Power Saving in the menu (saved in
+  `/Library/Application Support/USB Wifi/powersave`, `powersave-1` for the second dongle and so on).
 - A TX20U Nano that stays a "DISK" in System Information is still in driver-CD mode. The switch to
   Wi-Fi runs in your login session, so it needs a user logged in to the desktop; at the login window
   or on a headless Mac, unplug and replug after logging in. `usbwifid cd-eject` (as your user, not

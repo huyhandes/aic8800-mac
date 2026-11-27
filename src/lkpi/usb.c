@@ -209,8 +209,13 @@ int usb_submit_urb(struct urb *urb, gfp_t gfp)
 		urb->use_count--;
 		urb->refcount--; /* the caller still holds one */
 	}
+	/* a wedged RTL8852BU kept failing H2C submits with LIBUSB_ERROR_IO for 1.5 h while still
+	   enumerated: treat a dead pipe as an unplug so a fresh worker rebinds the dongle */
+	u16 *errs = &d->submit_errs[ep | (in ? 16 : 0)];
+	*errs = r && r != LIBUSB_ERROR_BUSY ? *errs + 1 : 0;
+	const bool dead = *errs >= 50;
 	pthread_mutex_unlock(&ulock);
-	if (r == LIBUSB_ERROR_NO_DEVICE)
+	if (r == LIBUSB_ERROR_NO_DEVICE || dead)
 		__atomic_store_n(&d->gone, true, __ATOMIC_RELAXED);
 	return r ? errno_of(r) : 0;
 }

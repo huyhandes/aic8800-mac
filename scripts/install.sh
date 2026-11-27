@@ -9,7 +9,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN=/Library/PrivilegedHelperTools/usbwifi
 SUP="/Library/Application Support/USB Wifi"
 APP="/Applications/USB Wifi.app"
-LABELS=(com.usbwifi.wifi)
+LOG_TRIM=com.usbwifi.logtrim
+LABELS=(com.usbwifi.wifi $LOG_TRIM)
 MENU_LABEL=com.usbwifi.menu
 [[ $EUID -eq 0 ]] || { echo "need root" >&2; exit 1; }
 
@@ -35,7 +36,7 @@ OLD=com.aic8800mac
 OLD_SUP="/Library/Application Support/AIC8800"
 for l in fwload wifi; do unload "system/$OLD.$l"; rm -f "/Library/LaunchDaemons/$OLD.$l.plist"; done
 for l in menu cdswitch; do unload "gui/$USER_UID/$OLD.$l"; done
-rm -f "$USER_HOME/Library/LaunchAgents/$OLD.menu.plist" "/Library/LaunchAgents/$OLD.cdswitch.plist"
+rm -f "$USER_HOME/Library/LaunchAgents/$OLD.menu.plist" "/Library/LaunchAgents/$OLD.cdswitch.plist" /var/log/$OLD.*.log
 pkill -x AIC8800Menu 2>/dev/null || true
 [[ -f "$OLD_SUP/wifi.conf" && ! -f "$SUP/wifi.conf" ]] && install -d -m 755 "$SUP" && mv "$OLD_SUP/wifi.conf" "$SUP/"
 rm -rf /Library/PrivilegedHelperTools/aic8800-mac "$OLD_SUP" /Applications/AIC8800Menu.app
@@ -48,7 +49,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     ifconfig "feth$((81 + 2 * s))" destroy 2>/dev/null || true
   done
   for l in "${LABELS[@]}"; do rm -f "/Library/LaunchDaemons/$l.plist"; done
-  rm -rf "$BIN" "$SUP" "$APP" "$AGENT" "$CD_AGENT" /var/run/usbwifi
+  rm -rf "$BIN" "$SUP" "$APP" "$AGENT" "$CD_AGENT" /var/run/usbwifi /var/log/com.usbwifi.wifi.log*
   for p in com.usbwifi.pkg com.usbwifi.pkg.aic8800 com.usbwifi.pkg.rtl8852bu com.usbwifi.pkg.setup; do
     pkgutil --forget "$p" >/dev/null 2>&1 || true
   done
@@ -59,7 +60,7 @@ fi
 if [[ "${1:-}" != "--setup" ]]; then
   [[ -d "$ROOT/build/USBWifi.app" ]] || { echo "run make first" >&2; exit 1; }
   install -d -m 755 "$BIN" "$SUP/fw"
-  install -S -m 755 "$ROOT"/build/{usbwifid,usbwifi_netsvc,libusb-1.0.0.dylib} "$BIN/"
+  install -S -m 755 "$ROOT"/build/{usbwifid,usbwifi_netsvc,libusb-1.0.0.dylib} "$ROOT/scripts/install.sh" "$BIN/"
   rm -rf "$SUP/fw/aic8800D80" "$SUP/fw/rtw89" "$APP"
   for d in aic8800D80 rtw89; do [[ -d "$ROOT/fw/$d" ]] && cp -R "$ROOT/fw/$d" "$SUP/fw/"; done
   cp -R "$ROOT/build/USBWifi.app" "$APP"
@@ -86,6 +87,24 @@ plist() { # label, args...
 plist com.usbwifi.wifi "$BIN/usbwifid" --daemon
 chmod 644 /var/log/com.usbwifi.wifi.log 2>/dev/null || true # readable from the app's "Open Wi-Fi Log"
 
+# keep about one day of log: at boot and hourly, empty it once the last trim (the stamp's mtime) is 24 h old,
+# so a Mac that is off at any fixed hour still gets trimmed. In place, not newsyslog's rename: usbwifid's
+# stdout stays open on the file in append mode, so it carries on at offset 0
+LOG=/var/log/com.usbwifi.wifi.log
+cat > "/Library/LaunchDaemons/$LOG_TRIM.plist" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$LOG_TRIM</string>
+<key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string>
+<string>[ -e $LOG.trimmed ] || touch $LOG.trimmed; [ -z "\$(find $LOG.trimmed -mmin +1440)" ] || { : > $LOG; touch $LOG.trimmed; }</string></array>
+<key>RunAtLoad</key><true/>
+<key>StartInterval</key><integer>3600</integer>
+</dict></plist>
+PL
+chmod 644 "/Library/LaunchDaemons/$LOG_TRIM.plist"
+launchctl bootstrap system "/Library/LaunchDaemons/$LOG_TRIM.plist"
+
 # Realtek dongles boot as a "driver CD" (0bda:1a2b). Its USB interface sits behind the per-user Removable
 # Volumes permission, which a daemon can never hold, so launchd runs the eject in the console user's session
 # on each plug-in (as Windows' WifiAutoInstallSrv does on device arrival); the daemon detaches macOS's driver
@@ -110,7 +129,9 @@ else
   rm -f "$CD_AGENT"
 fi
 
-# menu app at login for the console user (same plist the app's "Launch at Login" toggle manages)
+# menu app at login for the console user (same plist the app's "Launch at Login" toggle manages).
+# Nobody at the console (pkg pushed at the login window): skip it, the app starts from /Applications later
+if [[ "$USER_NAME" == root ]]; then echo "installed (no console user: menu agent skipped)"; exit 0; fi
 install -d -o "$USER_NAME" "$USER_HOME/Library/LaunchAgents"
 cat > "$AGENT" <<PL
 <?xml version="1.0" encoding="UTF-8"?>

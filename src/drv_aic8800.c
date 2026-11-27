@@ -193,7 +193,10 @@ static void on_cfg_pkt(uint8_t type, const uint8_t *payload, size_t len, void *c
    libusb completes transfers of one endpoint in submission order, so the stream stays ordered. */
 #define RX_XFERS 16
 static void LIBUSB_CALL rx_done(struct libusb_transfer *t) {
-    if (t->status == LIBUSB_TRANSFER_NO_DEVICE) ev->gone(); /* unplugged: the dongle returns to stage 0 */
+    static int errs; /* consecutive failed transfers; callbacks run one at a time on the event thread */
+    errs = t->status == LIBUSB_TRANSFER_COMPLETED ? 0 : errs + 1;
+    /* unplugged (the dongle returns to stage 0), or ~1 s of nothing but errors: RX is dead, restart */
+    if (t->status == LIBUSB_TRANSFER_NO_DEVICE || errs == 100) ev->gone();
     if (t->status == LIBUSB_TRANSFER_COMPLETED) { rxs.xfers++; rxs.bytes += (uint64_t)t->actual_length; }
     if (t->status == LIBUSB_TRANSFER_COMPLETED && t->actual_length >= 4)
         (void)aic_rx_demux_usb_aggr(t->buffer, (size_t)t->actual_length, on_data_chunk, on_cfg_pkt, NULL);
@@ -337,8 +340,7 @@ static int bring_up_lmac(void) {
     if (a.is_5g && !getenv("AICD_NO_VHT")) me.vht_supp = 1;
     /* AIC firmware does not set the rwnx HE feature bit either; D80 is an 11ax chip */
     if (!getenv("AICD_NO_HE")) me.he_supp = me.he_ul_on = 1;
-    /* power save lets the AP hold our frames until the next beacon (~100 ms spikes); latency wins */
-    if (!getenv("AICD_PS")) me.ps_on = me.dpsm = 0;
+    /* ps_on/dpsm only make power save available; aic_power_save() switches it */
     CMD(AIC_ME_CONFIG_REQ, AIC_TASK_ME, &me, AIC_ME_CONFIG_CFM, (uint8_t *)NULL);
 
     aic_me_chan_config_req_t ch = {0};
@@ -368,6 +370,9 @@ static int bring_up_lmac(void) {
     aic_build_d80_agg_enable_req(&agg);
     if (getenv("AICD_NO_RX_AGG")) agg.disable_rx = 1;
     CMD(AIC_MM_SET_AGG_DISABLE_REQ, AIC_TASK_MM, &agg, AIC_MM_SET_AGG_DISABLE_CFM, (uint8_t *)NULL);
+
+    const uint8_t ps_off = 0; /* MM_PS_MODE_OFF: the wifi_drv contract starts with power save off */
+    CMD(AIC_ME_SET_PS_MODE_REQ, AIC_TASK_ME, &ps_off, AIC_ME_SET_PS_MODE_CFM, (uint8_t *)NULL);
 
     fprintf(stderr, "aic8800: features=0x%08x ht=%u vht=%u he=%u ps=%u dpsm=%u bw_max=%u\n", a.fw_features,
             me.ht_supp, me.vht_supp, me.he_supp, me.ps_on, me.dpsm, me.phy_bw_max);
@@ -645,6 +650,12 @@ static int aic_set_authorized(bool on) {
     return send_cmd(AIC_ME_SET_CONTROL_PORT_REQ, AIC_TASK_ME, &p, sizeof(p), AIC_ME_SET_CONTROL_PORT_CFM, NULL, 0, NULL);
 }
 
+/* off by default: the AP then holds our frames until the next beacon (~100 ms latency spikes) */
+static int aic_power_save(bool on) {
+    uint8_t mode = on ? 2U : 0U; /* MM_PS_MODE_ON_DYN : MM_PS_MODE_OFF */
+    return send_cmd(AIC_ME_SET_PS_MODE_REQ, AIC_TASK_ME, &mode, 1, AIC_ME_SET_PS_MODE_CFM, NULL, 0, NULL);
+}
+
 const struct wifi_drv wifi_drv_aic8800 = {
     .name = "aic8800",
     .open = aic_open,
@@ -654,4 +665,5 @@ const struct wifi_drv wifi_drv_aic8800 = {
     .add_key = aic_add_key,
     .set_authorized = aic_set_authorized,
     .tx = aic_tx,
+    .power_save = aic_power_save,
 };

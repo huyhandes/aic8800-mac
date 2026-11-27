@@ -4,6 +4,11 @@
 #undef snprintf
 #include <assert.h>
 
+/* mlme.c's side of mac80211.c: no station runs here */
+struct lkpi_local;
+void ieee80211_connection_loss(struct ieee80211_vif *vif) {}
+void lkpi_mlme_down(struct lkpi_local *l) {}
+
 static u32 rate(u32 flags, u8 mcs, u8 nss, u8 bw, u8 gi)
 {
 	struct rate_info r = { .flags = flags, .mcs = mcs, .nss = nss, .bw = bw, .he_gi = gi };
@@ -87,7 +92,7 @@ static void test_stack(void)
 	const u8 mac[ETH_ALEN] = { 2, 0, 0, 0, 0, 1 }, bssid[ETH_ALEN] = { 2, 0, 0, 0, 0, 2 };
 
 	assert(hw && hw->priv && hw->wiphy && wiphy_to_ieee80211_hw(hw->wiphy) == hw);
-	assert(hw->conf.flags & IEEE80211_CONF_IDLE);
+	assert(!(hw->conf.flags & IEEE80211_CONF_IDLE)); /* never idle: keeps rtw89 out of IPS */
 	hw->extra_tx_headroom = 16;
 	hw->wiphy->reg_notifier = d_reg;
 	memcpy(hw->wiphy->perm_addr, mac, ETH_ALEN);

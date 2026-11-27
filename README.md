@@ -49,8 +49,8 @@ the same network.
   it is not an exact like-for-like comparison.
 
 Each optimization can be turned off with an environment variable on the
-daemon: `AICD_NO_VHT`, `AICD_NO_HE`, `AICD_PS` (power save back on),
-`AICD_ALWAYS_SCAN`.
+daemon: `AICD_NO_VHT`, `AICD_NO_HE`, `AICD_ALWAYS_SCAN`. Power save is off by
+default and has a per-dongle Power Saving toggle in the menu.
 
 ## How it works
 

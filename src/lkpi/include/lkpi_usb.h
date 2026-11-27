@@ -42,7 +42,8 @@ struct usb_device {
 	struct usb_device_descriptor descriptor;
 	struct libusb_device_handle *handle;
 	u16 ep_maxpacket[32]; /* index: endpoint number | (dir ? 16 : 0) */
-	bool gone; /* a transfer saw LIBUSB_ERROR_NO_DEVICE */
+	bool gone; /* a transfer saw LIBUSB_ERROR_NO_DEVICE, or a pipe stopped taking submits */
+	u16 submit_errs[32]; /* consecutive failed submits, same index as ep_maxpacket */
 };
 struct usb_interface {
 	struct device dev;

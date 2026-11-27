@@ -17,7 +17,9 @@
    host-visible interface feth(80+2N) (gets DHCP) and the peer feth(81+2N) (the driver's BPF endpoint). */
 #define WIFI_MAX_SLOTS 16
 #define WIFI_CONF_DIR "/Library/Application Support/USB Wifi"
+#ifndef WIFI_RUN_DIR /* tests point it at a scratch dir */
 #define WIFI_RUN_DIR  "/var/run/usbwifi" /* <slot>.sock control sockets, usb-<location> dongle locks */
+#endif
 extern char wifi_if_host[16], wifi_if_peer[16];
 int wifi_slot(void); /* -1 until a dongle is bound */
 
@@ -36,6 +38,8 @@ kern_return_t wifi_poll_eapol(io_connect_t conn, wifi_eapol_frame_t *out);
 kern_return_t wifi_send_eapol(io_connect_t conn, const uint8_t *eth, size_t len);
 const char *wifi_chip_name(void); /* "" until an adapter is up */
 void wifi_system_woke(void);
+bool wifi_has_power_save(void);
+int  wifi_set_power_save(bool on); /* -EOPNOTSUPP when the driver has none */
 kern_return_t wifi_add_key(io_connect_t conn, uint8_t key_idx, bool pairwise, uint8_t cipher,
                            const uint8_t *key, uint8_t key_len, uint8_t *out_hw_idx);
 kern_return_t wifi_set_port_link(io_connect_t conn, bool open_port, bool link_up);

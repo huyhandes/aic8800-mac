@@ -20,28 +20,33 @@ build/usbwifi_netsvc: src/usbwifi_netsvc.c
 	$(CC) $(CFLAGS) $(INC) $< -o $@ -framework SystemConfiguration $(FW)
 
 # AIC8800D80 firmware loader, linked into usbwifid as its "fwload" subcommand
-build/fwload.o: third_party/yokitea/fwload/main.c
+YK_HDR   = $(wildcard third_party/yokitea/common/*.h) # header-only: every includer rebuilds on a change
+build/fwload.o: third_party/yokitea/fwload/main.c $(YK_HDR)
 	@mkdir -p build
 	$(CC) -c $(CFLAGS) $(INC) -Dmain=aic_fwload_main $< -o $@
 
 # Realtek RTL8852BU: upstream Linux rtw89 (GPL-2.0 OR BSD-3-Clause, unmodified) on the src/lkpi mac80211 shim
 RTW_OBJ  = $(patsubst third_party/rtw89/%.c,build/rtw/%.o,$(wildcard third_party/rtw89/*.c))
-LK_OBJ   = $(patsubst %,build/lk/%.o,kernel usb mac80211 mlme cdcap)
-LK_HDR   = $(wildcard src/lkpi/include/*.h src/lkpi/include/*/*.h) src/lkpi/local.h src/rtwd.h
+LK_OBJ   = $(patsubst %,build/lk/%.o,kernel usb mac80211 mlme cdcap) build/lk/rtw89_led.o
+LK_HDR   = $(wildcard src/lkpi/include/*.h src/lkpi/include/*/*.h) src/lkpi/local.h src/rtwd.h src/wifi_drv.h $(YK_HDR)
 build/rtw/%.o: third_party/rtw89/%.c $(LK_HDR)
 	@mkdir -p $(@D)
 	$(CC) -c -std=gnu11 -O2 -Isrc/lkpi/include -DCONFIG_RTW89_DEBUGMSG -Wno-everything $< -o $@
+build/lk/rtw89_led.o: src/lkpi/rtw89_led.c $(LK_HDR)
+	@mkdir -p $(@D)
+	$(CC) -c -std=gnu11 -O2 -Isrc/lkpi/include -Ithird_party/rtw89 -Wno-everything $< -o $@
 build/lk/%.o: src/lkpi/%.c $(LK_HDR)
 	@mkdir -p $(@D)
 	$(CC) -c -std=gnu11 $(CFLAGS) -Isrc/lkpi/include -Ithird_party/yokitea/common -I$(USB_DIR)/include/libusb-1.0 $< -o $@
 
 # station core + one src/drv_<chip>.c per chip family (wifi_drv.h)
 CORE_SRC = src/usbwifid.c src/usbwifi_core.c src/drv_aic8800.c src/drv_rtw89.c
-build/usbwifid: $(CORE_SRC) src/usbwifi_core.h src/wifi_drv.h src/rtwd.h build/fwload.o $(RTW_OBJ) $(LK_OBJ)
+build/usbwifid: $(CORE_SRC) src/usbwifi_core.h src/wifi_drv.h src/rtwd.h $(YK_HDR) build/fwload.o $(RTW_OBJ) $(LK_OBJ)
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INC) $(CORE_SRC) build/fwload.o $(RTW_OBJ) $(LK_OBJ) -o $@ $(USB) $(FW) -framework DiskArbitration
 	install_name_tool -change $$(otool -L $@ | awk '/libusb/{print $$1}') @executable_path/libusb-1.0.0.dylib $@
-	codesign --force --sign - $@
+	# ad-hoc's default requirement is the cdhash, so each build lost the cd-eject agent's Removable Volumes grant
+	codesign --force --sign - -i com.usbwifi.usbwifid -r='designated => identifier "com.usbwifi.usbwifid"' $@
 
 # bundled so the installed driver does not depend on Homebrew
 build/libusb-1.0.0.dylib:
@@ -89,12 +94,22 @@ clean:
 	rm -rf build
 .PHONY: all clean
 
-# self-check (no root): WPA2 handshake unit test, then driver bring-up + scan against the plugged dongle
-check: build/usbwifid build/libusb-1.0.0.dylib build/wpa2_test
+# self-check (no root): WPA2 handshake and lkpi shim unit tests, then driver bring-up + scan against the plugged dongle
+check: build/usbwifid build/libusb-1.0.0.dylib build/wpa2_test build/drv_contract_test build/kernel_test build/mac80211_test
 	./build/wpa2_test
+	./build/drv_contract_test
+	./build/kernel_test
+	./build/mac80211_test
 	AICD_NO_NET=1 ./build/usbwifid scan
 
 build/wpa2_test: tests/wpa2_test.c third_party/yokitea/common/aic8800_wpa2.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INC) $< -o $@
+build/drv_contract_test: tests/drv_contract_test.c src/usbwifi_core.c src/usbwifi_core.h src/wifi_drv.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(INC) -DWIFI_RUN_DIR='"build/run"' $(filter %.c,$^) $(USB) -framework IOKit -o $@
+build/kernel_test: src/lkpi/tests/kernel_test.c src/lkpi/kernel.c $(LK_HDR)
+	$(CC) -std=gnu11 -Isrc/lkpi/include -Isrc/lkpi $(filter %.c,$^) -o $@
+build/mac80211_test: src/lkpi/tests/mac80211_test.c src/lkpi/mac80211.c src/lkpi/kernel.c $(LK_HDR)
+	$(CC) -std=gnu11 -Wno-everything -Isrc/lkpi/include -Isrc/lkpi -Ithird_party/yokitea/common $(filter %.c,$^) -o $@
 .PHONY: check

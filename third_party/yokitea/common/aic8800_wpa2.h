@@ -328,6 +328,7 @@ typedef struct {
     uint8_t  anonce[32];
     uint8_t  snonce[32];
     uint8_t  ptk[64]; /* KCK[0..15] KEK[16..31] TK[32..47] */
+    uint8_t  tptk[64]; /* from the latest M1; becomes ptk only once its M3's MIC checks out */
     uint8_t  gtk[AIC_MAC_SEC_KEY_LEN];
     uint8_t  gtk_len;
     uint8_t  gtk_idx;
@@ -336,7 +337,9 @@ typedef struct {
     uint8_t  pairwise_cipher;
     uint8_t  group_cipher;
     uint16_t key_ver;
-    uint64_t last_replay;
+    uint64_t last_replay; /* of the last frame whose MIC checked out */
+    bool     replay_set;
+    bool     has_tptk;
     bool     has_ptk;
     bool     has_gtk;
     bool     ptk_done; /* M3 accepted: the next M1 starts a new handshake */
@@ -363,6 +366,7 @@ static inline void aic_wpa2_ctx_init(aic_wpa2_ctx_t *ctx,
 }
 
 static inline int aic_wpa2_build_eapol_reply(const aic_wpa2_ctx_t *ctx,
+                                             const uint8_t *kck,
                                              uint8_t eapol_ver,
                                              uint8_t desc_type,
                                              uint16_t key_ver,
@@ -405,7 +409,7 @@ static inline int aic_wpa2_build_eapol_reply(const aic_wpa2_ctx_t *ctx,
     }
 
     uint8_t mic[16];
-    if (aic_wpa2_compute_eapol_mic(key_ver, &ctx->ptk[0], rpdu, reply_pdu_len, mic) != 0) {
+    if (aic_wpa2_compute_eapol_mic(key_ver, kck, rpdu, reply_pdu_len, mic) != 0) {
         return -1;
     }
     memcpy(&rbody[77], mic, 16U);
@@ -417,10 +421,28 @@ static inline int aic_wpa2_build_eapol_reply(const aic_wpa2_ctx_t *ctx,
  * Process an incoming Ethernet II EAPOL frame (`0x888E`), and optionally emit
  * a reply Ethernet II EAPOL frame (M2, M4, or Group M2).
  * Returns:
- *   1 -> reply written to `out_eth`, install_keys_now set if PTK+GTK ready
- *   0 -> frame ignored cleanly
- *  -1 -> malformed / MIC failure / unwrap failure
+ *   1 -> reply written to `out_eth`; *out_keys_ready set when a new PTK is ready to install,
+ *        *out_gtk_rekey when a GTK we do not hold yet is
+ *   0 -> frame dropped: malformed, bad MIC, replayed or stale. Anyone in range can send these, so
+ *        they must not end the link; a wrong PSK shows as the AP's silence after M2
+ *  -1 -> local crypto failure, or key data that does not unwrap under a valid MIC
  */
+/* unwraps the GTK into ctx: 1 = a new one, 0 = the one we hold (installing it again would reset its RX
+   replay counter, KRACK), -1 = does not unwrap */
+static inline int aic_wpa2_take_gtk(aic_wpa2_ctx_t *ctx, const uint8_t *kek, const uint8_t *kd, uint16_t kd_len) {
+    uint8_t gtk[sizeof(ctx->gtk)], gtk_len = 0U, gtk_idx = 0U;
+    if (aic_wpa2_extract_gtk(kek, kd, kd_len, &gtk_idx, gtk, &gtk_len) != 0) {
+        return -1;
+    }
+    const bool same = ctx->has_gtk && gtk_idx == ctx->gtk_idx && gtk_len == ctx->gtk_len &&
+                      memcmp(gtk, ctx->gtk, gtk_len) == 0;
+    memcpy(ctx->gtk, gtk, gtk_len);
+    ctx->gtk_len = gtk_len;
+    ctx->gtk_idx = gtk_idx;
+    ctx->has_gtk = true;
+    return same ? 0 : 1;
+}
+
 static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
                                            const uint8_t *eth_in,
                                            size_t eth_in_len,
@@ -435,7 +457,7 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
 
     if (!ctx || !eth_in || !out_eth || !out_len ||
         eth_in_len < 14U + AIC_EAPOL_HDR_LEN + AIC_EAPOL_KEY_BODY_MIN_LEN) {
-        return -1;
+        return 0;
     }
 
     const uint8_t *pdu = &eth_in[14];
@@ -445,7 +467,7 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
     }
     const uint16_t body_len = aic_wpa_get_be16(&pdu[2]);
     if (body_len < AIC_EAPOL_KEY_BODY_MIN_LEN || (size_t)body_len + 4U > pdu_len) {
-        return -1;
+        return 0;
     }
 
     const uint8_t *key_body = &pdu[4];
@@ -459,7 +481,7 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
     const uint64_t replay   = aic_wpa_get_be64(&key_body[5]);
     const uint16_t kd_len   = aic_wpa_get_be16(&key_body[93]);
     if (AIC_EAPOL_KEY_BODY_MIN_LEN + (size_t)kd_len > (size_t)body_len) {
-        return -1;
+        return 0;
     }
 
     const bool is_pw  = (key_info & AIC_KEY_INFO_PAIRWISE) != 0U;
@@ -471,88 +493,83 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
         return 0;
     }
 
-    /* 1. Pairwise M1: Pairwise=1, Ack=1, MIC=0 */
+    /* 1. Pairwise M1: Pairwise=1, Ack=1, MIC=0. Unauthenticated, so it only touches tptk */
     if (is_pw && !is_mic) {
         /* a retransmitted M1 (AP missed/was slow to see our M2) keeps the SNonce, as wpa_supplicant does,
            so whichever M2 the AP accepts yields the PTK we hold */
-        const bool resend = ctx->has_ptk && !ctx->ptk_done && memcmp(ctx->anonce, &key_body[13], 32U) == 0;
+        const bool resend = ctx->has_tptk && !ctx->ptk_done && memcmp(ctx->anonce, &key_body[13], 32U) == 0;
         if (!resend && CCRandomGenerateBytes(ctx->snonce, sizeof(ctx->snonce)) != kCCSuccess) {
             return -1;
         }
         ctx->ptk_done = false;
         memcpy(ctx->anonce, &key_body[13], 32U);
-        ctx->key_ver     = key_ver;
-        ctx->last_replay = replay;
+        ctx->key_ver = key_ver;
         aic_wpa2_derive_ptk(ctx->pmk,
                             ctx->aa,
                             ctx->spa,
                             ctx->anonce,
                             ctx->snonce,
                             (key_ver == AIC_KEY_INFO_VER_AES_CMAC),
-                            ctx->ptk);
-        ctx->has_ptk = true;
+                            ctx->tptk);
+        ctx->has_tptk = true;
 
         const uint16_t m2_info = (uint16_t)(key_ver | AIC_KEY_INFO_PAIRWISE | AIC_KEY_INFO_MIC);
-        return aic_wpa2_build_eapol_reply(ctx, pdu[0], desc_type, key_ver, m2_info, replay,
+        return aic_wpa2_build_eapol_reply(ctx, ctx->tptk, pdu[0], desc_type, key_ver, m2_info, replay,
                                           ctx->snonce, ctx->rsn_ie, ctx->rsn_ie_len,
                                           out_eth, out_cap, out_len);
     }
-
-    /* All signed messages (M3 or Group M1) require valid PTK + MIC verification */
-    if (is_mic) {
-        if (!ctx->has_ptk) {
-            return -1;
-        }
-        uint8_t calc_mic[16];
-        if (aic_wpa2_compute_eapol_mic(key_ver, &ctx->ptk[0], pdu, AIC_EAPOL_HDR_LEN + body_len, calc_mic) != 0 ||
-            memcmp(calc_mic, &key_body[77], 16U) != 0) {
-            return -1;
-        }
-        ctx->last_replay = replay;
+    if (!is_mic) {
+        return 0;
     }
 
+    /* M3 is signed with the PTK its M1 began, the group M1 with the installed one */
+    const uint8_t *key = is_pw ? ctx->tptk : ctx->ptk;
+    uint8_t calc_mic[16];
+    if (!(is_pw ? ctx->has_tptk : ctx->has_ptk)) {
+        return 0;
+    }
+    if (aic_wpa2_compute_eapol_mic(key_ver, key, pdu, AIC_EAPOL_HDR_LEN + body_len, calc_mic) != 0) {
+        return -1;
+    }
+    if (memcmp(calc_mic, &key_body[77], 16U) != 0 || (ctx->replay_set && replay <= ctx->last_replay)) {
+        return 0;
+    }
+    ctx->last_replay = replay;
+    ctx->replay_set  = true;
+
     /* 2. Pairwise M3: Pairwise=1, Ack=1, MIC=1, EncryptedKeyData=1 */
-    if (is_pw && is_mic) {
+    if (is_pw) {
         if (memcmp(ctx->anonce, &key_body[13], 32U) != 0) {
-            return -1;
+            return 0;
         }
-        if (is_enc && kd_len > 0U) {
-            if (aic_wpa2_extract_gtk(&ctx->ptk[16],
-                                     &key_body[95],
-                                     kd_len,
-                                     &ctx->gtk_idx,
-                                     ctx->gtk,
-                                     &ctx->gtk_len) == 0) {
-                ctx->has_gtk = true;
-            }
+        if (is_enc && kd_len > 0U && aic_wpa2_take_gtk(ctx, &ctx->tptk[16], &key_body[95], kd_len) && out_gtk_rekey) {
+            *out_gtk_rekey = true;
         }
         const uint16_t m4_info = (uint16_t)(key_ver | AIC_KEY_INFO_PAIRWISE |
                                             AIC_KEY_INFO_MIC | AIC_KEY_INFO_SECURE);
-        const int rc = aic_wpa2_build_eapol_reply(ctx, pdu[0], desc_type, key_ver, m4_info, replay,
+        const int rc = aic_wpa2_build_eapol_reply(ctx, ctx->tptk, pdu[0], desc_type, key_ver, m4_info, replay,
                                                   NULL, NULL, 0U, out_eth, out_cap, out_len);
-        if (rc == 1) ctx->ptk_done = true;
-        if (rc == 1 && out_keys_ready) {
-            *out_keys_ready = ctx->has_ptk;
+        if (rc == 1) {
+            /* a retransmitted M3 gets its M4 again but must not reinstall the key (KRACK) */
+            if (out_keys_ready) *out_keys_ready = !ctx->ptk_done;
+            memcpy(ctx->ptk, ctx->tptk, sizeof(ctx->ptk));
+            ctx->has_ptk  = true;
+            ctx->ptk_done = true;
         }
         return rc;
     }
 
     /* 3. Group Key Handshake M1: Pairwise=0, Ack=1, MIC=1, EncryptedKeyData=1 */
-    if (!is_pw && is_mic && is_enc && kd_len > 0U) {
-        if (aic_wpa2_extract_gtk(&ctx->ptk[16],
-                                 &key_body[95],
-                                 kd_len,
-                                 &ctx->gtk_idx,
-                                 ctx->gtk,
-                                 &ctx->gtk_len) != 0) {
+    if (is_enc && kd_len > 0U) {
+        const int fresh = aic_wpa2_take_gtk(ctx, &ctx->ptk[16], &key_body[95], kd_len);
+        if (fresh < 0) {
             return -1;
         }
-        ctx->has_gtk = true;
         const uint16_t gm2_info = (uint16_t)(key_ver | AIC_KEY_INFO_MIC | AIC_KEY_INFO_SECURE);
-        const int rc = aic_wpa2_build_eapol_reply(ctx, pdu[0], desc_type, key_ver, gm2_info, replay,
+        const int rc = aic_wpa2_build_eapol_reply(ctx, ctx->ptk, pdu[0], desc_type, key_ver, gm2_info, replay,
                                                   NULL, NULL, 0U, out_eth, out_cap, out_len);
         if (rc == 1 && out_gtk_rekey) {
-            *out_gtk_rekey = true;
+            *out_gtk_rekey = fresh == 1;
         }
         return rc;
     }

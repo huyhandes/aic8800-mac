@@ -74,7 +74,7 @@ int lkpi_detach_cd_driver(void)
 			r = (*d)->USBDeviceReEnumerate(d, kUSBReEnumerateCaptureDeviceMask);
 			(*d)->Release(d);
 		}
-		r = r ? -(r & 0xfff) : d ? 1 : -1;
+		r = r ? -((r & 0xfff) ? (r & 0xfff) : EIO) : d ? 1 : -1; /* never 0 ("nothing attached") on error */
 	}
 	IOObjectRelease(dev);
 	return r;
@@ -105,6 +105,25 @@ static kern_return_t eject(io_service_t s)
 			UInt16 mps;
 			if (!(*i)->GetPipeProperties(i, k, &dir, &num, &type, &mps, &intv) && type == kUSBBulk)
 				*(dir == kUSBIn ? &in : &out) = k;
+		}
+		if (out && in) { /* the recipe that switches it: BOT reset, clear halts, drain, INQUIRY, then the eject.
+				    Without INQUIRY the eject CBW times out (0xe0004051) on a CD macOS's driver has poked */
+			UInt8 num = 0, buf[512];
+			UInt8 inq[31] = { 'U', 'S', 'B', 'C', 0xa2, [8] = 36, [12] = 0x80, [14] = 6, [15] = 0x12, [19] = 36 };
+			UInt32 l = sizeof(buf);
+			(*i)->GetInterfaceNumber(i, &num);
+			IOUSBDevRequestTO rq = { .bmRequestType = 0x21, .bRequest = 0xff, .wIndex = num,
+						 .noDataTimeout = 1000, .completionTimeout = 1000 };
+			(*i)->ControlRequestTO(i, 0, &rq);
+			(*i)->ClearPipeStallBothEnds(i, out);
+			(*i)->ClearPipeStallBothEnds(i, in);
+			(*i)->ReadPipeTO(i, in, buf, &l, 300, 300); /* a stale CSW left by an earlier try */
+			if (!(*i)->WritePipeTO(i, out, inq, sizeof(inq), 2000, 2000)) {
+				l = 36;
+				(*i)->ReadPipeTO(i, in, buf, &l, 2000, 2000);
+				l = sizeof(csw);
+				(*i)->ReadPipeTO(i, in, csw, &l, 2000, 2000);
+			}
 		}
 		r = !out || !in ? kIOReturnNoDevice : (*i)->WritePipeTO(i, out, cbw, sizeof(cbw), 2000, 2000);
 		if (!r) /* the CSW may never come: the device can drop off the bus mid-command */

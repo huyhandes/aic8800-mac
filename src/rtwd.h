@@ -18,9 +18,9 @@ struct rtwd_cb {
 	void (*disconnected)(uint16_t reason);
 };
 
-/* binds the first supported dongle, loads firmware, starts the radio */
-int rtwd_open(const struct rtwd_cb *cb, uint8_t mac[6], int timeout_ms);
-void rtwd_close(void);
+/* binds the first supported dongle, loads firmware, starts the radio; country: ISO alpha2 picking
+   the chip's TX-power table */
+int rtwd_open(const struct rtwd_cb *cb, uint8_t mac[6], int timeout_ms, const char *country);
 /* console-user half of plug-in: switch any Realtek driver CD (0bda:1a2b) to Wi-Fi mode; 0 once none is left */
 int lkpi_usb_eject_cd(int timeout_ms);
 bool rtwd_gone(void);
@@ -31,8 +31,12 @@ int rtwd_scan(const uint8_t *ssid, uint8_t ssid_len, const uint16_t *freqs, int 
 int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uint8_t ssid_len,
 		 const uint8_t *rsn_ie, size_t rsn_len);
 void rtwd_disconnect(uint16_t reason);
+/* LED: 0 slow blink (not connected), 1 fast blink (connecting), 2 on (connected); safe from callbacks */
+void rtwd_led(int mode);
 /* cipher_suite: 00-0F-AC selector as one big-endian u32, e.g. 0x000FAC04 (CCMP-128) */
 int rtwd_add_key(bool pairwise, uint8_t idx, uint32_t cipher_suite, const uint8_t *key, uint8_t len);
 int rtwd_set_authorized(bool on);
 int rtwd_tx_eth(const uint8_t *eth, size_t len);
+/* rtw89 LPS while associated (vif->cfg.ps); kept across connects */
+int rtwd_power_save(bool on);
 #endif

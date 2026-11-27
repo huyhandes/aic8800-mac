@@ -91,7 +91,7 @@ void wiphy_work_flush(struct wiphy *wiphy, struct wiphy_work *work)
 
 bool wiphy_delayed_work_pending(struct wiphy *wiphy, struct wiphy_delayed_work *dwork)
 {
-	return dwork->timer.pending || work_pending(&dwork->work.lkpi);
+	return dwork->timer.pending; /* as Linux: only the timer, not the queued work */
 }
 
 /* ---------- hw lifecycle ---------- */
@@ -109,7 +109,8 @@ struct ieee80211_hw *ieee80211_alloc_hw(size_t priv_data_len, const struct ieee8
 	l->hw.wiphy = &l->wiphy;
 	l->hw.priv = l->priv;
 	l->hw.queues = 1;
-	l->hw.conf.flags = IEEE80211_CONF_IDLE;
+	/* never IEEE80211_CONF_IDLE: rtw89 powers the MAC off in idle (IPS) and over USB the re-power often fails
+	   (mac preinit -60, chip wedged) and reloads firmware on every connect */
 	mutex_init(&l->wiphy.mtx);
 	spin_lock_init(&l->txq_lock);
 	for (int ac = 0; ac < IEEE80211_NUM_ACS; ac++) {

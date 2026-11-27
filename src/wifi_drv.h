@@ -47,6 +47,9 @@ struct wifi_drv_events {
 	void (*gone)(void);
 };
 
+/* what the dongle's LED shows */
+enum wifi_led { WIFI_LED_IDLE, WIFI_LED_CONNECTING, WIFI_LED_CONNECTED }; /* slow blink, fast blink, on */
+
 struct wifi_connect_params {
 	uint8_t bssid[6];
 	uint16_t freq;           /* MHz, 0 = any */
@@ -78,6 +81,9 @@ struct wifi_drv {
 	int (*tx)(const uint8_t *eth, size_t len);
 	/* optional (NULL = nothing to do) */
 	void (*system_woke)(void);
+	void (*led)(enum wifi_led s); /* may run from an event: must not block */
+	/* off after open(); once on, it stays on across connects. 0 or -errno */
+	int (*power_save)(bool on);
 };
 
 extern const struct wifi_drv wifi_drv_aic8800, wifi_drv_rtw89;

@@ -1070,6 +1070,9 @@ void ieee80211_unregister_hw(struct ieee80211_hw *hw);
 void ieee80211_free_hw(struct ieee80211_hw *hw);
 /* lkpi: bring the single station interface up (start + add_interface) / down */
 int lkpi80211_up(struct ieee80211_hw *hw);
+/* src/lkpi/rtw89_led.c */
+void rtwd_led_init(struct ieee80211_hw *hw);
+void rtwd_led_set(struct ieee80211_hw *hw, bool on);
 void lkpi80211_down(struct ieee80211_hw *hw);
 struct ieee80211_hw *wiphy_to_ieee80211_hw(struct wiphy *wiphy);
 void ieee80211_restart_hw(struct ieee80211_hw *hw);
