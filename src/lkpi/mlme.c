@@ -50,6 +50,7 @@ static struct {
 	bool assoc, authorized, rsn, wme, scanning, txblock, ps;
 	u64 scan_since;
 	int scan_fails;
+	bool scan_lost; /* the last scan-done never came and rtwd_gone() aborted that scan */
 	struct ieee80211_scan_request *sreq;
 	u8 scan_ies[NUM_NL80211_BANDS][20];
 	struct bss bss[NBSS];
@@ -69,7 +70,7 @@ static struct {
 	u16 last_seq[NTID + 1];
 	/* tx */
 	u16 seq[NTID + 1];
-	u16 ba_want, ba_stop, ba_tx, ba_tried, ba_pending;
+	u16 ba_want, ba_stop, ba_tx, ba_tried, ba_pending, ba_amsdu;
 	/* deferred work */
 	unsigned int token, loss_token;
 	u16 loss_reason;
@@ -666,6 +667,7 @@ static void mgmt_work_fn(struct wiphy *w, struct wiphy_work *wk)
 				if (!buf || buf > 64)
 					buf = 64;
 				ampdu(IEEE80211_AMPDU_TX_OPERATIONAL, tid, 0, buf, capab & 1);
+				M.ba_amsdu = (M.ba_amsdu & ~BIT(tid)) | (capab & 1) << tid;
 				M.ba_tx |= BIT(tid);
 			} else {
 				ampdu(IEEE80211_AMPDU_TX_STOP_CONT, tid, 0, 0, false);
@@ -797,7 +799,7 @@ static void teardown(u16 reason, bool send)
 		if (M.ba_rx & BIT(tid))
 			ampdu(IEEE80211_AMPDU_RX_STOP, tid, 0, 0, false);
 	}
-	M.ba_tx = M.ba_pending = M.ba_tried = M.ba_rx = 0;
+	M.ba_tx = M.ba_pending = M.ba_tried = M.ba_rx = M.ba_amsdu = 0;
 	__atomic_store_n(&M.ba_want, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&M.ba_stop, 0, __ATOMIC_RELAXED);
 	if (was_assoc) {
@@ -964,10 +966,26 @@ static void wedged(const char *why)
 /* polled every 0.5 s by drv_rtw89 */
 bool rtwd_gone(void)
 {
-	/* a full scan takes ~5 s: a scan-done this late is lost, the firmware is wedged */
+	/* A full scan takes ~5 s, so a scan-done this late is lost: unplugging another dongle on the same hub
+	   mid-scan does that. Abort the scan and keep the link; a second lost one in a row means a wedged firmware.
+	   trylock: a stuck op must not stall this unplug poll. */
 	if (M.intf && __atomic_load_n(&M.scanning, __ATOMIC_ACQUIRE) &&
-	    lkpi_now_ns() - __atomic_load_n(&M.scan_since, __ATOMIC_RELAXED) > 20 * NSEC_PER_SEC)
-		wedged("scan stuck for 20 s");
+	    lkpi_now_ns() - __atomic_load_n(&M.scan_since, __ATOMIC_RELAXED) > 10 * NSEC_PER_SEC) {
+		if (M.scan_lost) {
+			wedged("scan stuck twice");
+		} else if (mutex_trylock(&op_lock)) {
+			if (M.l) {
+				wiphy_lock(WIPHY());
+				if (M.scanning) {
+					pr_err("mlme: scan stuck for 10 s, aborting it\n");
+					M.scan_lost = true;
+					OPS()->cancel_hw_scan(HW(), VIF());
+				}
+				wiphy_unlock(WIPHY());
+			}
+			mutex_unlock(&op_lock);
+		}
+	}
 	return M.intf && !lkpi_usb_present(M.intf);
 }
 
@@ -980,6 +998,8 @@ const char *rtwd_chip(void)
 void ieee80211_scan_completed(struct ieee80211_hw *hw, struct cfg80211_scan_info *info)
 {
 	M.scanning = false;
+	if (!info || !info->aborted)
+		M.scan_lost = false;
 	if (M.cb && M.cb->scan_done)
 		M.cb->scan_done(info && info->aborted);
 }
@@ -1043,6 +1063,9 @@ int rtwd_scan(const uint8_t *ssid, uint8_t ssid_len, const uint16_t *freqs, int 
 	__atomic_store_n(&M.scanning, true, __ATOMIC_RELEASE); /* after scan_since: rtwd_gone() reads both */
 	r = OPS()->hw_scan(HW(), VIF(), sr);
 	if (r) {
+		/* errno tells H2C ack timeout (-EAGAIN) from fw reject (-EFAULT) or no offload slot (-ENOSPC) */
+		pr_err("mlme: hw_scan failed %d after %lld ms (assoc %d)\n", r,
+		       (long long)((lkpi_now_ns() - M.scan_since) / 1000000), !!VIF()->cfg.assoc);
 		M.scanning = false;
 		if (r == 1)
 			r = -EOPNOTSUPP;
@@ -1348,6 +1371,9 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 			.mcs = sb->ht_cap.mcs,
 		};
 
+		/* SM PS 0 is "static": the AP then sends 1SS only. mac80211 sets "disabled" (3) here, as we do */
+		h.cap_info |= cpu_to_le16(IEEE80211_HT_CAP_SM_PS);
+
 		if (cd.width == NL80211_CHAN_WIDTH_20 || cd.width == NL80211_CHAN_WIDTH_20_NOHT)
 			h.cap_info &= cpu_to_le16(~(IEEE80211_HT_CAP_SUP_WIDTH_20_40 | IEEE80211_HT_CAP_SGI_40));
 		*p++ = WLAN_EID_HT_CAPABILITY;
@@ -1539,7 +1565,58 @@ static u8 classify(const u8 *eth, size_t len, u16 proto)
 	return 0;
 }
 
-/* shortcut: one MSDU per MPDU (no TX A-MSDU), upgrade if USB3 hosts become CPU bound */
+/* Backlog: append the packet to the queued tail as an A-MSDU subframe. rtw89 sends one MPDU per URB and the
+ * dongle tops out near 6500 URBs/s, so packing several packets per MPDU is what lifts throughput. The tail
+ * keeps its seq and PN, so nothing goes missing in the AP's reorder window. */
+#define AMSDU_MAX 5000 /* rtw8852b max_amsdu_limit */
+static bool amsdu_append(struct lkpi_txq *t, const u8 *eth, size_t len)
+{
+	const struct ieee80211_sta_aggregates *a = &STA()->deflink.agg;
+	/* rtw89's rate-based cap; a flat 5000 measured worse on air (fewer MPDUs per A-MPDU, lower MCS) */
+	unsigned int cap = min(a->max_amsdu_len, a->max_rc_amsdu_len), hl = sizeof(struct ieee80211_qos_hdr) + (M.ptk ? 8 : 0);
+	unsigned int conv, pad, sub = ETH_HLEN + 6 + len - 12;
+	struct ieee80211_qos_hdr *h;
+	struct sk_buff *tail;
+	bool ok = false;
+	u8 *p;
+
+	spin_lock(&t->q.lock);
+	tail = skb_peek_tail(&t->q);
+	if (!tail || tail->protocol == cpu_to_be16(ETH_P_PAE))
+		goto out;
+	h = (void *)tail->data;
+	conv = (h->qos_ctrl & cpu_to_le16(IEEE80211_QOS_CTL_A_MSDU_PRESENT)) ? 0 : ETH_HLEN;
+	pad = -(tail->len - hl + conv) & 3;
+	if (tail->len + conv + pad + sub > cap || skb_tailroom(tail) < (int)(pad + sub) ||
+	    skb_headroom(tail) < HW()->extra_tx_headroom + conv)
+		goto out;
+	if (conv) { /* first packet becomes subframe 1: DA moves from addr3 into it, addr3 becomes the BSSID */
+		unsigned int mlen = tail->len - hl;
+
+		skb_push(tail, ETH_HLEN);
+		h = memmove(tail->data, tail->data + ETH_HLEN, hl);
+		p = tail->data + hl;
+		memcpy(p, h->addr3, ETH_ALEN);
+		memcpy(p + 6, VIF()->addr, ETH_ALEN);
+		p[12] = mlen >> 8;
+		p[13] = mlen;
+		memcpy(h->addr3, M.bssid, ETH_ALEN);
+		h->qos_ctrl |= cpu_to_le16(IEEE80211_QOS_CTL_A_MSDU_PRESENT);
+	}
+	p = skb_put_zero(tail, pad + sub) + pad;
+	memcpy(p, eth, ETH_ALEN);
+	memcpy(p + 6, VIF()->addr, ETH_ALEN);
+	p[12] = (sub - ETH_HLEN) >> 8;
+	p[13] = sub - ETH_HLEN;
+	memcpy(p + ETH_HLEN, rfc1042, 6);
+	memcpy(p + ETH_HLEN + 6, eth + 12, len - 12);
+	t->bytes += conv + pad + sub;
+	ok = true;
+out:
+	spin_unlock(&t->q.lock);
+	return ok;
+}
+
 int rtwd_tx_eth(const uint8_t *eth, size_t len)
 {
 	u16 proto;
@@ -1571,12 +1648,17 @@ int rtwd_tx_eth(const uint8_t *eth, size_t len)
 		r = -ENOBUFS;
 		goto out;
 	}
+	if (M.wme && proto != ETH_P_PAE && (M.ba_tx & M.ba_amsdu & BIT(tid)) && amsdu_append(t, eth, len)) {
+		r = 0;
+		goto out; /* the tail is already scheduled */
+	}
 	hl = M.wme ? sizeof(struct ieee80211_qos_hdr) : 24;
-	skb = dev_alloc_skb(HW()->extra_tx_headroom + hl + 8 + 8 + len - ETH_HLEN);
+	/* room for amsdu_append: ETH_HLEN of headroom, tailroom up to AMSDU_MAX */
+	skb = dev_alloc_skb(HW()->extra_tx_headroom + ETH_HLEN + max_t(size_t, hl + 8 + 8 + len - ETH_HLEN, AMSDU_MAX));
 	r = -ENOMEM;
 	if (!skb)
 		goto out;
-	skb_reserve(skb, HW()->extra_tx_headroom);
+	skb_reserve(skb, HW()->extra_tx_headroom + ETH_HLEN);
 	h = skb_put_zero(skb, hl);
 	h->frame_control = cpu_to_le16(IEEE80211_FTYPE_DATA | IEEE80211_FCTL_TODS |
 				       (M.wme ? IEEE80211_STYPE_QOS_DATA : IEEE80211_STYPE_DATA) |

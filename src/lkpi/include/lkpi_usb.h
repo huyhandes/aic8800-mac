@@ -44,6 +44,9 @@ struct usb_device {
 	u16 ep_maxpacket[32]; /* index: endpoint number | (dir ? 16 : 0) */
 	bool gone; /* a transfer saw LIBUSB_ERROR_NO_DEVICE, or a pipe stopped taking submits */
 	u16 submit_errs[32]; /* consecutive failed submits, same index as ep_maxpacket */
+	u16 out_busy[16]; /* bulk-out URBs in flight, by endpoint number */
+	u64 out_done_ns[16]; /* their last completion, or the submit that made the endpoint busy */
+	u16 zlp_hold; /* bulk-out endpoints whose in-flight URB still has its ZLP to send */
 };
 struct usb_interface {
 	struct device dev;

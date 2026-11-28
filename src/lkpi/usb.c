@@ -43,8 +43,12 @@ static int status_of(enum libusb_transfer_status s)
 	}
 }
 
+static pthread_t ev_th;
+static pthread_cond_t zlp_cv = PTHREAD_COND_INITIALIZER;
+
 static void *event_main(void *arg)
 {
+	ev_th = pthread_self();
 	pthread_setname_np("lkpi-usb");
 	for (;;)
 		libusb_handle_events(ctx);
@@ -137,18 +141,29 @@ static void xfer_cb(struct libusb_transfer *x)
 		urb->actual_length = x->actual_length; /* not the ZLP stage */
 	if (urb->zlp_pending) {
 		/* the data ended on a packet boundary: send the zero-length packet the device waits for */
+		bool queued = false;
+
 		urb->zlp_pending = false;
 		if (!status && !urb->reject) {
 			x->length = 0;
-			if (!libusb_submit_transfer(x)) {
-				pthread_mutex_unlock(&ulock);
-				return;
-			}
-			status = -EPROTO;
+			queued = !libusb_submit_transfer(x);
+			if (!queued)
+				status = -EPROTO;
+		}
+		urb->dev->zlp_hold &= ~BIT(usb_pipeendpoint(urb->pipe)); /* the ZLP is queued, or never will be */
+		pthread_cond_broadcast(&zlp_cv);
+		if (queued) {
+			pthread_mutex_unlock(&ulock);
+			return;
 		}
 	}
 	urb->in_flight = false;
 	urb->status = status;
+	if (!usb_pipein(urb->pipe)) {
+		unsigned int ep = usb_pipeendpoint(urb->pipe);
+		urb->dev->out_busy[ep]--;
+		urb->dev->out_done_ns[ep] = lkpi_now_ns();
+	}
 	a = urb->anchor;
 	if (a) {
 		a->busy++;
@@ -186,6 +201,12 @@ int usb_submit_urb(struct urb *urb, gfp_t gfp)
 	maxp = d->ep_maxpacket[ep | (in ? 16 : 0)];
 
 	pthread_mutex_lock(&ulock);
+	/* macOS libusb has no LIBUSB_TRANSFER_ADD_ZERO_PACKET, so a ZLP goes out as its own transfer after the data.
+	   A URB queued in between made the RTL8852BU merge two frames and stop its TX pipe for good.
+	   Never on the event thread, which clears the hold (only RX resubmits run there) */
+	while (!in && (d->zlp_hold & BIT(ep)) && !pthread_equal(pthread_self(), ev_th) &&
+	       !__atomic_load_n(&d->gone, __ATOMIC_RELAXED))
+		pthread_cond_wait(&zlp_cv, &ulock);
 	if (urb->reject) {
 		pthread_mutex_unlock(&ulock);
 		return -EPERM;
@@ -208,6 +229,11 @@ int usb_submit_urb(struct urb *urb, gfp_t gfp)
 		urb->in_flight = false;
 		urb->use_count--;
 		urb->refcount--; /* the caller still holds one */
+	} else if (!in) {
+		if (!d->out_busy[ep]++)
+			d->out_done_ns[ep] = lkpi_now_ns();
+		if (urb->zlp_pending)
+			d->zlp_hold |= BIT(ep);
 	}
 	/* a wedged RTL8852BU kept failing H2C submits with LIBUSB_ERROR_IO for 1.5 h while still
 	   enumerated: treat a dead pipe as an unplug so a fresh worker rebinds the dongle */
@@ -432,6 +458,19 @@ static void detach_cd(void)
 			 r > 0 ? "done" : "failed");
 }
 
+/* The TX20U Nano has no USB 3 lanes, yet rtw89_usb_switch_mode tries them on every power-up: the chip drops
+   off the bus for 5.4 s and comes back on USB 2 for a second probe. MATCH_CNT (R_AX_PAD_CTRL2 0xc4, bits
+   15:8) = USB_SWITCH_DELAY (0xf) is rtw89's own "already tried, USB 2 port" mark, so it skips the switch. */
+static void skip_usb3_switch(libusb_device_handle *h)
+{
+	u8 v[4];
+
+	if (libusb_control_transfer(h, 0xc0, 0x05, 0x00c4, 0, v, 4, 500) == 4 && v[1] != 0x0f) {
+		v[1] = 0x0f;
+		libusb_control_transfer(h, 0x40, 0x05, 0x00c4, 0, v, 4, 500);
+	}
+}
+
 static int bind_dev(libusb_device *dev, const struct usb_device_id *id, struct usb_interface **out)
 {
 	struct libusb_device_descriptor dd;
@@ -486,6 +525,9 @@ static int bind_dev(libusb_device *dev, const struct usb_device_id *id, struct u
 	lkpi_log(6, "usb: %04x:%04x bus %d port %d, %s speed\n", dd.idVendor, dd.idProduct,
 		 libusb_get_bus_number(dev), libusb_get_port_number(dev),
 		 b->udev.speed >= USB_SPEED_SUPER ? "super" : b->udev.speed == USB_SPEED_HIGH ? "high" : "full");
+	/* shortcut: USB 2 only hardware by VID:PID, add a PID here when another one is known */
+	if (dd.idVendor == 0x35bc && dd.idProduct == 0x0108)
+		skip_usb3_switch(h);
 	r = lkpi_usb_driver->probe(&b->intf, id);
 	if (r || !usb_get_intfdata(&b->intf)) {
 		libusb_release_interface(h, 0);
@@ -561,8 +603,20 @@ struct usb_interface *lkpi_usb_probe(int timeout_ms)
 
 bool lkpi_usb_present(struct usb_interface *i)
 {
-	if (!lkpi_usb_gone(i) && !present(libusb_get_device(i->udev->handle)))
-		__atomic_store_n(&i->udev->gone, true, __ATOMIC_RELAXED);
+	struct usb_device *d = i->udev;
+
+	if (!lkpi_usb_gone(i) && !present(libusb_get_device(d->handle)))
+		__atomic_store_n(&d->gone, true, __ATOMIC_RELAXED);
+	/* under a speedtest the RTL8852BU stopped taking bulk-out data with the link still up: 186 TX URBs
+	   sat queued for minutes and blackholed the Mac (no error, no completion). Rebind, as for an unplug */
+	pthread_mutex_lock(&ulock);
+	for (unsigned int ep = 0; ep < 16 && !d->gone; ep++)
+		if (d->out_busy[ep] && lkpi_now_ns() - d->out_done_ns[ep] > 5 * NSEC_PER_SEC) {
+			pr_err("usb: ep %u: %u TX URBs stuck for 5 s, rebinding the dongle\n", ep, d->out_busy[ep]);
+			__atomic_store_n(&d->gone, true, __ATOMIC_RELAXED);
+			pthread_cond_broadcast(&zlp_cv); /* a submit waiting on a ZLP that never goes out */
+		}
+	pthread_mutex_unlock(&ulock);
 	return !lkpi_usb_gone(i);
 }
 
