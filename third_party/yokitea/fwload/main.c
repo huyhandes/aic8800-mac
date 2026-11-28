@@ -183,6 +183,7 @@ static int pt_table_parse(const uint8_t *raw,
 
         if (sec->type == AICBT_PT_INF && sec->len > 0U) {
             const uint32_t base_len = 4U;
+            const uint32_t n_pairs = sec->len; /* data holds 2 * n_pairs words */
             uint32_t memcpy_len = sec->len;
             if (sec->len > base_len) {
                 memcpy_len = base_len + 1U;
@@ -195,7 +196,8 @@ static int pt_table_parse(const uint8_t *raw,
                 out->addr_patch = sec->data[3];
             }
             if (memcpy_len >= 5U) {
-                out->ext_patch_nb = sec->data[9];
+                /* the count comes from the file: past the pairs actually there it would read off the buffer */
+                out->ext_patch_nb = sec->data[9] <= n_pairs - memcpy_len ? sec->data[9] : 0U;
                 out->ext_patch_pairs = sec->data + (memcpy_len * 2U);
             }
         }
@@ -645,7 +647,7 @@ static int eject_stage0_via_diskarbitration_ex(uint16_t vid,
         run_da_wait(&eject_ctx.done, da_mode, 5000);
         if (!eject_ctx.done || eject_ctx.status != 0) {
             fprintf(stderr,
-                    "[fwload] error: DADiskEject(/dev/%s) failed (done=%d status=0x%08x)\n",
+                    "[fwload] note: DADiskEject(/dev/%s) not done yet (done=%d status=0x%08x), retrying\n",
                     bsd_name, eject_ctx.done ? 1 : 0, (unsigned)eject_ctx.status);
             rc = -1;
         }
@@ -735,7 +737,9 @@ static int eject_stage0_if_present(uint32_t settle_timeout_ms,
             ejected = true;
             break;
         }
-        if (found_disk || is_last || !usb_vid_pid_present(AIC_USB_VID_AICS_BOOT, stage0_pid)) {
+        /* a just-mounted Stage 0 disk refuses the first eject with EBUSY (0xc010): retry it for a while */
+        bool busy_expired = found_disk && mono_ms() - t_start > 6000U;
+        if (busy_expired || is_last || !usb_vid_pid_present(AIC_USB_VID_AICS_BOOT, stage0_pid)) {
             fprintf(stderr,
                     "[fwload] error: Stage 0 MSC device (0x%04x:0x%04x) could neither be opened directly "
                     "nor ejected via DiskArbitration (ensure AIC8800MSCBlocker.kext or IOMedia is active)\n",
@@ -811,7 +815,10 @@ static aic_cycle_outcome_t run_fwload_cycle(const char *fw_dir,
     memset(&metrics, 0, sizeof(metrics));
     uint64_t t_cycle_start = mono_ms();
 
-    if (usb_vid_pid_present(AIC_USB_VID_AICS_WIFI, AIC_USB_PID_WIFI_BT_RUNTIME)) {
+    /* a Stage 2 device may be another, already loaded dongle: only a dongle still in Stage 0/1 needs us */
+    const bool needs_fw = any_stage0_present(NULL) ||
+                          usb_vid_pid_present(AIC_USB_VID_AICS_BOOT, AIC_USB_PID_BOOTLOADER);
+    if (!needs_fw && usb_vid_pid_present(AIC_USB_VID_AICS_WIFI, AIC_USB_PID_WIFI_BT_RUNTIME)) {
         if (!quiet_no_device) {
             printf("[fwload] Stage 2 device (0x%04x:0x%04x) already enumerated\n",
                    AIC_USB_VID_AICS_WIFI, AIC_USB_PID_WIFI_BT_RUNTIME);
@@ -822,8 +829,7 @@ static aic_cycle_outcome_t run_fwload_cycle(const char *fw_dir,
         return AIC_CYCLE_ALREADY_READY;
     }
 
-    if (!any_stage0_present(NULL) &&
-        !usb_vid_pid_present(AIC_USB_VID_AICS_BOOT, AIC_USB_PID_BOOTLOADER)) {
+    if (!needs_fw) {
         if (!quiet_no_device) {
             fprintf(stderr, "error: Stage 1 device (0x%04x:0x%04x) not found\n",
                     AIC_USB_VID_AICS_BOOT, AIC_USB_PID_BOOTLOADER);
@@ -1061,7 +1067,9 @@ static aic_cycle_outcome_t run_fwload_cycle(const char *fw_dir,
 
     uint64_t t_enum_start = mono_ms();
     for (int wait_ms = 0; !g_stop_requested && wait_ms < 8000; wait_ms += 50) {
-        if (usb_vid_pid_present(AIC_USB_VID_AICS_WIFI, AIC_USB_PID_WIFI_BT_RUNTIME)) {
+        /* the bootloader leaving, not any Stage 2 device existing: another dongle may already be one */
+        if (!usb_vid_pid_present(AIC_USB_VID_AICS_BOOT, AIC_USB_PID_BOOTLOADER) &&
+            usb_vid_pid_present(AIC_USB_VID_AICS_WIFI, AIC_USB_PID_WIFI_BT_RUNTIME)) {
             metrics.stage2_enum_ms = mono_ms() - t_enum_start;
             metrics.total_ms = mono_ms() - t_cycle_start;
             printf("[fwload] Stage 1 firmware started at 0x%08x (5G=%s); Stage 2 (0x%04x:0x%04x) active "

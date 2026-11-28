@@ -21,7 +21,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define AIC_FW_INSTALLED_DIR        "/Library/Application Support/AIC8800/fw/aic8800D80"
+#define AIC_FW_INSTALLED_DIR        "/Library/Application Support/USB Wifi/fw/aic8800D80"
 #define AIC_FW_REQUIRED_MARKER      "fw_patch_table_8800d80_u02.bin"
 #define AIC_FWLOAD_DAEMON_LOCK_PATH "/var/run/aic8800_fwload.lock"
 #define AIC_FWLOAD_MAX_WAKE_DELAY_MS 10000U
