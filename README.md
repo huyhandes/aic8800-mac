@@ -62,7 +62,7 @@ troubleshooting.
 
 Measured on 2026-11-28 with v1.1.1 on an Apple Silicon MacBook, both dongles on the same 802.11ax AP
 (5 GHz at 5240 MHz with 80 MHz, 2.4 GHz at 2412 MHz). Numbers are `networkQuality -s` to the internet in
-Mbit/s: two runs each for the AIC8800D80, and for the RTL8852BU 16 runs over 8 reconnects on 5 GHz and 9 runs
+Mbit/s: two runs each for the AIC8800D80, and for the RTL8852BU 16 runs over 8 reconnects on 5 GHz and 10 runs
 over 7 reconnects on 2.4 GHz.
 
 | Dongle | Band | Upload | Download |
