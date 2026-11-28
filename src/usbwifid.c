@@ -143,7 +143,7 @@ static int run_scan_and_wait(io_connect_t conn,
         return -1;
     }
 
-    for (int i = 0; i < 3000; ++i) {
+    for (int i = 0; i < 3000 && g_keep_running; ++i) {
         usleep(2000);
         kr = wifi_get_scan_results(conn, out_list);
         if (kr != KERN_SUCCESS) {
@@ -491,7 +491,7 @@ static int perform_connect(io_connect_t conn,
         target = &last_bss;
     }
     have_last = false;
-    for (int pass = fast ? 0 : 1; pass < 2 && !target; ++pass) {
+    for (int pass = fast ? 0 : 1; pass < 2 && !target && g_keep_running; ++pass) {
         printf("[1/4] Scanning for \"%s\"%s...\n", ssid_arg, pass == 0 ? " (known channels)" : "");
         if (run_scan_and_wait(conn, (const uint8_t *)ssid_arg, (uint8_t)ssid_len,
                               pass == 0 ? known_freqs : NULL, pass == 0 ? n_known : 0,
@@ -499,7 +499,8 @@ static int perform_connect(io_connect_t conn,
             return 1;
         }
         int best = -1000;
-        n_known = 0;
+        /* one missed probe on the known channels must not drop that band from the list for good */
+        if (pass) n_known = 0;
         for (uint16_t i = 0U; i < list.count; ++i) {
             const wifi_scan_bss_t *b = &list.bss[i];
             if (b->ssid_len != ssid_len || memcmp(b->ssid, ssid_arg, ssid_len) != 0) continue;
@@ -522,6 +523,8 @@ static int perform_connect(io_connect_t conn,
             (void)write_pref(g_chans_path, v);
         }
     }
+    /* stopping: the next daemon's worker waits for this one to let go of the dongle */
+    if (!g_keep_running) return 1;
     if (!target) {
         set_err(err_buf, err_cap, "Network \"%s\" not found", ssid_arg);
         fprintf(stderr, "error: AP \"%s\" not found in %u scan results\n", ssid_arg, list.count);
@@ -1813,7 +1816,7 @@ static int run_worker(void) {
             if (rc == 0) {
                 connect_fails = 0;
                 (void)run_rekey_loop(conn, svc, &wpa_ctx, is_open, true);
-            } else if (sleep_with_wake_ms(connect_fails++ ? 3000 : 500)) {
+            } else if (g_keep_running && sleep_with_wake_ms(connect_fails++ ? 3000 : 500)) {
                 drain_wake_pipe();
                 (void)handle_daemon_pending_command(conn, svc, &wpa_ctx, &is_open, &connected_now);
                 if (connected_now) {
