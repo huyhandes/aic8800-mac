@@ -139,8 +139,9 @@ A new driver can reuse the chip-independent parts as they are: the scan list and
 
 ## Known issues
 
-- The RTL8852BU reaches about 100 Mbit/s upload on 5 GHz, less than the single-stream AIC8800D80. Earlier test
-  builds reached about 270 Mbit/s on the same AP. The cause is not found yet.
+- The RTL8852BU reaches about 100 Mbit/s upload on 5 GHz, less than the single-stream AIC8800D80. rtw89 sends
+  one MPDU per USB transfer and the dongle takes about 6500 transfers a second, so upload depends on how many
+  packets fit in one A-MSDU. Builds before 1.1.0 measured about 67 Mbit/s on the same AP.
 - The AIC8800D80 does not join WPA3-only networks.
 - The package is not notarized, so macOS asks before installing it.
 - `usbwifid status|scan|connect` and `scripts/usbwifi-up.sh` talk to slot 0 only. Use the menu app for other
