@@ -424,45 +424,4 @@ static inline int aic_rx_chunk_to_eth_frames(const uint8_t *chunk,
     return emitted;
 }
 
-/*
- * Lock-free-friendly fixed O(1) slot pool (preallocated by caller, zero heap ops).
- */
-typedef struct {
-    uint16_t capacity;
-    uint16_t free_count;
-    uint16_t free_stack[256];
-} aic_fixed_slot_pool_t;
-
-static inline int aic_slot_pool_init(aic_fixed_slot_pool_t *pool, uint16_t capacity) {
-    if (!pool || capacity == 0U || capacity > 256U)
-        return -1;
-    pool->capacity = capacity;
-    pool->free_count = capacity;
-    for (uint16_t i = 0U; i < capacity; i++)
-        pool->free_stack[i] = (uint16_t)(capacity - 1U - i);
-    return 0;
-}
-
-static inline int aic_slot_pool_acquire(aic_fixed_slot_pool_t *pool, uint16_t *out_idx) {
-    if (!pool || !out_idx || pool->free_count == 0U)
-        return -1;
-    pool->free_count--;
-    *out_idx = pool->free_stack[pool->free_count];
-    return 0;
-}
-
-static inline int aic_slot_pool_release(aic_fixed_slot_pool_t *pool, uint16_t idx) {
-    if (!pool || idx >= pool->capacity || pool->free_count >= pool->capacity)
-        return -1;
-    pool->free_stack[pool->free_count] = idx;
-    pool->free_count++;
-    return 0;
-}
-
-static inline uint16_t aic_slot_pool_in_flight(const aic_fixed_slot_pool_t *pool) {
-    if (!pool || pool->free_count > pool->capacity)
-        return 0U;
-    return (uint16_t)(pool->capacity - pool->free_count);
-}
-
 #endif /* AIC8800_FRAMING_H */

@@ -49,7 +49,6 @@ static struct {
     uint8_t ep_in, ep_out_data, ep_out_msg;
     uint16_t mps_data, mps_msg;
     pthread_t rx_thr;
-    volatile bool stopping;
 
     /* command path */
     pthread_mutex_t cmd_serial, cmd_lock;
@@ -218,7 +217,6 @@ static void LIBUSB_CALL rx_done(struct libusb_transfer *t) {
     if (t->status == LIBUSB_TRANSFER_COMPLETED && t->actual_length >= 4)
         (void)aic_rx_demux_usb_aggr(t->buffer, (size_t)t->actual_length, on_data_chunk, on_cfg_pkt, NULL);
     else if (t->status != LIBUSB_TRANSFER_COMPLETED) usleep(10000); /* transient error: don't spin */
-    if (a.stopping) return;
     /* a stalled IN endpoint (seen with two dongles on one hub): clear it instead of dropping the dongle */
     if (t->status == LIBUSB_TRANSFER_STALL) (void)libusb_clear_halt(a.h, a.ep_in);
     int rc = libusb_submit_transfer(t);
@@ -237,7 +235,7 @@ static void *rx_thread(void *arg) {
         if (rc == LIBUSB_ERROR_NO_DEVICE) ev->gone();
         if (rc != 0) { fprintf(stderr, "aic8800: RX submit failed: %s\n", libusb_error_name(rc)); exit(1); }
     }
-    while (!a.stopping) {
+    for (;;) {
         struct timeval tv = { 0, reord_pending ? 10000 : 500000 };
         (void)libusb_handle_events_timeout_completed(a.ctx, &tv, NULL);
         reord_tick();
@@ -270,7 +268,7 @@ static int send_cmd(uint16_t msg_id, uint16_t dest, const void *param, uint16_t 
         struct timespec dl;
         clock_gettime(CLOCK_REALTIME, &dl);
         dl.tv_sec += AIC_CMD_TX_TIMEOUT_MS / 1000;
-        while (!a.matcher.completed && !a.stopping) {
+        while (!a.matcher.completed) {
             if (pthread_cond_timedwait(&a.cmd_cond, &a.cmd_lock, &dl) == ETIMEDOUT) break;
         }
         if (a.matcher.completed) {
@@ -478,7 +476,7 @@ static int aic_tx(const uint8_t *eth, size_t len) {
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);
     dl.tv_sec += 1;
-    while (tx_nfree == 0 && !a.stopping)
+    while (tx_nfree == 0)
         if (pthread_cond_timedwait(&tx_cond, &a.tx_lock, &dl) == ETIMEDOUT) break;
     struct libusb_transfer *t = tx_nfree > 0 ? tx_free[--tx_nfree] : NULL;
     pthread_mutex_unlock(&a.tx_lock);

@@ -58,7 +58,7 @@ build/libusb-1.0.0.dylib:
 # double-click installer: required core + selectable drivers; the hidden setup pkg runs last
 # (install.sh --setup), so it only wires up the drivers that were ticked. The optional clean pkg runs first
 # (choices-outline order) and carries its own install.sh, since none may be installed yet
-VERSION = 1.1.0
+VERSION = 1.1.2
 PKGROOT = build/pkgroot
 HELPER  = Library/PrivilegedHelperTools/usbwifi
 SUPDIR  = Library/Application Support/USB Wifi
@@ -100,9 +100,10 @@ clean:
 .PHONY: all clean
 
 # self-check (no root): WPA2 handshake and lkpi shim unit tests, then driver bring-up + scan against the plugged dongle
-check: build/usbwifid build/libusb-1.0.0.dylib build/wpa2_test build/reord_test build/drv_contract_test build/kernel_test build/mac80211_test
+check: build/usbwifid build/libusb-1.0.0.dylib build/wpa2_test build/reord_test build/aic_framing_test build/drv_contract_test build/kernel_test build/mac80211_test
 	./build/wpa2_test
 	./build/reord_test
+	./build/aic_framing_test
 	./build/drv_contract_test
 	./build/kernel_test
 	./build/mac80211_test
@@ -112,6 +113,9 @@ build/wpa2_test: tests/wpa2_test.c src/wpa2.h src/wifi_ctl.h src/ft.h src/wpa3.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INC) $< -o $@
 build/reord_test: tests/reord_test.c src/rx_reord.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(INC) $< -o $@
+build/aic_framing_test: tests/aic_framing_test.c third_party/yokitea/common/aic8800_framing.h third_party/yokitea/common/aic8800_lmac.h third_party/yokitea/common/aic8800_abi.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INC) $< -o $@
 build/drv_contract_test: tests/drv_contract_test.c src/usbwifi_core.c src/usbwifi_core.h src/wifi_drv.h src/wifi_ctl.h

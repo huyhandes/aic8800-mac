@@ -23,7 +23,6 @@
 #include "aic8800_framing.h"
 #include "aic8800_fwload_ctl.h"
 
-#define AIC_FW_DEFAULT_DIR "/Users/rush/.gemini/antigravity/brain/3af3af06-ee65-4085-960c-f78f553e3493/scratch/aic8800d80/fw/aic8800D80"
 
 #define AIC_BTMODE_BT_ONLY_COANT    0x05U
 #define AIC_BTPORT_MB               0x01U
@@ -562,6 +561,8 @@ static bool media_belongs_to_usb_vid_pid(io_service_t media, uint16_t vid, uint1
     return false;
 }
 
+#define AIC_DA_MODE "com.rush.aic8800.dawait"
+
 static void run_da_wait(const bool *done_flag, CFStringRef mode, int timeout_ms) {
     for (int elapsed = 0; !*done_flag && !g_stop_requested && elapsed < timeout_ms; elapsed += 50) {
         CFRunLoopRunInMode(mode, 0.05, true);
@@ -591,7 +592,7 @@ static int eject_stage0_via_diskarbitration_ex(uint16_t vid,
         IOObjectRelease(iter);
         return -1;
     }
-    CFStringRef da_mode = CFSTR("com.rush.aic8800.dawait");
+    CFStringRef da_mode = CFSTR(AIC_DA_MODE);
     DASessionScheduleWithRunLoop(session, CFRunLoopGetCurrent(), da_mode);
 
     bool found_disk = false;
@@ -677,9 +678,47 @@ static bool any_stage0_present(uint16_t *out_pid) {
     return false;
 }
 
+static DADissenterRef deny_stage0_mount(DADiskRef disk, void *ctx) {
+    (void)ctx;
+    io_service_t media = DADiskCopyIOMedia(disk);
+    if (media == IO_OBJECT_NULL) {
+        return NULL;
+    }
+    bool ours = false;
+    size_t pid_count = 0;
+    const uint16_t *pids = aic_stage0_pids(&pid_count);
+    for (size_t i = 0; i < pid_count && !ours; i++) {
+        ours = media_belongs_to_usb_vid_pid(media, AIC_USB_VID_AICS_BOOT, pids[i]);
+    }
+    IOObjectRelease(media);
+    return ours ? DADissenterCreate(kCFAllocatorDefault, kDAReturnNotPermitted, CFSTR("AIC8800 Stage 0 is being ejected"))
+                : NULL;
+}
+
+static int eject_stage0_inner(uint32_t settle_timeout_ms, bool *out_did_eject, uint64_t *out_eject_ms);
+
+/* a mounted Stage 0 disk must be unmounted first and then refuses DADiskEject with EBUSY (0xc010) for a
+   while: keep it from mounting at all while we eject it */
 static int eject_stage0_if_present(uint32_t settle_timeout_ms,
                                    bool *out_did_eject,
                                    uint64_t *out_eject_ms) {
+    DASessionRef deny = DASessionCreate(kCFAllocatorDefault);
+    if (deny) {
+        DARegisterDiskMountApprovalCallback(deny, NULL, deny_stage0_mount, NULL);
+        DASessionScheduleWithRunLoop(deny, CFRunLoopGetCurrent(), CFSTR(AIC_DA_MODE));
+    }
+    int rc = eject_stage0_inner(settle_timeout_ms, out_did_eject, out_eject_ms);
+    if (deny) {
+        DAUnregisterApprovalCallback(deny, (void *)deny_stage0_mount, NULL);
+        DASessionUnscheduleFromRunLoop(deny, CFRunLoopGetCurrent(), CFSTR(AIC_DA_MODE));
+        CFRelease(deny);
+    }
+    return rc;
+}
+
+static int eject_stage0_inner(uint32_t settle_timeout_ms,
+                              bool *out_did_eject,
+                              uint64_t *out_eject_ms) {
     if (out_did_eject) {
         *out_did_eject = false;
     }
@@ -746,7 +785,10 @@ static int eject_stage0_if_present(uint32_t settle_timeout_ms,
                     AIC_USB_VID_AICS_BOOT, stage0_pid);
             return -1;
         }
-        usleep(100000);
+        /* waits in the DA mode so deny_stage0_mount answers while the disk shows up */
+        if (CFRunLoopRunInMode(CFSTR(AIC_DA_MODE), 0.1, false) == kCFRunLoopRunFinished) {
+            usleep(100000);
+        }
     }
 
     if (!ejected || g_stop_requested) {
@@ -763,7 +805,10 @@ static int eject_stage0_if_present(uint32_t settle_timeout_ms,
             }
             return 0;
         }
-        usleep(50000);
+        /* keeps answering deny_stage0_mount while Stage 0 is still on the bus */
+        if (CFRunLoopRunInMode(CFSTR(AIC_DA_MODE), 0.05, false) == kCFRunLoopRunFinished) {
+            usleep(50000);
+        }
     }
     fprintf(stderr,
             "[fwload] error: Stage 0 (0x%04x:0x%04x) eject sent, but Stage 1 (0x%04x:0x%04x) "
@@ -1685,7 +1730,7 @@ int main(int argc, char **argv) {
     aic_fw_src_t fw_src = AIC_FW_SRC_DEV;
     if (aic_fwload_resolve_fw_dir(cfg.fw_dir_arg,
                                   AIC_FW_INSTALLED_DIR,
-                                  AIC_FW_DEFAULT_DIR,
+                                  NULL,
                                   fw_dir, sizeof(fw_dir), &fw_src) != 0) {
         fprintf(stderr, "[fwload] error: could not resolve firmware directory\n");
         return 1;

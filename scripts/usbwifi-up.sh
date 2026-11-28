@@ -9,7 +9,7 @@ SSID="${1:?usage: $0 <SSID>}"
 
 # AIC8800D80 still in its mass-storage boot mode (0x5723 = 22307): push its firmware first
 if ioreg -p IOUSB -l | grep -q '"idProduct" = 22307'; then
-  "$ROOT/build/usbwifid" fwload --once --fw-dir "$ROOT/fw/aic8800D80" --lock-file /tmp/aicfw.lock
+  "$ROOT/build/usbwifid" fwload --once --fw-dir "$ROOT/fw/aic8800D80" --lock-file /var/run/aicfw.lock
 fi
 
 # network service on feth80 = shows in System Settings > Network; configd does DHCP when link goes up
@@ -19,4 +19,4 @@ export LKPI_FW_DIR="${LKPI_FW_DIR:-$ROOT/fw}" # RTL8852BU firmware from the repo
 
 read -rsp "Passphrase for $SSID: " PASS; echo
 trap 'ifconfig feth80 destroy 2>/dev/null || true; ifconfig feth81 destroy 2>/dev/null || true' EXIT
-"$ROOT/build/usbwifid" connect "$SSID" ${PASS:+"$PASS"} --no-dhcp --stay
+USBWIFI_PASS="$PASS" "$ROOT/build/usbwifid" connect "$SSID" --stay # env, not argv: ps shows argv to every user

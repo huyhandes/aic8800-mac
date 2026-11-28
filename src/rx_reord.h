@@ -46,6 +46,7 @@ typedef struct {
     uint16_t         ind_sn;
     uint16_t         pending_count;
     uint16_t         stuck_sn; /* ind_sn at the last timeout tick: a hole is skipped only once it has waited a full tick */
+    uint16_t         drop_sn;  /* SN of the last first subframe dropped as a duplicate: its A-MSDU tail goes too */
     rx_reord_slot_t slots[RX_REORD_WINSIZE];
 } rx_reord_tid_t;
 
@@ -66,6 +67,7 @@ static inline void rx_reord_init(rx_reord_t *r) {
     for (uint8_t t = 0U; t < RX_REORD_TID_CNT; ++t) {
         r->tids[t].ind_sn = RX_REORD_SN_UNINIT;
         r->tids[t].stuck_sn = RX_REORD_SN_UNINIT;
+        r->tids[t].drop_sn = RX_REORD_SN_UNINIT;
     }
 }
 
@@ -131,6 +133,7 @@ static inline void rx_reord_flush_tid(rx_reord_t *r,
     q->pending_count = 0U;
     q->ind_sn        = RX_REORD_SN_UNINIT;
     q->stuck_sn      = RX_REORD_SN_UNINIT;
+    q->drop_sn       = RX_REORD_SN_UNINIT;
 }
 
 static inline void rx_reord_flush_all(rx_reord_t *r,
@@ -225,6 +228,16 @@ static inline void rx_reord_submit(rx_reord_t *r,
 
     /* Continuation subframes of an A-MSDU share the same MPDU SN */
     if (same_mpdu_subframe) {
+        if (sn == q->drop_sn) { /* tail of an A-MSDU retry whose first subframe was dropped */
+            r->dup_drops++;
+            if (drop) {
+                drop(pkt, ctx);
+            }
+            if (out_needs_timer) {
+                *out_needs_timer = (q->pending_count > 0U);
+            }
+            return;
+        }
         rx_reord_slot_t *s = &q->slots[sn & (RX_REORD_WINSIZE - 1U)];
         if (s->occupied && s->sn == sn && append) {
             append(s->tail, pkt);
@@ -242,6 +255,7 @@ static inline void rx_reord_submit(rx_reord_t *r,
         return;
     }
 
+    q->drop_sn = RX_REORD_SN_UNINIT;
     if (q->ind_sn == RX_REORD_SN_UNINIT) {
         q->ind_sn = sn;
     }
@@ -252,6 +266,7 @@ static inline void rx_reord_submit(rx_reord_t *r,
     if (rx_reord_sn_less(sn, q->ind_sn)) {
         if ((uint16_t)((q->ind_sn - sn) & RX_REORD_SN_MASK) <= 2U * RX_REORD_WINSIZE) {
             r->dup_drops++;
+            q->drop_sn = sn;
             if (drop) {
                 drop(pkt, ctx);
             }
@@ -312,6 +327,7 @@ static inline void rx_reord_submit(rx_reord_t *r,
         if (dst->sn == sn) {
             /* Duplicate 802.11 retry of an already-buffered SN */
             r->dup_drops++;
+            q->drop_sn = sn;
             if (drop) {
                 drop(pkt, ctx);
             }

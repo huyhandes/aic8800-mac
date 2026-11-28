@@ -21,6 +21,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "wifi_ctl.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -271,16 +273,21 @@ static inline int wpa2_compute_eapol_mic(uint16_t key_ver,
     return -1;
 }
 
+/* the RSNE bits an M3 must repeat from the beacon: a forged beacon cannot downgrade the AKM or drop MFPR */
+#define WPA2_RSN_CHECK_BITS (WIFI_SEC_WPA2_PSK | WIFI_SEC_WPA3_SAE | WIFI_SEC_SHA256 | WIFI_SEC_8021X | WIFI_SEC_MFP_REQ)
+
 /*
  * Unwrap encrypted Key Data from EAPOL M3 / Group M1 using KEK (RFC 3394 AES Key Unwrap)
- * and extract the GTK KDE (OUI 00-0F-AC type 01).
+ * and extract the GTK KDE (OUI 00-0F-AC type 01), and into *out_rsn (if not NULL) the
+ * WPA2_RSN_CHECK_BITS of the first RSNE.
  */
 static inline int wpa2_extract_gtk(const uint8_t kek[16],
                                    const uint8_t *enc_data,
                                    size_t enc_len,
                                    uint8_t *out_gtk_idx,
                                    uint8_t out_gtk[WPA2_KEY_LEN],
-                                   uint8_t *out_gtk_len) {
+                                   uint8_t *out_gtk_len,
+                                   uint32_t *out_rsn) {
     if (!kek || !enc_data || !out_gtk_idx || !out_gtk || !out_gtk_len ||
         enc_len < 24U || (enc_len % 8U) != 0U || enc_len > 512U) {
         return -1;
@@ -302,6 +309,7 @@ static inline int wpa2_extract_gtk(const uint8_t kek[16],
     }
 
     size_t pos = 0U;
+    bool found = false, rsn_seen = false;
     while (pos + 2U <= plain_len) {
         const uint8_t tag = plain[pos];
         const uint8_t len = plain[pos + 1U];
@@ -313,19 +321,25 @@ static inline int wpa2_extract_gtk(const uint8_t kek[16],
             break;
         }
         const uint8_t *val = &plain[pos];
-        if (tag == 0xDDU && len >= 6U &&
+        if (tag == 0x30U && out_rsn && !rsn_seen) {
+            wifi_scan_bss_t b = { 0 };
+            wifi_parse_rsn_ie_body(val, len, &b);
+            *out_rsn = b.sec_mask & WPA2_RSN_CHECK_BITS;
+            rsn_seen = true;
+        }
+        if (!found && tag == 0xDDU && len >= 6U &&
             val[0] == 0x00U && val[1] == 0x0FU && val[2] == 0xACU && val[3] == 0x01U) {
             const uint8_t klen = (uint8_t)(len - 6U);
             if (klen > 0U && klen <= WPA2_KEY_LEN) {
                 *out_gtk_idx = (uint8_t)(val[4] & 0x03U);
                 *out_gtk_len = klen;
                 memcpy(out_gtk, &val[6], klen);
-                return 0;
+                found = true;
             }
         }
         pos += (size_t)len;
     }
-    return -1;
+    return found ? 0 : -1;
 }
 
 typedef struct {
@@ -350,6 +364,7 @@ typedef struct {
     bool     has_ptk;
     bool     has_gtk;
     bool     ptk_done; /* M3 accepted: the next M1 starts a new handshake */
+    uint32_t expect_rsn; /* WPA2_RSN_CHECK_BITS of the scanned beacon; 0 = no check */
     /* NULL: the 802.11i PRF. Set by a driver-specific feature (RTL FT-PSK) that derives the PTK another way */
     void (*derive_ptk)(const uint8_t pmk[32], const uint8_t snonce[32], const uint8_t anonce[32],
                        const uint8_t aa[6], const uint8_t spa[6], uint8_t ptk[64]);
@@ -435,13 +450,15 @@ static inline int wpa2_build_eapol_reply(const wpa2_ctx_t *ctx,
  *        *out_gtk_rekey when a GTK we do not hold yet is
  *   0 -> frame dropped: malformed, bad MIC, replayed or stale. Anyone in range can send these, so
  *        they must not end the link; a wrong PSK shows as the AP's silence after M2
- *  -1 -> local crypto failure, or key data that does not unwrap under a valid MIC
+ *  -1 -> local crypto failure, group key data that does not unwrap under a valid MIC, or an M3 whose
+ *        signed RSNE differs from the scanned beacon (downgrade)
  */
 /* unwraps the GTK into ctx: 1 = a new one, 0 = the one we hold (installing it again would reset its RX
    replay counter, KRACK), -1 = does not unwrap */
-static inline int wpa2_take_gtk(wpa2_ctx_t *ctx, const uint8_t *kek, const uint8_t *kd, uint16_t kd_len) {
+static inline int wpa2_take_gtk(wpa2_ctx_t *ctx, const uint8_t *kek, const uint8_t *kd, uint16_t kd_len,
+                                uint32_t *out_rsn) {
     uint8_t gtk[sizeof(ctx->gtk)], gtk_len = 0U, gtk_idx = 0U;
-    if (wpa2_extract_gtk(kek, kd, kd_len, &gtk_idx, gtk, &gtk_len) != 0) {
+    if (wpa2_extract_gtk(kek, kd, kd_len, &gtk_idx, gtk, &gtk_len, out_rsn) != 0) {
         return -1;
     }
     const bool same = ctx->has_gtk && gtk_idx == ctx->gtk_idx && gtk_len == ctx->gtk_len &&
@@ -543,7 +560,7 @@ static inline int wpa2_handle_rx_eapol(wpa2_ctx_t *ctx,
         return 0;
     }
     if (wpa2_compute_eapol_mic(key_ver, key, pdu, EAPOL_HDR_LEN + body_len, calc_mic) != 0) {
-        return -1;
+        return 0; /* unknown key version: unauthenticated, so dropped like a bad MIC */
     }
     if (memcmp(calc_mic, &key_body[77], 16U) != 0 || (ctx->replay_set && replay <= ctx->last_replay)) {
         return 0;
@@ -556,7 +573,13 @@ static inline int wpa2_handle_rx_eapol(wpa2_ctx_t *ctx,
         if (memcmp(ctx->anonce, &key_body[13], 32U) != 0) {
             return 0;
         }
-        if (is_enc && kd_len > 0U && wpa2_take_gtk(ctx, &ctx->tptk[16], &key_body[95], kd_len) && out_gtk_rekey) {
+        uint32_t rsn = 0U;
+        const int fresh = (is_enc && kd_len > 0U) ? wpa2_take_gtk(ctx, &ctx->tptk[16], &key_body[95], kd_len, &rsn) : -1;
+        /* shortcut: an M3 without an RSNE passes, wpa_supplicant fails it; tighten if an AP is seen to omit it */
+        if (ctx->expect_rsn && rsn && rsn != ctx->expect_rsn) {
+            return -1; /* the AP's signed RSNE differs from the beacon we chose by: downgrade */
+        }
+        if (fresh == 1 && out_gtk_rekey) {
             *out_gtk_rekey = true;
         }
         const uint16_t m4_info = (uint16_t)(key_ver | WPA_KEY_INFO_PAIRWISE |
@@ -575,7 +598,7 @@ static inline int wpa2_handle_rx_eapol(wpa2_ctx_t *ctx,
 
     /* 3. Group Key Handshake M1: Pairwise=0, Ack=1, MIC=1, EncryptedKeyData=1 */
     if (is_enc && kd_len > 0U) {
-        const int fresh = wpa2_take_gtk(ctx, &ctx->ptk[16], &key_body[95], kd_len);
+        const int fresh = wpa2_take_gtk(ctx, &ctx->ptk[16], &key_body[95], kd_len, NULL);
         if (fresh < 0) {
             return -1;
         }
