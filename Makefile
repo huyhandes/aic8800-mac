@@ -58,7 +58,7 @@ build/libusb-1.0.0.dylib:
 # double-click installer: required core + selectable drivers; the hidden setup pkg runs last
 # (install.sh --setup), so it only wires up the drivers that were ticked. The optional clean pkg runs first
 # (choices-outline order) and carries its own install.sh, since none may be installed yet
-VERSION = 1.1.1
+VERSION = 1.1.2
 PKGROOT = build/pkgroot
 HELPER  = Library/PrivilegedHelperTools/usbwifi
 SUPDIR  = Library/Application Support/USB Wifi
