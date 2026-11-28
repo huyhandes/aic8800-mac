@@ -61,15 +61,16 @@ troubleshooting.
 ## Performance
 
 Measured on 2026-11-28 with v1.1.1 on an Apple Silicon MacBook, both dongles on the same 802.11ax AP
-(5 GHz at 5240 MHz with 80 MHz, 2.4 GHz at 2412 MHz). Numbers are `networkQuality -s` to the internet, two
-runs each, in Mbit/s.
+(5 GHz at 5240 MHz with 80 MHz, 2.4 GHz at 2412 MHz). Numbers are `networkQuality -s` to the internet in
+Mbit/s: two runs each for the AIC8800D80, and for the RTL8852BU 16 runs over 8 reconnects on 5 GHz and 9 runs
+over 7 reconnects on 2.4 GHz.
 
 | Dongle | Band | Upload | Download |
 | --- | --- | --- | --- |
 | AIC8800D80 | 5 GHz | 257 to 284 | 198 to 243 |
 | AIC8800D80 | 2.4 GHz | 85 to 90 | 63 to 74 |
-| RTL8852BU | 5 GHz | 104 to 113 | 152 to 154 |
-| RTL8852BU | 2.4 GHz | 34 to 35 | 97 to 99 |
+| RTL8852BU | 5 GHz | 236 to 275 | 261 to 286 |
+| RTL8852BU | 2.4 GHz | 52 to 89 | 141 to 164 |
 
 Connect times from the daemon log on the same day:
 
@@ -139,9 +140,9 @@ A new driver can reuse the chip-independent parts as they are: the scan list and
 
 ## Known issues
 
-- The RTL8852BU reaches about 100 Mbit/s upload on 5 GHz, less than the single-stream AIC8800D80. rtw89 sends
-  one MPDU per USB transfer and the dongle takes about 6500 transfers a second, so upload depends on how many
-  packets fit in one A-MSDU. Builds before 1.1.0 measured about 67 Mbit/s on the same AP.
+- On 2.4 GHz the RTL8852BU dropped off USB 4 times in about 15 daemon restarts during testing, with and without
+  the 1.1.1 BlockAck fix. It comes back in driver-CD mode and the daemon reconnects it, which takes 10 to 35 s.
+  No drop was seen on 5 GHz.
 - The AIC8800D80 does not join WPA3-only networks.
 - The package is not notarized, so macOS asks before installing it.
 - `usbwifid status|scan|connect` and `scripts/usbwifi-up.sh` talk to slot 0 only. Use the menu app for other

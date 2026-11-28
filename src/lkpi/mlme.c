@@ -703,9 +703,9 @@ static void ba_work_fn(struct wiphy *w, struct wiphy_work *wk)
 		if ((stop & BIT(tid)) && (M.ba_tx | M.ba_pending) & BIT(tid)) {
 			ampdu(IEEE80211_AMPDU_TX_STOP_FLUSH, tid, 0, 0, false);
 			delba_tx(tid, true);
+			M.ba_tried &= ~BIT(tid);
 			M.ba_tx &= ~BIT(tid);
 			M.ba_pending &= ~BIT(tid);
-			M.ba_tried &= ~BIT(tid);
 		}
 		if ((want & BIT(tid)) && !((M.ba_tried | M.ba_tx) & BIT(tid))) {
 			u16 ssn;
@@ -714,12 +714,14 @@ static void ba_work_fn(struct wiphy *w, struct wiphy_work *wk)
 			mutex_lock(&tx_lock);
 			ssn = M.seq[tid] & 0xfff;
 			mutex_unlock(&tx_lock);
-			M.ba_tried |= BIT(tid);
+			/* pending before tried: ieee80211_start_tx_ba_session() reads them without the wiphy lock */
+			__atomic_fetch_or(&M.ba_pending, BIT(tid), __ATOMIC_RELEASE);
+			__atomic_fetch_or(&M.ba_tried, BIT(tid), __ATOMIC_RELEASE);
 			r = ampdu(IEEE80211_AMPDU_TX_START, tid, ssn, 0, false);
-			if (r == 0 || r == IEEE80211_AMPDU_TX_START_IMMEDIATE) {
-				M.ba_pending |= BIT(tid);
+			if (r == 0 || r == IEEE80211_AMPDU_TX_START_IMMEDIATE)
 				addba_req_tx(tid, ssn);
-			}
+			else
+				M.ba_pending &= ~BIT(tid);
 		}
 	}
 }
@@ -915,16 +917,16 @@ static void mgmt_work_fn(struct wiphy *w, struct wiphy_work *wk)
 
 			if (tid >= 8 || !(M.ba_pending & BIT(tid)))
 				goto next;
-			M.ba_pending &= ~BIT(tid);
 			if (!m->u.action.addba_resp.status) {
 				if (!buf || buf > 64)
 					buf = 64;
 				ampdu(IEEE80211_AMPDU_TX_OPERATIONAL, tid, 0, buf, capab & 1);
 				M.ba_amsdu = (M.ba_amsdu & ~BIT(tid)) | (capab & 1) << tid;
-				M.ba_tx |= BIT(tid);
+				__atomic_fetch_or(&M.ba_tx, BIT(tid), __ATOMIC_RELEASE);
 			} else {
 				ampdu(IEEE80211_AMPDU_TX_STOP_CONT, tid, 0, 0, false);
 			}
+			__atomic_fetch_and(&M.ba_pending, ~BIT(tid), __ATOMIC_RELEASE); /* after ba_tx, see ba_work_fn */
 		} else if (act == WLAN_ACTION_DELBA && skb->len >= 28) {
 			u16 params = le16_to_cpu(m->u.action.delba.params);
 			u8 tid = params >> 12;
@@ -945,6 +947,7 @@ static void mgmt_work_fn(struct wiphy *w, struct wiphy_work *wk)
 				rx_flush_out(&o);
 			} else if ((M.ba_tx | M.ba_pending) & BIT(tid)) {
 				ampdu(IEEE80211_AMPDU_TX_STOP_FLUSH, tid, 0, 0, false);
+				M.ba_tried &= ~BIT(tid); /* the AP ended it: rtw89 may ask again */
 				M.ba_tx &= ~BIT(tid);
 				M.ba_pending &= ~BIT(tid);
 			}
@@ -959,9 +962,14 @@ int ieee80211_start_tx_ba_session(struct ieee80211_sta *sta, u16 tid, u16 timeou
 {
 	if (tid >= 8)
 		return -EINVAL;
-	if (__atomic_load_n(&M.ba_tried, __ATOMIC_RELAXED) & BIT(tid) &&
-	    !(__atomic_load_n(&M.ba_tx, __ATOMIC_RELAXED) & BIT(tid)))
-		return -EINVAL; /* the AP refused or never answered */
+	/* tried, then pending, then tx: the reverse of the write order in ba_work_fn and mgmt_work_fn */
+	if (__atomic_load_n(&M.ba_tried, __ATOMIC_ACQUIRE) & BIT(tid)) {
+		/* rtw89 blocks aggregation on the TID for good on -EINVAL, so a request while the ADDBA is out must not get it */
+		if (__atomic_load_n(&M.ba_pending, __ATOMIC_ACQUIRE) & BIT(tid))
+			return -EAGAIN;
+		if (!(__atomic_load_n(&M.ba_tx, __ATOMIC_RELAXED) & BIT(tid)))
+			return -EINVAL; /* the AP refused or never answered */
+	}
 	__atomic_fetch_or(&M.ba_want, BIT(tid), __ATOMIC_RELEASE);
 	wiphy_work_queue(WIPHY(), &M.ba_work);
 	return 0;
