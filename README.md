@@ -140,9 +140,15 @@ A new driver can reuse the chip-independent parts as they are: the scan list and
 
 ## Known issues
 
-- On 2.4 GHz the RTL8852BU dropped off USB 4 times in about 15 daemon restarts during testing, with and without
-  the 1.1.1 BlockAck fix. It comes back in driver-CD mode and the daemon reconnects it, which takes 10 to 35 s.
-  No drop was seen on 5 GHz.
+- On 2.4 GHz the RTL8852BU can drop off USB under upload load or right after the daemon starts. The kernel log
+  shows the whole bus-powered hub disconnecting ("hardware connection lost"), so the hub sags when the dongle
+  transmits at full power. The dongle comes back in driver-CD mode and the daemon reconnects it in 10 to 35 s.
+  Once the hub's USB 2 half stayed gone until its cable was replugged. Testing saw 9 drops in 32 restarts on a
+  hub that had already dropped, and none in 20 restarts after replugging it, nor on 5 GHz. A hub with its own
+  power supply, or a port on the Mac, should avoid it (not tested here).
+- At close range the ETSI 2.4 GHz TX power table gave more upload than the default US table: median 105 against
+  79 Mbit/s over 10 restarts each, with the same download. Set `country` (see INSTALL) when the US limits are
+  not the ones that apply to you.
 - The AIC8800D80 does not join WPA3-only networks.
 - The package is not notarized, so macOS asks before installing it.
 - `usbwifid status|scan|connect` and `scripts/usbwifi-up.sh` talk to slot 0 only. Use the menu app for other
