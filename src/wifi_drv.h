@@ -3,7 +3,7 @@
  *
  * A driver binds one dongle per process, runs the radio and moves frames; the core owns everything
  * above that (scan list, connection state, WPA2 EAPOL queue, the feth/BPF network side, adapter slot).
- * To add a chip: implement struct wifi_drv in src/drv_<chip>.c and list it in wifi_drivers[]
+ * To add a chip: implement struct wifi_drv in src/<chip>/drv_<chip>.c and list it in wifi_drivers[]
  * (usbwifi_core.c). Firmware loading or USB mode switching that must run before the dongle shows its
  * Wi-Fi interface belongs in the driver's open().
  *

@@ -19,8 +19,25 @@
 #include "aic8800_abi.h"
 #include "aic8800_framing.h"
 #include "aic8800_lmac.h"
-#include "aic8800_reord.h"
+#include "rx_reord.h"
 #include "aic8800_wifi_ctl.h"
+#include "wifi_ctl.h"
+
+/* the core's cipher, band and connect flag codes go to the LMAC unchanged */
+#define SAME_CODE(w, a) _Static_assert((int)(w) == (int)(a), #w " != " #a)
+SAME_CODE(WIFI_CIPHER_WEP40, AIC_CIPHER_WEP40);
+SAME_CODE(WIFI_CIPHER_TKIP, AIC_CIPHER_TKIP);
+SAME_CODE(WIFI_CIPHER_CCMP, AIC_CIPHER_CCMP);
+SAME_CODE(WIFI_CIPHER_WEP104, AIC_CIPHER_WEP104);
+SAME_CODE(WIFI_CIPHER_BIP_CMAC_128, AIC_CIPHER_BIP_CMAC_128);
+SAME_CODE(WIFI_CIPHER_GCMP_128, AIC_CIPHER_GCMP_128);
+SAME_CODE(WIFI_CIPHER_GCMP_256, AIC_CIPHER_GCMP_256);
+SAME_CODE(WIFI_CIPHER_CCMP_256, AIC_CIPHER_CCMP_256);
+SAME_CODE(WIFI_CIPHER_INVALID, AIC_CIPHER_INVALID);
+SAME_CODE(WIFI_BAND_2G4, AIC_PHY_BAND_2G4);
+SAME_CODE(WIFI_BAND_5G, AIC_PHY_BAND_5G);
+SAME_CODE(WIFI_CONN_CONTROL_PORT_HOST, AIC_CONTROL_PORT_HOST);
+SAME_CODE(WIFI_CONN_WPA_WPA2_IN_USE, AIC_WPA_WPA2_IN_USE);
 
 #define RX_BUF_BYTES 32768
 
@@ -79,7 +96,7 @@ static void on_async_ind(uint16_t id, const uint8_t *param, uint16_t len, void *
 #define REORD_POOL 512
 typedef struct rpkt { struct rpkt *next; uint16_t len; uint8_t data[AIC_DATA_BUF_MAX]; } rpkt_t;
 static rpkt_t rpool[REORD_POOL], *rfree;
-static aic_rx_reord_t reord;
+static rx_reord_t reord;
 static pthread_mutex_t rx_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool reord_pending;
 static struct timespec reord_armed;
@@ -98,17 +115,17 @@ static void rpkt_append(void *tail, void *pkt) { ((rpkt_t *)tail)->next = pkt; }
 /* frames buffered for the old link must not leak into the next one */
 static void reord_reset(void) {
     pthread_mutex_lock(&rx_lock);
-    aic_rx_reord_flush_all(&reord, true, NULL, rpkt_drop, NULL);
-    aic_rx_reord_init(&reord);
+    rx_reord_flush_all(&reord, true, NULL, rpkt_drop, NULL);
+    rx_reord_init(&reord);
     reord_pending = false;
     pthread_mutex_unlock(&rx_lock);
 }
 
-/* rx_thread tick: release frames stuck behind a lost subframe after AIC_REORD_TIMEOUT_MS */
+/* rx_thread tick: release frames stuck behind a lost subframe after RX_REORD_TIMEOUT_MS */
 static void reord_tick(void) {
     pthread_mutex_lock(&rx_lock);
-    if (reord_pending && since_ms(&reord_armed) >= AIC_REORD_TIMEOUT_MS) {
-        reord_pending = aic_rx_reord_timeout_flush(&reord, rpkt_deliver, NULL);
+    if (reord_pending && since_ms(&reord_armed) >= RX_REORD_TIMEOUT_MS) {
+        reord_pending = rx_reord_timeout_flush(&reord, rpkt_deliver, NULL);
         if (reord_pending) clock_gettime(CLOCK_MONOTONIC, &reord_armed);
     }
     pthread_mutex_unlock(&rx_lock);
@@ -124,7 +141,7 @@ static void on_eth(const uint8_t *eth, size_t len, const aic_rx_frame_meta_t *me
     if (!meta || !meta->is_qos || len > AIC_DATA_BUF_MAX) { ev->rx(eth, len, false); return; }
     if (!meta->need_reord) {
         /* firmware says this TID has no BA session: anything buffered for it is stale */
-        if (reord.tids[meta->tid & 7].pending_count) aic_rx_reord_flush_tid(&reord, meta->tid, false, rpkt_deliver, rpkt_drop, NULL);
+        if (reord.tids[meta->tid & 7].pending_count) rx_reord_flush_tid(&reord, meta->tid, false, rpkt_deliver, rpkt_drop, NULL);
         ev->rx(eth, len, false);
         return;
     }
@@ -135,8 +152,8 @@ static void on_eth(const uint8_t *eth, size_t len, const aic_rx_frame_meta_t *me
     p->len = (uint16_t)len;
     memcpy(p->data, eth, len);
     bool timer = false;
-    aic_rx_reord_submit(&reord, meta->tid, meta->seq_num, p, (uint32_t)len, meta->amsdu_sub_idx > 0,
-                        rpkt_deliver, rpkt_append, rpkt_drop, NULL, &timer);
+    rx_reord_submit(&reord, meta->tid, meta->seq_num, p, (uint32_t)len, meta->amsdu_sub_idx > 0,
+                    rpkt_deliver, rpkt_append, rpkt_drop, NULL, &timer);
     if (timer && !reord_pending) clock_gettime(CLOCK_MONOTONIC, &reord_armed);
     reord_pending = reord_pending || timer; /* timer is per-TID; reord_tick() clears it once all TIDs drain */
 }
@@ -638,8 +655,8 @@ static int aic_add_key(bool pairwise, uint8_t idx, uint32_t cipher, const uint8_
     r.key_idx = pairwise ? 0 : idx;
     r.pairwise = pairwise ? 1 : 0;
     r.inst_nbr = a.vif_idx;
-    r.cipher_suite = aic_rsn_cipher_suite_to_mac(suite);
-    if (r.cipher_suite == AIC_CIPHER_INVALID) return -EOPNOTSUPP;
+    r.cipher_suite = wifi_cipher_from_suite(suite);
+    if (r.cipher_suite == WIFI_CIPHER_INVALID) return -EOPNOTSUPP;
     r.key.length = len;
     memcpy(r.key.array, key, len);
     aic_mm_key_add_cfm_t cfm = {0};

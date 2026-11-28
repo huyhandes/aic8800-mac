@@ -87,16 +87,20 @@ binds the first dongle that no other worker holds. A dongle's slot N is its line
 ### Adding a chip driver
 
 `src/wifi_drv.h` is the contract between the chip-independent station core (`src/usbwifi_core.c`: scan list,
-connection state, WPA2 EAPOL, the `feth`/BPF side, slots) and a chip driver (`src/drv_aic8800.c`,
-`src/drv_rtw89.c`). To add a chip, implement `struct wifi_drv` (open, scan, connect, disconnect, add_key,
-set_authorized, tx) in `src/drv_<chip>.c`. Report results through `struct wifi_drv_events`, then add the
-driver to `wifi_drivers[]` in `usbwifi_core.c` and to `CORE_SRC` in the Makefile.
+connection state, WPA2 EAPOL, the `feth`/BPF side, slots) and a chip driver (`src/aic8800/drv_aic8800.c`,
+`src/rtw89/drv_rtw89.c`). To add a chip, implement `struct wifi_drv` (open, scan, connect, disconnect, add_key,
+set_authorized, tx) in `src/<chip>/drv_<chip>.c`. Report results through `struct wifi_drv_events`, then add the
+driver to `wifi_drivers[]` in `usbwifi_core.c` and to `CORE_SRC` in the Makefile. None of these depend on a
+chip, so a new driver can use them as they are: the scan list and IE parsers (`src/wifi_ctl.h`), the WPA2
+handshake and PMF keys (`src/wpa2.h`), WPA3-SAE (`src/wpa3.h`), FT-PSK roaming (`src/ft.h`) and the BlockAck
+reorder window (`src/rx_reord.h`). SAE and FT need the optional `ft_connect` op.
 
 ## Credits
 
 - [yokitea/aic8800-macos](https://github.com/yokitea/aic8800-macos) (BSD-3-Clause):
   the AIC8800WiFi kext, firmware loader, WPA2 code and menu app that this port
-  is built on. They are vendored in `third_party/yokitea/` with their license.
+  is built on. They are vendored in `third_party/yokitea/` with their license, except the
+  chip-independent headers, which now live in `src/wifi_ctl.h`, `src/wpa2.h` and `src/rx_reord.h`.
 - [asanrivas/aic8800-linux-driver](https://github.com/asanrivas/aic8800-linux-driver)
   (Linux driver by goecho, based on AICSemi's driver): the reference for the USB
   protocol and RX reorder, and the source of the `aic8800D80` firmware files.

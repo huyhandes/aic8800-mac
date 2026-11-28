@@ -101,6 +101,11 @@ static void *dfree_main(void *arg)
 	return NULL;
 }
 
+/* each lkpi thread starts on first use: the supervisor, fwload and AIC workers link this file but never
+   bind an RTL dongle. start_thread takes no lock, so the timer and RCU starts are safe under any lock */
+static pthread_once_t dfree_once = PTHREAD_ONCE_INIT;
+static void dfree_start(void) { start_thread(dfree_main, NULL, QOS_CLASS_UTILITY); }
+
 void lkpi_defer_free(void *p)
 {
 	struct dfree *d;
@@ -114,6 +119,7 @@ void lkpi_defer_free(void *p)
 		return;
 	}
 	d->p = p;
+	pthread_once(&dfree_once, dfree_start);
 	pthread_mutex_lock(&dlock);
 	d->next = dhead;
 	dhead = d;
@@ -225,10 +231,14 @@ static void *timer_main(void *arg)
 	return NULL;
 }
 
+static pthread_once_t timer_once = PTHREAD_ONCE_INIT;
+static void timer_start(void) { start_thread(timer_main, NULL, QOS_CLASS_USER_INTERACTIVE); }
+
 void lkpi_timer_add(struct lkpi_timer *t, u64 delay_ns)
 {
 	struct lkpi_timer *pos;
 
+	pthread_once(&timer_once, timer_start);
 	pthread_mutex_lock(&tlock);
 	if (t->pending)
 		list_del(&t->entry);
@@ -510,8 +520,27 @@ static void wait_idle(struct work_struct *w)
 		pthread_cond_wait(&wdone, &wlock);
 }
 
+static void system_wq_start(void)
+{
+	system_wq = wq_create("lkpi-events", 2, QOS_CLASS_USER_INITIATED, NULL);
+	if (!system_wq)
+		abort();
+}
+
+/* system_wq is NULL until first queued to; created here, before wlock, because wq_create takes it */
+static struct workqueue_struct *wq_or_system(struct workqueue_struct *wq)
+{
+	static pthread_once_t once = PTHREAD_ONCE_INIT;
+
+	if (wq)
+		return wq;
+	pthread_once(&once, system_wq_start);
+	return system_wq;
+}
+
 bool queue_work(struct workqueue_struct *wq, struct work_struct *w)
 {
+	wq = wq_or_system(wq);
 	pthread_mutex_lock(&wlock);
 	bool r = __queue_work(wq, w);
 	pthread_mutex_unlock(&wlock);
@@ -520,6 +549,7 @@ bool queue_work(struct workqueue_struct *wq, struct work_struct *w)
 
 bool queue_delayed_work(struct workqueue_struct *wq, struct delayed_work *dw, unsigned long delay)
 {
+	wq = wq_or_system(wq);
 	pthread_mutex_lock(&wlock);
 	bool r = __queue_delayed(wq, dw, delay);
 	pthread_mutex_unlock(&wlock);
@@ -528,6 +558,7 @@ bool queue_delayed_work(struct workqueue_struct *wq, struct delayed_work *dw, un
 
 bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *dw, unsigned long delay)
 {
+	wq = wq_or_system(wq);
 	pthread_mutex_lock(&wlock);
 	if (dw->work.state & LKPI_WORK_CANCELING) {
 		pthread_mutex_unlock(&wlock);
@@ -1095,12 +1126,3 @@ void release_firmware(const struct firmware *fw)
 	free((void *)fw);
 }
 
-/* ---------- start-up ---------- */
-__attribute__((constructor)) static void lkpi_kernel_init(void)
-{
-	start_thread(timer_main, NULL, QOS_CLASS_USER_INTERACTIVE);
-	start_thread(dfree_main, NULL, QOS_CLASS_UTILITY);
-	system_wq = wq_create("lkpi-events", 2, QOS_CLASS_USER_INITIATED, NULL);
-	if (!system_wq)
-		abort();
-}

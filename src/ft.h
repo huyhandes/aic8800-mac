@@ -1,44 +1,11 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
-/* Features only the RTL8852BU driver offers (its optional wifi_drv ops set_mac and ft_connect); the daemon
-   calls these only when wifi_has_set_mac() / wifi_has_ft() say the dongle supports them. AIC never does. */
-#ifndef RTL_EXTRAS_H
-#define RTL_EXTRAS_H
+/* 802.11r FT-PSK, chip-independent. The daemon uses it only with a driver that has the optional
+   wifi_drv op ft_connect (wifi_has_ft()). */
+#ifndef FT_H
+#define FT_H
 
-#include "aic8800_wpa2.h"
+#include "wpa2.h"
 #include "wifi_drv.h"
-
-/* MAC randomization: a per-network station address, stable across connects, different per dongle (slot)
-   and unlinkable without the secret. Locally administered unicast. */
-static inline void rtl_random_mac(const uint8_t secret[32], int slot, const uint8_t *ssid, size_t ssid_len,
-                                  uint8_t mac[6]) {
-    uint8_t d[CC_SHA256_DIGEST_LENGTH], in[1 + 32];
-    const size_t n = ssid_len > 32U ? 32U : ssid_len;
-    in[0] = (uint8_t)slot;
-    memcpy(in + 1, ssid, n);
-    CCHmac(kCCHmacAlgSHA256, secret, 32U, in, 1U + n, d);
-    memcpy(mac, d, 6);
-    mac[0] = (uint8_t)((mac[0] & 0xfcU) | 0x02U);
-}
-
-/* IEEE 802.11-2016 12.7.1.7.2 KDF-Hash-Length with SHA256 (label without NUL); bits a multiple of 8 */
-static inline void ft_kdf_sha256(const uint8_t *key, size_t key_len, const char *label,
-                                  const uint8_t *ctx, size_t ctx_len, uint8_t *out, uint16_t bits) {
-    const uint8_t len_le[2] = { (uint8_t)bits, (uint8_t)(bits >> 8U) };
-    const size_t n = bits / 8U;
-    uint8_t d[CC_SHA256_DIGEST_LENGTH];
-    for (uint16_t i = 1U; (size_t)(i - 1U) * 32U < n; ++i) {
-        const uint8_t ctr[2] = { (uint8_t)i, (uint8_t)(i >> 8U) };
-        const size_t off = (size_t)(i - 1U) * 32U;
-        CCHmacContext h;
-        CCHmacInit(&h, kCCHmacAlgSHA256, key, key_len);
-        CCHmacUpdate(&h, ctr, 2U);
-        CCHmacUpdate(&h, label, strlen(label));
-        CCHmacUpdate(&h, ctx, ctx_len);
-        CCHmacUpdate(&h, len_le, 2U);
-        CCHmacFinal(&h, d);
-        memcpy(out + off, d, n - off < 32U ? n - off : 32U);
-    }
-}
 
 /*
  * 802.11r FT-PSK key hierarchy and FTE MIC, IEEE 802.11-2016 12.7.1.7.3-5 and 13.8.4-5. XXKey = the PMK.
@@ -60,7 +27,7 @@ static inline void ft_pmk_r0(const uint8_t pmk[32], const uint8_t *ssid, uint8_t
     p += r0kh_len;
     memcpy(c + p, sta, 6U);
     p += 6U;
-    ft_kdf_sha256(pmk, 32U, "FT-R0", c, p, k, 384U);
+    wpa_kdf_sha256(pmk, 32U, "FT-R0", c, p, k, 384U);
     memcpy(pmk_r0, k, 32U);
     memcpy(n, "FT-R0N", 6U);
     memcpy(n + 6, k + 32, 16U); /* PMK-R0Name-Salt */
@@ -75,7 +42,7 @@ static inline void ft_pmk_r1(const uint8_t pmk_r0[32], const uint8_t r0_name[16]
     memcpy(n + 6, r0_name, 16U);
     memcpy(n + 22, r1kh, 6U);
     memcpy(n + 28, sta, 6U);
-    ft_kdf_sha256(pmk_r0, 32U, "FT-R1", n + 22, 12U, pmk_r1, 256U);
+    wpa_kdf_sha256(pmk_r0, 32U, "FT-R1", n + 22, 12U, pmk_r1, 256U);
     CC_SHA256(n, sizeof(n), h);
     memcpy(r1_name, h, 16U);
 }
@@ -88,7 +55,7 @@ static inline void ft_ptk(const uint8_t pmk_r1[32], const uint8_t snonce[32], co
     memcpy(c + 64, bssid, 6U);
     memcpy(c + 70, sta, 6U);
     memset(ptk, 0, 64U);
-    ft_kdf_sha256(pmk_r1, 32U, "FT-PTK", c, sizeof(c), ptk, 384U);
+    wpa_kdf_sha256(pmk_r1, 32U, "FT-PTK", c, sizeof(c), ptk, 384U);
 }
 
 /* CMAC(KCK, STA || AP || seq || RSNE || MDE || FTE with its MIC zeroed): seq 5 reassoc request, 6 response */
@@ -108,7 +75,7 @@ static inline int ft_mic(const uint8_t kck[16], const uint8_t sta[6], const uint
         p += e[i][1] + 2U;
     }
     memset(b + p - fte[1] - 2U + 4U, 0, 16U);
-    aic_aes128_cmac(kck, b, p, mic);
+    aes128_cmac(kck, b, p, mic);
     return 0;
 }
 
@@ -124,12 +91,12 @@ static inline const uint8_t *ft_sub(const uint8_t *fte, uint8_t id) {
 }
 
 /* GTK subelement: key info (2, key ID in bits 0-1), key length (1), RSC (8), AES key wrapped key */
-static inline int ft_gtk(const uint8_t kek[16], const uint8_t *sub, uint8_t *idx, uint8_t gtk[AIC_MAC_SEC_KEY_LEN],
+static inline int ft_gtk(const uint8_t kek[16], const uint8_t *sub, uint8_t *idx, uint8_t gtk[WPA2_KEY_LEN],
                              uint8_t *len) {
     uint8_t plain[64];
     size_t plain_len = sizeof(plain);
     if (!sub || sub[1] < 11U + 24U || sub[1] > 11U + 8U + sizeof(plain) || (sub[1] - 11U) % 8U != 0U ||
-        sub[4] == 0U || sub[4] > AIC_MAC_SEC_KEY_LEN) {
+        sub[4] == 0U || sub[4] > WPA2_KEY_LEN) {
         return -1;
     }
     if (CCSymmetricKeyUnwrap(kCCWRAPAES, CCrfc3394_iv, CCrfc3394_ivLen, kek, 16U, sub + 13, sub[1] - 11U, plain,
@@ -159,7 +126,7 @@ static inline const uint8_t *ft_ie(const uint8_t *ies, size_t len, uint8_t id) {
     return NULL;
 }
 
-/* rsne (the 22-byte PSK form from aic_build_wpa2_rsn_ie, AKM 4) with one PMKID */
+/* rsne (the 22-byte PSK form from wifi_build_wpa2_rsn_ie, AKM 4) with one PMKID */
 static inline uint8_t *ft_put_rsne(uint8_t *o, const uint8_t rsne[22], const uint8_t pmkid[16]) {
     memcpy(o, rsne, 22U);
     o[1] = 38U;
@@ -267,7 +234,7 @@ static inline int ft_reassoc_ie(void *arg, const uint8_t *ies, size_t len, uint8
 
 /* FT roam, step 3: check the reassociation response's MIC and nonces, then put the PTK and the GTK in c
    as a completed handshake, so the group key handshakes that follow work. 0, or -1 */
-static inline int ft_finish(ft_state_t *s, const struct wifi_ft *ft, aic_wpa2_ctx_t *c) {
+static inline int ft_finish(ft_state_t *s, const struct wifi_ft *ft, wpa2_ctx_t *c) {
     const uint8_t *rsne = ft_ie(ft->resp, ft->resp_len, 48U), *mde = ft_ie(ft->resp, ft->resp_len, 54U),
                   *fte = ft_ie(ft->resp, ft->resp_len, 55U);
     uint8_t mic[16];
@@ -281,29 +248,4 @@ static inline int ft_finish(ft_state_t *s, const struct wifi_ft *ft, aic_wpa2_ct
     return 0;
 }
 
-/* PMF: the IGTK KDE (00-0f-ac:9) of an EAPOL-Key frame aic_wpa2_handle_rx_eapol just accepted (M3 or group M1,
-   so its KEK is in ptk now). out: IGTK then IPN, the BIP-CMAC-128 key wifi_add_key takes. Returns the key ID
-   (4 or 5), 0 when there is none. */
-static inline int rtl_igtk(const aic_wpa2_ctx_t *c, const uint8_t *eth, size_t len, uint8_t out[22]) {
-    uint8_t kd[512];
-    if (len < 14U + 4U + 95U) return 0;
-    const uint8_t *b = &eth[18];
-    const size_t kl = aic_wpa_get_be16(&b[93]);
-    size_t n = kl - 8U;
-    if (!(aic_wpa_get_be16(&b[1]) & AIC_KEY_INFO_ENC_KEY_DATA) || kl < 24U || kl % 8U || n > sizeof(kd) ||
-        18U + 95U + kl > len ||
-        CCSymmetricKeyUnwrap(kCCWRAPAES, CCrfc3394_iv, CCrfc3394_ivLen, &c->ptk[16], 16U, &b[95], kl, kd, &n) != 0)
-        return 0;
-    for (size_t o = 0U; o + 2U <= n && kd[o + 1] + 2U <= n - o; o += kd[o + 1] + 2U) {
-        const uint8_t *e = &kd[o];
-        if (e[0] == 0xddU && e[1] >= 4U + 2U + 6U + 16U && !memcmp(&e[2], "\x00\x0f\xac\x09", 4U)) {
-            const int id = e[6] | e[7] << 8;
-            memcpy(out, &e[14], 16U);
-            memcpy(&out[16], &e[8], 6U);
-            return id == 4 || id == 5 ? id : 0;
-        }
-    }
-    return 0;
-}
-
-#endif
+#endif /* FT_H */

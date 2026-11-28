@@ -66,6 +66,26 @@ static void requeue_fn(struct work_struct *w)
 	queue_work(wq, w); /* refused while cancel_work_sync runs */
 }
 
+/* the lkpi threads start on first use: system_wq on the first schedule_*, the timer and RCU threads lazily */
+static void test_lazy_start(void)
+{
+	struct work_struct w;
+	struct delayed_work dw;
+
+	assert(!system_wq);
+	ran = 0;
+	INIT_DELAYED_WORK(&dw, count_fn);
+	assert(schedule_delayed_work(&dw, 1));
+	INIT_WORK(&w, count_fn);
+	assert(schedule_work(&w));
+	assert(system_wq);
+	flush_work(&w);
+	flush_delayed_work(&dw);
+	assert(ran == 2);
+	ran = 0;
+	kfree_rcu(malloc(16), rcu);
+}
+
 static void test_workqueue(void)
 {
 	struct work_struct w;
@@ -236,6 +256,7 @@ static void test_skb_bits(void)
 int main(void)
 {
 	test_printf();
+	test_lazy_start();
 	test_workqueue();
 	test_sync();
 	test_poll();

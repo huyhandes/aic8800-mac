@@ -1,12 +1,13 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* WPA3-Personal SAE (IEEE 802.11-2020 12.4), group 19 (NIST P-256), PWE by hunting-and-pecking or hash-to-element
-   (H2E), for the RTL driver's struct wifi_ft sae step. AIC never uses it.
+   (H2E), for the struct wifi_ft sae step of a driver that has the optional wifi_drv op ft_connect.
    Field arithmetic picks results with masks instead of branches, and scalar multiplication is a Montgomery
    ladder with a fixed step count, so the timing does not depend on the password or the secret scalars. */
-#ifndef RTL_SAE_H
-#define RTL_SAE_H
+#ifndef WPA3_H
+#define WPA3_H
 
-#include "rtl_extras.h"
+#include "wpa2.h"
+#include "wifi_drv.h"
 
 typedef struct { uint64_t v[4]; } sae_bn;                /* little-endian 64-bit limbs */
 typedef struct { sae_bn m, r2, one; uint64_t inv; } sae_mont; /* one = R mod m, inv = -1/m mod 2^64 */
@@ -339,7 +340,7 @@ static inline int sae_init(sae_t *s, const uint8_t own[6], const uint8_t peer[6]
     for (int ctr = 1; ctr <= 40; ctr++) {
         msg[pw_len] = (uint8_t)ctr;
         CCHmac(kCCHmacAlgSHA256, key, sizeof(key), msg, pw_len + 1U, seed);
-        ft_kdf_sha256(seed, sizeof(seed), "SAE Hunting and Pecking", pb, sizeof(pb), val, 256);
+        wpa_kdf_sha256(seed, sizeof(seed), "SAE Hunting and Pecking", pb, sizeof(pb), val, 256);
         sae_bn_get(&x, val);
         if (sae_bn_cmp(&x, &s->C.p.m) >= 0) continue;
         sae_mmul(&s->C.p, &x, &x, &s->C.p.r2);
@@ -402,7 +403,7 @@ static inline int sae_process_commit(sae_t *s, const uint8_t *b, size_t n) {
     CCHmac(kCCHmacAlgSHA256, zero, sizeof(zero), k, 32U, keyseed);
     sae_madd(&s->C.n, &ps, &ps, &s->scalar);
     sae_bn_put(val, &ps);
-    ft_kdf_sha256(keyseed, sizeof(keyseed), "SAE KCK and PMK", val, sizeof(val), keys, 512);
+    wpa_kdf_sha256(keyseed, sizeof(keyseed), "SAE KCK and PMK", val, sizeof(val), keys, 512);
     memcpy(s->kck, keys, 32);
     memcpy(s->pmk, keys + 32, 32);
     memcpy(s->pmkid, val, 16);
@@ -502,4 +503,4 @@ static inline int sae_step(void *arg, const uint8_t *rx, size_t rx_len, uint8_t 
     return -1;
 }
 
-#endif
+#endif /* WPA3_H */

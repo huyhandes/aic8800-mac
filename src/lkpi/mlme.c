@@ -10,9 +10,9 @@
 #include <string.h>
 #include "local.h"
 #include "lkpi_usb.h"
-#include "../rtwd.h"
+#include "../rtw89/rtwd.h"
 #include "../wifi_drv.h"
-#include "aic8800_reord.h"
+#include "../rx_reord.h"
 #include "ccmp.h"
 
 #define HW() (&M.l->hw)
@@ -72,7 +72,7 @@ static struct {
 	/* keys */
 	struct mkey *ptk, *gtk[4], *retired;
 	/* rx */
-	aic_rx_reord_t reord;
+	rx_reord_t reord;
 	u16 ba_rx;
 	u64 rx_pn[NTID + 1], gtk_pn[4];
 	u16 last_seq[NTID + 1];
@@ -455,10 +455,10 @@ static void reord_timeout(struct work_struct *w)
 
 	__skb_queue_head_init(&o.q);
 	mutex_lock(&rx_lock);
-	more = aic_rx_reord_timeout_flush(&M.reord, rx_deliver, &o);
+	more = rx_reord_timeout_flush(&M.reord, rx_deliver, &o);
 	mutex_unlock(&rx_lock);
 	if (more)
-		schedule_delayed_work(&M.reord_dw, msecs_to_jiffies(AIC_REORD_TIMEOUT_MS));
+		schedule_delayed_work(&M.reord_dw, msecs_to_jiffies(RX_REORD_TIMEOUT_MS));
 	rx_flush_out(&o);
 }
 
@@ -488,7 +488,7 @@ static void rx_data(struct sk_buff *skb)
 	}
 	skb->next = NULL;
 	if (!mc && qos && tid < 8 && (M.ba_rx & BIT(tid))) {
-		aic_rx_reord_submit(&M.reord, tid, sn, skb, skb->len, false, rx_deliver, rx_append, rx_drop, &o,
+		rx_reord_submit(&M.reord, tid, sn, skb, skb->len, false, rx_deliver, rx_append, rx_drop, &o,
 				    &timer);
 	} else {
 		if (!mc && (fc & IEEE80211_FCTL_RETRY) && M.last_seq[tid] == sc) {
@@ -502,7 +502,7 @@ static void rx_data(struct sk_buff *skb)
 out:
 	mutex_unlock(&rx_lock);
 	if (timer)
-		schedule_delayed_work(&M.reord_dw, msecs_to_jiffies(AIC_REORD_TIMEOUT_MS));
+		schedule_delayed_work(&M.reord_dw, msecs_to_jiffies(RX_REORD_TIMEOUT_MS));
 	rx_flush_out(&o);
 }
 
@@ -879,8 +879,8 @@ static void mgmt_work_fn(struct wiphy *w, struct wiphy_work *wk)
 			u16 status = WLAN_STATUS_REQUEST_DECLINED;
 			struct ieee80211_mgmt *r = (void *)f;
 
-			if (!buf || buf > AIC_REORD_WINSIZE)
-				buf = AIC_REORD_WINSIZE;
+			if (!buf || buf > RX_REORD_WINSIZE)
+				buf = RX_REORD_WINSIZE;
 			if (tid < 8 && (capab & 2)) {
 				if (M.ba_rx & BIT(tid))
 					ampdu(IEEE80211_AMPDU_RX_STOP, tid, 0, 0, false);
@@ -889,7 +889,7 @@ static void mgmt_work_fn(struct wiphy *w, struct wiphy_work *wk)
 
 					__skb_queue_head_init(&o.q);
 					mutex_lock(&rx_lock);
-					aic_rx_reord_flush_tid(&M.reord, tid, false, rx_deliver, rx_drop, &o);
+					rx_reord_flush_tid(&M.reord, tid, false, rx_deliver, rx_drop, &o);
 					M.ba_rx |= BIT(tid);
 					mutex_unlock(&rx_lock);
 					rx_flush_out(&o);
@@ -939,7 +939,7 @@ static void mgmt_work_fn(struct wiphy *w, struct wiphy_work *wk)
 				__skb_queue_head_init(&o.q);
 				mutex_lock(&rx_lock);
 				M.ba_rx &= ~BIT(tid);
-				aic_rx_reord_flush_tid(&M.reord, tid, false, rx_deliver, rx_drop, &o);
+				rx_reord_flush_tid(&M.reord, tid, false, rx_deliver, rx_drop, &o);
 				mutex_unlock(&rx_lock);
 				rx_flush_out(&o);
 			} else if ((M.ba_tx | M.ba_pending) & BIT(tid)) {
@@ -1079,7 +1079,7 @@ static void teardown(u16 reason, bool send)
 
 	__skb_queue_head_init(&o.q);
 	mutex_lock(&rx_lock);
-	aic_rx_reord_flush_all(&M.reord, true, rx_deliver, rx_drop, &o);
+	rx_reord_flush_all(&M.reord, true, rx_deliver, rx_drop, &o);
 	memset(M.rx_pn, 0, sizeof(M.rx_pn));
 	memset(M.gtk_pn, 0, sizeof(M.gtk_pn));
 	memset(M.last_seq, 0xff, sizeof(M.last_seq));
@@ -1196,7 +1196,7 @@ int rtwd_open(const struct rtwd_cb *cb, uint8_t mac[6], int timeout_ms, const ch
 	rtwd_led_init(hw);
 	wiphy_unlock(WIPHY());
 	M.led_alive = true;
-	aic_rx_reord_init(&M.reord);
+	rx_reord_init(&M.reord);
 	memset(M.last_seq, 0xff, sizeof(M.last_seq));
 	memcpy(mac, VIF()->addr, ETH_ALEN);
 	mutex_unlock(&op_lock);

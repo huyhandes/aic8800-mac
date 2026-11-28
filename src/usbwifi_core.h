@@ -11,7 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "aic8800_wifi_ctl.h"
+#include "wifi_ctl.h"
 
 /* One process drives one dongle. Each dongle gets a slot N, fixed by its MAC address, that picks its
    host-visible interface feth(80+2N) (gets DHCP) and the peer feth(81+2N) (the driver's BPF endpoint). */

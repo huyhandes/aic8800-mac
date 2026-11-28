@@ -3,14 +3,16 @@
    live PTK, replay and forged-MIC drops, and no reinstall of a key we already hold (KRACK) */
 #include <assert.h>
 #include <stdio.h>
-#include "rtl_sae.h"
+#include "ft.h"
+#include "wifi_ctl.h"
+#include "wpa3.h"
 #include "lkpi/ccmp.h"
 
-#define PW   AIC_KEY_INFO_PAIRWISE
-#define ACK  AIC_KEY_INFO_ACK
-#define MIC  AIC_KEY_INFO_MIC
-#define SEC  AIC_KEY_INFO_SECURE
-#define ENC  AIC_KEY_INFO_ENC_KEY_DATA
+#define PW   WPA_KEY_INFO_PAIRWISE
+#define ACK  WPA_KEY_INFO_ACK
+#define MIC  WPA_KEY_INFO_MIC
+#define SEC  WPA_KEY_INFO_SECURE
+#define ENC  WPA_KEY_INFO_ENC_KEY_DATA
 
 /* EAPOL-Key frame (HMAC-SHA1 MIC); ptk != NULL signs it with ptk's KCK and, with gtk_byte != 0,
    wraps a GTK KDE (16 x gtk_byte, key id 1) under ptk's KEK */
@@ -29,7 +31,7 @@ static size_t frame(uint8_t *f, uint16_t info, uint8_t replay, uint8_t anonce, c
 	memset(f, 0, 14 + 4 + body);
 	f[12] = 0x88; f[13] = 0x8e;
 	uint8_t *p = f + 14, *k = p + 4;
-	info |= AIC_KEY_INFO_VER_HMAC_SHA1;
+	info |= WPA_KEY_INFO_VER_HMAC_SHA1;
 	p[0] = 2; p[1] = 3; p[2] = (uint8_t)(body >> 8); p[3] = (uint8_t)body;
 	k[0] = 2; k[1] = (uint8_t)(info >> 8); k[2] = (uint8_t)info;
 	k[12] = replay;
@@ -37,7 +39,7 @@ static size_t frame(uint8_t *f, uint16_t info, uint8_t replay, uint8_t anonce, c
 	k[93] = 0; k[94] = (uint8_t)kd_len;
 	memcpy(k + 95, kd, kd_len);
 	if (ptk)
-		assert(aic_wpa2_compute_eapol_mic(AIC_KEY_INFO_VER_HMAC_SHA1, ptk, p, 4 + body, k + 77) == 0);
+		assert(wpa2_compute_eapol_mic(WPA_KEY_INFO_VER_HMAC_SHA1, ptk, p, 4 + body, k + 77) == 0);
 	return 14 + 4 + body;
 }
 
@@ -122,7 +124,7 @@ static void test_ft_flow(void)
 	struct wifi_ft ft = { .md = { 0x34, 0x12, 1 } };
 	uint8_t rsne[22], kd[255], sn0[32] = { 0 }, ies[400], out[300], mic[16];
 	memset(&s, 0, sizeof(s));
-	assert(aic_build_wpa2_rsn_ie(rsne, AIC_CIPHER_CCMP, false) == 22);
+	assert(wifi_build_wpa2_rsn_ie(rsne, WIFI_CIPHER_CCMP, false) == 22);
 	rsne[19] = 4;
 	memcpy(ft.resp, mde, 5);
 	ft.resp_len = 5 + ap_fte(ft.resp + 5, sn0, NULL);
@@ -152,7 +154,7 @@ static void test_ft_flow(void)
 	memcpy(ft.resp, out, 45);
 	ft.resp_len = 45 + ap_fte(ft.resp + 45, s.snonce, k_ft_ptk + 16);
 	assert(ft_mic(k_ft_ptk, sta, ap, 6, ft.resp, ft.resp + 40, ft.resp + 45, ft.resp + 49) == 0);
-	aic_wpa2_ctx_t c;
+	wpa2_ctx_t c;
 	memset(&c, 0, sizeof(c));
 	assert(ft_finish(&s, &ft, &c) == 0 && c.has_ptk && c.has_gtk && c.gtk_idx == 1 && c.gtk[0] == 0x5a);
 	assert(!memcmp(c.ptk, k_ft_ptk, 48));
@@ -342,32 +344,52 @@ static void test_bip(void)
 	assert(bip_verify(igtk, 4, f, sizeof(f)) == -1);
 	assert(bip_verify(igtk, 4, f, 26) == -1);
 
-	/* rtl_igtk: the IGTK KDE behind a GTK KDE in wrapped key data; none without EncryptedKeyData */
+	/* wpa2_igtk: the IGTK KDE behind a GTK KDE in wrapped key data; none without EncryptedKeyData */
 	uint8_t kde[56] = { 0xdd, 22, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00 }, e[14 + 4 + 95 + 64] = { 0 }, k[22];
-	aic_wpa2_ctx_t c = { 0 };
+	wpa2_ctx_t c = { 0 };
 	size_t n = 64;
 	memcpy(kde + 24, (const uint8_t[]){ 0xdd, 28, 0x00, 0x0f, 0xac, 0x09, 4, 0, 7, 0, 0, 0, 0, 0 }, 14);
 	memcpy(kde + 38, igtk, 16);
 	kde[54] = 0xdd; /* padding */
 	memset(c.ptk + 16, 0x5a, 16);
 	assert(CCSymmetricKeyWrap(kCCWRAPAES, CCrfc3394_iv, CCrfc3394_ivLen, c.ptk + 16, 16, kde, sizeof(kde), e + 113, &n) == kCCSuccess && n == 64);
-	e[19] = AIC_KEY_INFO_ENC_KEY_DATA >> 8;
+	e[19] = WPA_KEY_INFO_ENC_KEY_DATA >> 8;
 	e[18 + 94] = 64;
-	assert(rtl_igtk(&c, e, sizeof(e), k) == 4 && !memcmp(k, igtk, 16) && k[16] == 7 && !k[17]);
+	assert(wpa2_igtk(&c, e, sizeof(e), k) == 4 && !memcmp(k, igtk, 16) && k[16] == 7 && !k[17]);
 	e[19] = 0;
-	assert(rtl_igtk(&c, e, sizeof(e), k) == 0);
+	assert(wpa2_igtk(&c, e, sizeof(e), k) == 0);
+}
+
+/* wifi_parse_bss: a WPA2-PSK/CCMP beacon on 5 GHz with MFP required; a truncated frame is rejected */
+static void test_parse_bss(void)
+{
+	uint8_t b[36 + 6 + 22] = { 0 }, rsne[22];
+	wifi_scan_bss_t s;
+	memcpy(&b[16], "\x02\x00\x00\x00\x00\x07", 6);
+	b[34] = 0x11; /* ESS, privacy */
+	memcpy(&b[36], "\x00\x04home", 6);
+	wifi_build_wpa2_rsn_ie(rsne, WIFI_CIPHER_CCMP, false);
+	rsne[20] = 0x40; /* RSN capabilities: MFPR */
+	memcpy(&b[42], rsne, 22);
+	assert(wifi_parse_bss(b, sizeof(b), 5180, -40, &s) == 0);
+	assert(s.band == WIFI_BAND_5G && s.freq == 5180 && s.rssi == -40 && s.bssid[5] == 7);
+	assert(s.ssid_len == 4 && !memcmp(s.ssid, "home", 4));
+	assert(s.pairwise_cipher == WIFI_CIPHER_CCMP && s.group_cipher == WIFI_CIPHER_CCMP);
+	assert(s.sec_mask == (WIFI_SEC_PRIVACY | WIFI_SEC_CCMP | WIFI_SEC_WPA2_PSK | WIFI_SEC_MFP_REQ));
+	assert(wifi_parse_bss(b, 35, 2412, -40, &s) == -1);
 }
 
 int main(void)
 {
+	test_parse_bss();
 	static const uint8_t spa[6] = { 2 }, aa[6] = { 4 }, pmk[32] = { 1 }, zero[64] = { 0 };
-	aic_wpa2_ctx_t c;
+	wpa2_ctx_t c;
 	uint8_t f[256], out[512], sn[32], ptk[64];
 	size_t ol;
 	bool kr, gr;
-#define RX(len) aic_wpa2_handle_rx_eapol(&c, f, (len), out, sizeof(out), &ol, &kr, &gr)
+#define RX(len) wpa2_handle_rx_eapol(&c, f, (len), out, sizeof(out), &ol, &kr, &gr)
 
-	aic_wpa2_ctx_init(&c, spa, aa, pmk, NULL, 0, AIC_CIPHER_CCMP, AIC_CIPHER_CCMP);
+	wpa2_ctx_init(&c, spa, aa, pmk, NULL, 0, WIFI_CIPHER_CCMP, WIFI_CIPHER_CCMP);
 	assert(RX(frame(f, PW | ACK, 1, 0xaa, NULL, 0)) == 1);
 	memcpy(sn, c.snonce, 32);
 	assert(RX(frame(f, PW | ACK, 2, 0xaa, NULL, 0)) == 1); /* retransmitted M1 keeps the SNonce */
@@ -399,10 +421,10 @@ int main(void)
 
 	/* random MAC: locally administered unicast, stable per network, different per network and per dongle */
 	uint8_t m1[6], m2[6], m3[6], m4[6];
-	rtl_random_mac(pmk, 0, (const uint8_t *)"home", 4, m1);
-	rtl_random_mac(pmk, 0, (const uint8_t *)"home", 4, m2);
-	rtl_random_mac(pmk, 0, (const uint8_t *)"cafe", 4, m3);
-	rtl_random_mac(pmk, 1, (const uint8_t *)"home", 4, m4);
+	wifi_random_mac(pmk, 0, (const uint8_t *)"home", 4, m1);
+	wifi_random_mac(pmk, 0, (const uint8_t *)"home", 4, m2);
+	wifi_random_mac(pmk, 0, (const uint8_t *)"cafe", 4, m3);
+	wifi_random_mac(pmk, 1, (const uint8_t *)"home", 4, m4);
 	assert((m1[0] & 3) == 2 && !memcmp(m1, m2, 6) && memcmp(m1, m3, 6) && memcmp(m1, m4, 6));
 	test_ft();
 	test_ft_flow();

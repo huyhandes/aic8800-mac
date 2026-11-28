@@ -1,13 +1,14 @@
 /*
- * aic8800_wpa2.h - Zero-heap IEEE 802.11i WPA2-PSK 4-Way & Group Handshake
+ * wpa2.h - Zero-heap IEEE 802.11i WPA2-PSK 4-Way & Group Handshake
  *
  * Uses macOS built-in CommonCrypto (PBKDF2-HMAC-SHA1, HMAC-SHA1/SHA256,
  * AES-ECB for RFC 4493 AES-128-CMAC, RFC 3394 AES Key Unwrap, CCRandomGenerateBytes).
  * Self-contained header so offline ASan/UBSan tests verify exact RFC/IEEE vectors.
+ * From yokitea AIC8800WiFi.kext (BSD-3, see third_party/yokitea/LICENSE); chip-independent.
  */
 
-#ifndef AIC8800_WPA2_H
-#define AIC8800_WPA2_H
+#ifndef WPA2_H
+#define WPA2_H
 
 #include <CommonCrypto/CommonCryptor.h>
 #include <CommonCrypto/CommonDigest.h>
@@ -20,38 +21,44 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "aic8800_framing.h"
-#include "aic8800_wifi_ctl.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define AIC_EAPOL_ETHERTYPE        0x888EU
-#define AIC_EAPOL_HDR_LEN          4U
-#define AIC_EAPOL_KEY_BODY_MIN_LEN 95U
+#define WPA2_ADDR_LEN              6U
+#define WPA2_KEY_LEN               32U   /* GTK buffer, fits a 256-bit key */
+#define WPA2_EAPOL_MAX_FRAME       1600U
 
-#define AIC_KEY_INFO_VER_MASK      0x0007U
-#define AIC_KEY_INFO_VER_HMAC_MD5  1U
-#define AIC_KEY_INFO_VER_HMAC_SHA1 2U
-#define AIC_KEY_INFO_VER_AES_CMAC  3U
-#define AIC_KEY_INFO_PAIRWISE      (1U << 3U)
-#define AIC_KEY_INFO_INSTALL       (1U << 6U)
-#define AIC_KEY_INFO_ACK           (1U << 7U)
-#define AIC_KEY_INFO_MIC           (1U << 8U)
-#define AIC_KEY_INFO_SECURE        (1U << 9U)
-#define AIC_KEY_INFO_ENC_KEY_DATA  (1U << 12U)
+#define EAPOL_ETHERTYPE            0x888EU
+#define EAPOL_HDR_LEN              4U
+#define EAPOL_KEY_BODY_MIN_LEN     95U
 
-static inline uint16_t aic_wpa_get_be16(const uint8_t *b) {
+#define WPA_KEY_INFO_VER_MASK      0x0007U
+#define WPA_KEY_INFO_VER_HMAC_MD5  1U
+#define WPA_KEY_INFO_VER_HMAC_SHA1 2U
+#define WPA_KEY_INFO_VER_AES_CMAC  3U
+#define WPA_KEY_INFO_PAIRWISE      (1U << 3U)
+#define WPA_KEY_INFO_INSTALL       (1U << 6U)
+#define WPA_KEY_INFO_ACK           (1U << 7U)
+#define WPA_KEY_INFO_MIC           (1U << 8U)
+#define WPA_KEY_INFO_SECURE        (1U << 9U)
+#define WPA_KEY_INFO_ENC_KEY_DATA  (1U << 12U)
+
+static inline uint16_t wpa_get_be16(const uint8_t *b) {
     return (uint16_t)((uint16_t)b[0] << 8U) | (uint16_t)b[1];
 }
 
-static inline void aic_wpa_put_be16(uint8_t *b, uint16_t v) {
+static inline void wpa_put_be16(uint8_t *b, uint16_t v) {
     b[0] = (uint8_t)((v >> 8U) & 0xFFU);
     b[1] = (uint8_t)(v & 0xFFU);
 }
 
-static inline uint64_t aic_wpa_get_be64(const uint8_t *b) {
+static inline void wpa_put_le16(uint8_t *b, uint16_t v) {
+    b[0] = (uint8_t)(v & 0xFFU);
+    b[1] = (uint8_t)((v >> 8U) & 0xFFU);
+}
+
+static inline uint64_t wpa_get_be64(const uint8_t *b) {
     uint64_t v = 0U;
     for (size_t i = 0U; i < 8U; ++i) {
         v = (v << 8U) | (uint64_t)b[i];
@@ -59,7 +66,7 @@ static inline uint64_t aic_wpa_get_be64(const uint8_t *b) {
     return v;
 }
 
-static inline void aic_wpa_put_be64(uint8_t *b, uint64_t v) {
+static inline void wpa_put_be64(uint8_t *b, uint64_t v) {
     for (size_t i = 0U; i < 8U; ++i) {
         b[7U - i] = (uint8_t)(v & 0xFFU);
         v >>= 8U;
@@ -69,7 +76,7 @@ static inline void aic_wpa_put_be64(uint8_t *b, uint64_t v) {
 /*
  * RFC 4493 AES-128-CMAC over arbitrary message bytes using AES-128 ECB.
  */
-static inline void aic_aes128_cmac_left_shift(const uint8_t in[16], uint8_t out[16]) {
+static inline void aes128_cmac_left_shift(const uint8_t in[16], uint8_t out[16]) {
     uint8_t overflow = 0U;
     for (int i = 15; i >= 0; --i) {
         out[i] = (uint8_t)((in[i] << 1U) | overflow);
@@ -77,10 +84,10 @@ static inline void aic_aes128_cmac_left_shift(const uint8_t in[16], uint8_t out[
     }
 }
 
-static inline void aic_aes128_cmac(const uint8_t key[16],
-                                   const uint8_t *msg,
-                                   size_t msg_len,
-                                   uint8_t mac_out[16]) {
+static inline void aes128_cmac(const uint8_t key[16],
+                               const uint8_t *msg,
+                               size_t msg_len,
+                               uint8_t mac_out[16]) {
     uint8_t zero[16] = {0};
     uint8_t L[16]    = {0};
     size_t out_len   = 0U;
@@ -88,12 +95,12 @@ static inline void aic_aes128_cmac(const uint8_t key[16],
             key, 16, NULL, zero, 16, L, 16, &out_len);
 
     uint8_t K1[16];
-    aic_aes128_cmac_left_shift(L, K1);
+    aes128_cmac_left_shift(L, K1);
     if ((L[0] & 0x80U) != 0U) {
         K1[15] ^= 0x87U;
     }
     uint8_t K2[16];
-    aic_aes128_cmac_left_shift(K1, K2);
+    aes128_cmac_left_shift(K1, K2);
     if ((K1[0] & 0x80U) != 0U) {
         K2[15] ^= 0x87U;
     }
@@ -145,11 +152,11 @@ static inline void aic_aes128_cmac(const uint8_t key[16],
 /*
  * IEEE 802.11i PBKDF2-HMAC-SHA1 (4096 rounds) -> 32-byte PMK.
  */
-static inline int aic_wpa2_derive_pmk(const char *passphrase,
-                                      size_t pass_len,
-                                      const uint8_t *ssid,
-                                      size_t ssid_len,
-                                      uint8_t pmk_out[32]) {
+static inline int wpa2_derive_pmk(const char *passphrase,
+                                  size_t pass_len,
+                                  const uint8_t *ssid,
+                                  size_t ssid_len,
+                                  uint8_t pmk_out[32]) {
     if (!passphrase || !ssid || pass_len < 8U || pass_len > 63U ||
         ssid_len == 0U || ssid_len > 32U || !pmk_out) {
         return -1;
@@ -169,13 +176,13 @@ static inline int aic_wpa2_derive_pmk(const char *passphrase,
 /*
  * IEEE 802.11 PRF-512 (SHA1) / KDF-384 (SHA256) for PTK derivation (64 bytes).
  */
-static inline void aic_wpa2_derive_ptk(const uint8_t pmk[32],
-                                       const uint8_t aa[6],
-                                       const uint8_t spa[6],
-                                       const uint8_t anonce[32],
-                                       const uint8_t snonce[32],
-                                       bool use_sha256_kdf,
-                                       uint8_t ptk_out[64]) {
+static inline void wpa2_derive_ptk(const uint8_t pmk[32],
+                                   const uint8_t aa[6],
+                                   const uint8_t spa[6],
+                                   const uint8_t anonce[32],
+                                   const uint8_t snonce[32],
+                                   bool use_sha256_kdf,
+                                   uint8_t ptk_out[64]) {
     static const char kLabel[] = "Pairwise key expansion"; /* 22 bytes */
     uint8_t data[76];
 
@@ -216,10 +223,10 @@ static inline void aic_wpa2_derive_ptk(const uint8_t pmk[32],
         uint8_t digest[CC_SHA256_DIGEST_LENGTH];
         memset(ptk_out, 0, 64U);
         for (uint16_t ctr = 1U; ctr <= 2U; ++ctr) {
-            aic_put_le16(&input[0], ctr);
+            wpa_put_le16(&input[0], ctr);
             memcpy(&input[2], kLabel, 22U); /* no NUL terminator in KDF-SHA256 */
             memcpy(&input[24], data, sizeof(data));
-            aic_put_le16(&input[24 + sizeof(data)], 384U);
+            wpa_put_le16(&input[24 + sizeof(data)], 384U);
             CCHmac(kCCHmacAlgSHA256, pmk, 32U, input, sizeof(input), digest);
             const size_t off = (size_t)(ctr - 1U) * 32U;
             const size_t take = (48U - off < 32U) ? (48U - off) : 32U;
@@ -231,31 +238,31 @@ static inline void aic_wpa2_derive_ptk(const uint8_t pmk[32],
 /*
  * Compute 16-byte EAPOL-Key MIC (over whole EAPOL PDU with MIC field [81..96] zeroed).
  */
-static inline int aic_wpa2_compute_eapol_mic(uint16_t key_ver,
-                                             const uint8_t kck[16],
-                                             const uint8_t *eapol_pdu,
-                                             size_t eapol_len,
-                                             uint8_t mic_out[16]) {
+static inline int wpa2_compute_eapol_mic(uint16_t key_ver,
+                                         const uint8_t kck[16],
+                                         const uint8_t *eapol_pdu,
+                                         size_t eapol_len,
+                                         uint8_t mic_out[16]) {
     if (!kck || !eapol_pdu || !mic_out ||
-        eapol_len < AIC_EAPOL_HDR_LEN + AIC_EAPOL_KEY_BODY_MIN_LEN ||
-        eapol_len > WIFI_EAPOL_MAX_FRAME) {
+        eapol_len < EAPOL_HDR_LEN + EAPOL_KEY_BODY_MIN_LEN ||
+        eapol_len > WPA2_EAPOL_MAX_FRAME) {
         return -1;
     }
-    uint8_t copy[WIFI_EAPOL_MAX_FRAME];
+    uint8_t copy[WPA2_EAPOL_MAX_FRAME];
     memcpy(copy, eapol_pdu, eapol_len);
-    memset(&copy[AIC_EAPOL_HDR_LEN + 77U], 0, 16U);
+    memset(&copy[EAPOL_HDR_LEN + 77U], 0, 16U);
 
-    if (key_ver == AIC_KEY_INFO_VER_HMAC_SHA1) {
+    if (key_ver == WPA_KEY_INFO_VER_HMAC_SHA1) {
         uint8_t digest[CC_SHA1_DIGEST_LENGTH];
         CCHmac(kCCHmacAlgSHA1, kck, 16U, copy, eapol_len, digest);
         memcpy(mic_out, digest, 16U);
         return 0;
     }
-    if (key_ver == AIC_KEY_INFO_VER_AES_CMAC || key_ver == 0U) { /* 0: AKM-defined, SAE uses AES-CMAC */
-        aic_aes128_cmac(kck, copy, eapol_len, mic_out);
+    if (key_ver == WPA_KEY_INFO_VER_AES_CMAC || key_ver == 0U) { /* 0: AKM-defined, SAE uses AES-CMAC */
+        aes128_cmac(kck, copy, eapol_len, mic_out);
         return 0;
     }
-    if (key_ver == AIC_KEY_INFO_VER_HMAC_MD5) {
+    if (key_ver == WPA_KEY_INFO_VER_HMAC_MD5) {
         uint8_t digest[CC_MD5_DIGEST_LENGTH];
         CCHmac(kCCHmacAlgMD5, kck, 16U, copy, eapol_len, digest);
         memcpy(mic_out, digest, 16U);
@@ -268,12 +275,12 @@ static inline int aic_wpa2_compute_eapol_mic(uint16_t key_ver,
  * Unwrap encrypted Key Data from EAPOL M3 / Group M1 using KEK (RFC 3394 AES Key Unwrap)
  * and extract the GTK KDE (OUI 00-0F-AC type 01).
  */
-static inline int aic_wpa2_extract_gtk(const uint8_t kek[16],
-                                       const uint8_t *enc_data,
-                                       size_t enc_len,
-                                       uint8_t *out_gtk_idx,
-                                       uint8_t out_gtk[AIC_MAC_SEC_KEY_LEN],
-                                       uint8_t *out_gtk_len) {
+static inline int wpa2_extract_gtk(const uint8_t kek[16],
+                                   const uint8_t *enc_data,
+                                   size_t enc_len,
+                                   uint8_t *out_gtk_idx,
+                                   uint8_t out_gtk[WPA2_KEY_LEN],
+                                   uint8_t *out_gtk_len) {
     if (!kek || !enc_data || !out_gtk_idx || !out_gtk || !out_gtk_len ||
         enc_len < 24U || (enc_len % 8U) != 0U || enc_len > 512U) {
         return -1;
@@ -309,7 +316,7 @@ static inline int aic_wpa2_extract_gtk(const uint8_t kek[16],
         if (tag == 0xDDU && len >= 6U &&
             val[0] == 0x00U && val[1] == 0x0FU && val[2] == 0xACU && val[3] == 0x01U) {
             const uint8_t klen = (uint8_t)(len - 6U);
-            if (klen > 0U && klen <= AIC_MAC_SEC_KEY_LEN) {
+            if (klen > 0U && klen <= WPA2_KEY_LEN) {
                 *out_gtk_idx = (uint8_t)(val[4] & 0x03U);
                 *out_gtk_len = klen;
                 memcpy(out_gtk, &val[6], klen);
@@ -322,14 +329,14 @@ static inline int aic_wpa2_extract_gtk(const uint8_t kek[16],
 }
 
 typedef struct {
-    uint8_t  aa[AIC_MAC_ADDR_LEN];
-    uint8_t  spa[AIC_MAC_ADDR_LEN];
+    uint8_t  aa[WPA2_ADDR_LEN];
+    uint8_t  spa[WPA2_ADDR_LEN];
     uint8_t  pmk[32];
     uint8_t  anonce[32];
     uint8_t  snonce[32];
     uint8_t  ptk[64]; /* KCK[0..15] KEK[16..31] TK[32..47] */
     uint8_t  tptk[64]; /* from the latest M1; becomes ptk only once its M3's MIC checks out */
-    uint8_t  gtk[AIC_MAC_SEC_KEY_LEN];
+    uint8_t  gtk[WPA2_KEY_LEN];
     uint8_t  gtk_len;
     uint8_t  gtk_idx;
     uint8_t  rsn_ie[255]; /* M2 key data: the RSNE, and for FT-PSK also the MDE and FTE */
@@ -346,16 +353,16 @@ typedef struct {
     /* NULL: the 802.11i PRF. Set by a driver-specific feature (RTL FT-PSK) that derives the PTK another way */
     void (*derive_ptk)(const uint8_t pmk[32], const uint8_t snonce[32], const uint8_t anonce[32],
                        const uint8_t aa[6], const uint8_t spa[6], uint8_t ptk[64]);
-} aic_wpa2_ctx_t;
+} wpa2_ctx_t;
 
-static inline void aic_wpa2_ctx_init(aic_wpa2_ctx_t *ctx,
-                                     const uint8_t spa[6],
-                                     const uint8_t aa[6],
-                                     const uint8_t pmk[32],
-                                     const uint8_t *rsn_ie,
-                                     uint8_t rsn_ie_len,
-                                     uint8_t pairwise_cipher,
-                                     uint8_t group_cipher) {
+static inline void wpa2_ctx_init(wpa2_ctx_t *ctx,
+                                 const uint8_t spa[6],
+                                 const uint8_t aa[6],
+                                 const uint8_t pmk[32],
+                                 const uint8_t *rsn_ie,
+                                 uint8_t rsn_ie_len,
+                                 uint8_t pairwise_cipher,
+                                 uint8_t group_cipher) {
     memset(ctx, 0, sizeof(*ctx));
     memcpy(ctx->spa, spa, 6U);
     memcpy(ctx->aa, aa, 6U);
@@ -368,21 +375,21 @@ static inline void aic_wpa2_ctx_init(aic_wpa2_ctx_t *ctx,
     ctx->group_cipher    = group_cipher;
 }
 
-static inline int aic_wpa2_build_eapol_reply(const aic_wpa2_ctx_t *ctx,
-                                             const uint8_t *kck,
-                                             uint8_t eapol_ver,
-                                             uint8_t desc_type,
-                                             uint16_t key_ver,
-                                             uint16_t reply_info,
-                                             uint64_t replay,
-                                             const uint8_t *nonce,
-                                             const uint8_t *kd,
-                                             uint16_t kd_bytes,
-                                             uint8_t *out_eth,
-                                             size_t out_cap,
-                                             size_t *out_len) {
-    const size_t reply_body_len = AIC_EAPOL_KEY_BODY_MIN_LEN + (size_t)kd_bytes;
-    const size_t reply_pdu_len  = AIC_EAPOL_HDR_LEN + reply_body_len;
+static inline int wpa2_build_eapol_reply(const wpa2_ctx_t *ctx,
+                                         const uint8_t *kck,
+                                         uint8_t eapol_ver,
+                                         uint8_t desc_type,
+                                         uint16_t key_ver,
+                                         uint16_t reply_info,
+                                         uint64_t replay,
+                                         const uint8_t *nonce,
+                                         const uint8_t *kd,
+                                         uint16_t kd_bytes,
+                                         uint8_t *out_eth,
+                                         size_t out_cap,
+                                         size_t *out_len) {
+    const size_t reply_body_len = EAPOL_KEY_BODY_MIN_LEN + (size_t)kd_bytes;
+    const size_t reply_pdu_len  = EAPOL_HDR_LEN + reply_body_len;
     const size_t reply_eth_len  = 14U + reply_pdu_len;
     if (reply_eth_len > out_cap) {
         return -1;
@@ -396,23 +403,23 @@ static inline int aic_wpa2_build_eapol_reply(const aic_wpa2_ctx_t *ctx,
     uint8_t *rpdu = &out_eth[14];
     rpdu[0] = eapol_ver;
     rpdu[1] = 3U; /* EAPOL-Key */
-    aic_wpa_put_be16(&rpdu[2], (uint16_t)reply_body_len);
+    wpa_put_be16(&rpdu[2], (uint16_t)reply_body_len);
 
     uint8_t *rbody = &rpdu[4];
     rbody[0] = desc_type;
-    aic_wpa_put_be16(&rbody[1], reply_info);
-    aic_wpa_put_be16(&rbody[3], 0U);
-    aic_wpa_put_be64(&rbody[5], replay);
+    wpa_put_be16(&rbody[1], reply_info);
+    wpa_put_be16(&rbody[3], 0U);
+    wpa_put_be64(&rbody[5], replay);
     if (nonce) {
         memcpy(&rbody[13], nonce, 32U);
     }
-    aic_wpa_put_be16(&rbody[93], kd_bytes);
+    wpa_put_be16(&rbody[93], kd_bytes);
     if (kd && kd_bytes > 0U) {
         memcpy(&rbody[95], kd, kd_bytes);
     }
 
     uint8_t mic[16];
-    if (aic_wpa2_compute_eapol_mic(key_ver, kck, rpdu, reply_pdu_len, mic) != 0) {
+    if (wpa2_compute_eapol_mic(key_ver, kck, rpdu, reply_pdu_len, mic) != 0) {
         return -1;
     }
     memcpy(&rbody[77], mic, 16U);
@@ -432,9 +439,9 @@ static inline int aic_wpa2_build_eapol_reply(const aic_wpa2_ctx_t *ctx,
  */
 /* unwraps the GTK into ctx: 1 = a new one, 0 = the one we hold (installing it again would reset its RX
    replay counter, KRACK), -1 = does not unwrap */
-static inline int aic_wpa2_take_gtk(aic_wpa2_ctx_t *ctx, const uint8_t *kek, const uint8_t *kd, uint16_t kd_len) {
+static inline int wpa2_take_gtk(wpa2_ctx_t *ctx, const uint8_t *kek, const uint8_t *kd, uint16_t kd_len) {
     uint8_t gtk[sizeof(ctx->gtk)], gtk_len = 0U, gtk_idx = 0U;
-    if (aic_wpa2_extract_gtk(kek, kd, kd_len, &gtk_idx, gtk, &gtk_len) != 0) {
+    if (wpa2_extract_gtk(kek, kd, kd_len, &gtk_idx, gtk, &gtk_len) != 0) {
         return -1;
     }
     const bool same = ctx->has_gtk && gtk_idx == ctx->gtk_idx && gtk_len == ctx->gtk_len &&
@@ -446,20 +453,20 @@ static inline int aic_wpa2_take_gtk(aic_wpa2_ctx_t *ctx, const uint8_t *kek, con
     return same ? 0 : 1;
 }
 
-static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
-                                           const uint8_t *eth_in,
-                                           size_t eth_in_len,
-                                           uint8_t *out_eth,
-                                           size_t out_cap,
-                                           size_t *out_len,
-                                           bool *out_keys_ready,
-                                           bool *out_gtk_rekey) {
+static inline int wpa2_handle_rx_eapol(wpa2_ctx_t *ctx,
+                                       const uint8_t *eth_in,
+                                       size_t eth_in_len,
+                                       uint8_t *out_eth,
+                                       size_t out_cap,
+                                       size_t *out_len,
+                                       bool *out_keys_ready,
+                                       bool *out_gtk_rekey) {
     if (out_len) *out_len = 0U;
     if (out_keys_ready) *out_keys_ready = false;
     if (out_gtk_rekey) *out_gtk_rekey = false;
 
     if (!ctx || !eth_in || !out_eth || !out_len ||
-        eth_in_len < 14U + AIC_EAPOL_HDR_LEN + AIC_EAPOL_KEY_BODY_MIN_LEN) {
+        eth_in_len < 14U + EAPOL_HDR_LEN + EAPOL_KEY_BODY_MIN_LEN) {
         return 0;
     }
 
@@ -468,8 +475,8 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
     if (pdu[1] != 3U) { /* not EAPOL-Key */
         return 0;
     }
-    const uint16_t body_len = aic_wpa_get_be16(&pdu[2]);
-    if (body_len < AIC_EAPOL_KEY_BODY_MIN_LEN || (size_t)body_len + 4U > pdu_len) {
+    const uint16_t body_len = wpa_get_be16(&pdu[2]);
+    if (body_len < EAPOL_KEY_BODY_MIN_LEN || (size_t)body_len + 4U > pdu_len) {
         return 0;
     }
 
@@ -479,18 +486,18 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
         return 0;
     }
 
-    const uint16_t key_info = aic_wpa_get_be16(&key_body[1]);
-    const uint16_t key_ver  = (uint16_t)(key_info & AIC_KEY_INFO_VER_MASK);
-    const uint64_t replay   = aic_wpa_get_be64(&key_body[5]);
-    const uint16_t kd_len   = aic_wpa_get_be16(&key_body[93]);
-    if (AIC_EAPOL_KEY_BODY_MIN_LEN + (size_t)kd_len > (size_t)body_len) {
+    const uint16_t key_info = wpa_get_be16(&key_body[1]);
+    const uint16_t key_ver  = (uint16_t)(key_info & WPA_KEY_INFO_VER_MASK);
+    const uint64_t replay   = wpa_get_be64(&key_body[5]);
+    const uint16_t kd_len   = wpa_get_be16(&key_body[93]);
+    if (EAPOL_KEY_BODY_MIN_LEN + (size_t)kd_len > (size_t)body_len) {
         return 0;
     }
 
-    const bool is_pw  = (key_info & AIC_KEY_INFO_PAIRWISE) != 0U;
-    const bool is_ack = (key_info & AIC_KEY_INFO_ACK) != 0U;
-    const bool is_mic = (key_info & AIC_KEY_INFO_MIC) != 0U;
-    const bool is_enc = (key_info & AIC_KEY_INFO_ENC_KEY_DATA) != 0U;
+    const bool is_pw  = (key_info & WPA_KEY_INFO_PAIRWISE) != 0U;
+    const bool is_ack = (key_info & WPA_KEY_INFO_ACK) != 0U;
+    const bool is_mic = (key_info & WPA_KEY_INFO_MIC) != 0U;
+    const bool is_enc = (key_info & WPA_KEY_INFO_ENC_KEY_DATA) != 0U;
 
     if (!is_ack) {
         return 0;
@@ -510,20 +517,20 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
         if (ctx->derive_ptk) {
             ctx->derive_ptk(ctx->pmk, ctx->snonce, ctx->anonce, ctx->aa, ctx->spa, ctx->tptk);
         } else {
-            aic_wpa2_derive_ptk(ctx->pmk,
-                                ctx->aa,
-                                ctx->spa,
-                                ctx->anonce,
-                                ctx->snonce,
-                                (key_ver == AIC_KEY_INFO_VER_AES_CMAC || key_ver == 0U),
-                                ctx->tptk);
+            wpa2_derive_ptk(ctx->pmk,
+                            ctx->aa,
+                            ctx->spa,
+                            ctx->anonce,
+                            ctx->snonce,
+                            (key_ver == WPA_KEY_INFO_VER_AES_CMAC || key_ver == 0U),
+                            ctx->tptk);
         }
         ctx->has_tptk = true;
 
-        const uint16_t m2_info = (uint16_t)(key_ver | AIC_KEY_INFO_PAIRWISE | AIC_KEY_INFO_MIC);
-        return aic_wpa2_build_eapol_reply(ctx, ctx->tptk, pdu[0], desc_type, key_ver, m2_info, replay,
-                                          ctx->snonce, ctx->rsn_ie, ctx->rsn_ie_len,
-                                          out_eth, out_cap, out_len);
+        const uint16_t m2_info = (uint16_t)(key_ver | WPA_KEY_INFO_PAIRWISE | WPA_KEY_INFO_MIC);
+        return wpa2_build_eapol_reply(ctx, ctx->tptk, pdu[0], desc_type, key_ver, m2_info, replay,
+                                      ctx->snonce, ctx->rsn_ie, ctx->rsn_ie_len,
+                                      out_eth, out_cap, out_len);
     }
     if (!is_mic) {
         return 0;
@@ -535,7 +542,7 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
     if (!(is_pw ? ctx->has_tptk : ctx->has_ptk)) {
         return 0;
     }
-    if (aic_wpa2_compute_eapol_mic(key_ver, key, pdu, AIC_EAPOL_HDR_LEN + body_len, calc_mic) != 0) {
+    if (wpa2_compute_eapol_mic(key_ver, key, pdu, EAPOL_HDR_LEN + body_len, calc_mic) != 0) {
         return -1;
     }
     if (memcmp(calc_mic, &key_body[77], 16U) != 0 || (ctx->replay_set && replay <= ctx->last_replay)) {
@@ -549,13 +556,13 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
         if (memcmp(ctx->anonce, &key_body[13], 32U) != 0) {
             return 0;
         }
-        if (is_enc && kd_len > 0U && aic_wpa2_take_gtk(ctx, &ctx->tptk[16], &key_body[95], kd_len) && out_gtk_rekey) {
+        if (is_enc && kd_len > 0U && wpa2_take_gtk(ctx, &ctx->tptk[16], &key_body[95], kd_len) && out_gtk_rekey) {
             *out_gtk_rekey = true;
         }
-        const uint16_t m4_info = (uint16_t)(key_ver | AIC_KEY_INFO_PAIRWISE |
-                                            AIC_KEY_INFO_MIC | AIC_KEY_INFO_SECURE);
-        const int rc = aic_wpa2_build_eapol_reply(ctx, ctx->tptk, pdu[0], desc_type, key_ver, m4_info, replay,
-                                                  NULL, NULL, 0U, out_eth, out_cap, out_len);
+        const uint16_t m4_info = (uint16_t)(key_ver | WPA_KEY_INFO_PAIRWISE |
+                                            WPA_KEY_INFO_MIC | WPA_KEY_INFO_SECURE);
+        const int rc = wpa2_build_eapol_reply(ctx, ctx->tptk, pdu[0], desc_type, key_ver, m4_info, replay,
+                                              NULL, NULL, 0U, out_eth, out_cap, out_len);
         if (rc == 1) {
             /* a retransmitted M3 gets its M4 again but must not reinstall the key (KRACK) */
             if (out_keys_ready) *out_keys_ready = !ctx->ptk_done;
@@ -568,13 +575,13 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
 
     /* 3. Group Key Handshake M1: Pairwise=0, Ack=1, MIC=1, EncryptedKeyData=1 */
     if (is_enc && kd_len > 0U) {
-        const int fresh = aic_wpa2_take_gtk(ctx, &ctx->ptk[16], &key_body[95], kd_len);
+        const int fresh = wpa2_take_gtk(ctx, &ctx->ptk[16], &key_body[95], kd_len);
         if (fresh < 0) {
             return -1;
         }
-        const uint16_t gm2_info = (uint16_t)(key_ver | AIC_KEY_INFO_MIC | AIC_KEY_INFO_SECURE);
-        const int rc = aic_wpa2_build_eapol_reply(ctx, ctx->ptk, pdu[0], desc_type, key_ver, gm2_info, replay,
-                                                  NULL, NULL, 0U, out_eth, out_cap, out_len);
+        const uint16_t gm2_info = (uint16_t)(key_ver | WPA_KEY_INFO_MIC | WPA_KEY_INFO_SECURE);
+        const int rc = wpa2_build_eapol_reply(ctx, ctx->ptk, pdu[0], desc_type, key_ver, gm2_info, replay,
+                                              NULL, NULL, 0U, out_eth, out_cap, out_len);
         if (rc == 1 && out_gtk_rekey) {
             *out_gtk_rekey = fresh == 1;
         }
@@ -584,8 +591,53 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
     return 0;
 }
 
+/* IEEE 802.11-2016 12.7.1.7.2 KDF-Hash-Length with SHA256 (label without NUL); bits a multiple of 8 */
+static inline void wpa_kdf_sha256(const uint8_t *key, size_t key_len, const char *label,
+                                  const uint8_t *ctx, size_t ctx_len, uint8_t *out, uint16_t bits) {
+    const uint8_t len_le[2] = { (uint8_t)bits, (uint8_t)(bits >> 8U) };
+    const size_t n = bits / 8U;
+    uint8_t d[CC_SHA256_DIGEST_LENGTH];
+    for (uint16_t i = 1U; (size_t)(i - 1U) * 32U < n; ++i) {
+        const uint8_t ctr[2] = { (uint8_t)i, (uint8_t)(i >> 8U) };
+        const size_t off = (size_t)(i - 1U) * 32U;
+        CCHmacContext h;
+        CCHmacInit(&h, kCCHmacAlgSHA256, key, key_len);
+        CCHmacUpdate(&h, ctr, 2U);
+        CCHmacUpdate(&h, label, strlen(label));
+        CCHmacUpdate(&h, ctx, ctx_len);
+        CCHmacUpdate(&h, len_le, 2U);
+        CCHmacFinal(&h, d);
+        memcpy(out + off, d, n - off < 32U ? n - off : 32U);
+    }
+}
+
+/* PMF: the IGTK KDE (00-0f-ac:9) of an EAPOL-Key frame wpa2_handle_rx_eapol just accepted (M3 or group M1,
+   so its KEK is in ptk now). out: IGTK then IPN, the BIP-CMAC-128 key wifi_add_key takes. Returns the key ID
+   (4 or 5), 0 when there is none. */
+static inline int wpa2_igtk(const wpa2_ctx_t *c, const uint8_t *eth, size_t len, uint8_t out[22]) {
+    uint8_t kd[512];
+    if (len < 14U + 4U + 95U) return 0;
+    const uint8_t *b = &eth[18];
+    const size_t kl = wpa_get_be16(&b[93]);
+    size_t n = kl - 8U;
+    if (!(wpa_get_be16(&b[1]) & WPA_KEY_INFO_ENC_KEY_DATA) || kl < 24U || kl % 8U || n > sizeof(kd) ||
+        18U + 95U + kl > len ||
+        CCSymmetricKeyUnwrap(kCCWRAPAES, CCrfc3394_iv, CCrfc3394_ivLen, &c->ptk[16], 16U, &b[95], kl, kd, &n) != 0)
+        return 0;
+    for (size_t o = 0U; o + 2U <= n && kd[o + 1] + 2U <= n - o; o += kd[o + 1] + 2U) {
+        const uint8_t *e = &kd[o];
+        if (e[0] == 0xddU && e[1] >= 4U + 2U + 6U + 16U && !memcmp(&e[2], "\x00\x0f\xac\x09", 4U)) {
+            const int id = e[6] | e[7] << 8;
+            memcpy(out, &e[14], 16U);
+            memcpy(&out[16], &e[8], 6U);
+            return id == 4 || id == 5 ? id : 0;
+        }
+    }
+    return 0;
+}
+
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* AIC8800_WPA2_H */
+#endif /* WPA2_H */

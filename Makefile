@@ -28,7 +28,7 @@ build/fwload.o: third_party/yokitea/fwload/main.c $(YK_HDR)
 # Realtek RTL8852BU: upstream Linux rtw89 (GPL-2.0 OR BSD-3-Clause, unmodified) on the src/lkpi mac80211 shim
 RTW_OBJ  = $(patsubst third_party/rtw89/%.c,build/rtw/%.o,$(wildcard third_party/rtw89/*.c))
 LK_OBJ   = $(patsubst %,build/lk/%.o,kernel usb mac80211 mlme cdcap) build/lk/rtw89_led.o
-LK_HDR   = $(wildcard src/lkpi/include/*.h src/lkpi/include/*/*.h) src/lkpi/local.h src/lkpi/ccmp.h src/rtwd.h src/wifi_drv.h $(YK_HDR)
+LK_HDR   = $(wildcard src/lkpi/include/*.h src/lkpi/include/*/*.h) src/lkpi/local.h src/lkpi/ccmp.h src/rtw89/rtwd.h src/wifi_drv.h src/rx_reord.h
 build/rtw/%.o: third_party/rtw89/%.c $(LK_HDR)
 	@mkdir -p $(@D)
 	$(CC) -c -std=gnu11 -O2 -Isrc/lkpi/include -DCONFIG_RTW89_DEBUGMSG -Wno-everything $< -o $@
@@ -37,11 +37,11 @@ build/lk/rtw89_led.o: src/lkpi/rtw89_led.c $(LK_HDR)
 	$(CC) -c -std=gnu11 -O2 -Isrc/lkpi/include -Ithird_party/rtw89 -Wno-everything $< -o $@
 build/lk/%.o: src/lkpi/%.c $(LK_HDR)
 	@mkdir -p $(@D)
-	$(CC) -c -std=gnu11 $(CFLAGS) -Isrc/lkpi/include -Ithird_party/yokitea/common -I$(USB_DIR)/include/libusb-1.0 $< -o $@
+	$(CC) -c -std=gnu11 $(CFLAGS) -Isrc/lkpi/include -I$(USB_DIR)/include/libusb-1.0 $< -o $@
 
-# station core + one src/drv_<chip>.c per chip family (wifi_drv.h)
-CORE_SRC = src/usbwifid.c src/usbwifi_core.c src/drv_aic8800.c src/drv_rtw89.c
-build/usbwifid: $(CORE_SRC) src/usbwifi_core.h src/wifi_drv.h src/rtwd.h src/rtl_extras.h src/rtl_sae.h $(YK_HDR) build/fwload.o $(RTW_OBJ) $(LK_OBJ)
+# station core + one src/<chip>/drv_<chip>.c per chip family (wifi_drv.h)
+CORE_SRC = src/usbwifid.c src/usbwifi_core.c src/aic8800/drv_aic8800.c src/rtw89/drv_rtw89.c
+build/usbwifid: $(CORE_SRC) src/usbwifi_core.h src/wifi_drv.h src/wpa2.h src/rx_reord.h src/rtw89/rtwd.h src/wifi_ctl.h src/ft.h src/wpa3.h $(YK_HDR) build/fwload.o $(RTW_OBJ) $(LK_OBJ)
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INC) $(CORE_SRC) build/fwload.o $(RTW_OBJ) $(LK_OBJ) -o $@ $(USB) $(FW) -framework DiskArbitration
 	install_name_tool -change $$(otool -L $@ | awk '/libusb/{print $$1}') @executable_path/libusb-1.0.0.dylib $@
@@ -108,17 +108,17 @@ check: build/usbwifid build/libusb-1.0.0.dylib build/wpa2_test build/reord_test 
 	./build/mac80211_test
 	AICD_NO_NET=1 ./build/usbwifid scan
 
-build/wpa2_test: tests/wpa2_test.c third_party/yokitea/common/aic8800_wpa2.h src/rtl_extras.h src/rtl_sae.h src/lkpi/ccmp.h
+build/wpa2_test: tests/wpa2_test.c src/wpa2.h src/wifi_ctl.h src/ft.h src/wpa3.h src/lkpi/ccmp.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INC) $< -o $@
-build/reord_test: tests/reord_test.c third_party/yokitea/common/aic8800_reord.h
+build/reord_test: tests/reord_test.c src/rx_reord.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INC) $< -o $@
-build/drv_contract_test: tests/drv_contract_test.c src/usbwifi_core.c src/usbwifi_core.h src/wifi_drv.h
+build/drv_contract_test: tests/drv_contract_test.c src/usbwifi_core.c src/usbwifi_core.h src/wifi_drv.h src/wifi_ctl.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INC) -DWIFI_RUN_DIR='"build/run"' $(filter %.c,$^) $(USB) -framework IOKit -o $@
 build/kernel_test: src/lkpi/tests/kernel_test.c src/lkpi/kernel.c $(LK_HDR)
 	$(CC) -std=gnu11 -Isrc/lkpi/include -Isrc/lkpi $(filter %.c,$^) -o $@
 build/mac80211_test: src/lkpi/tests/mac80211_test.c src/lkpi/mac80211.c src/lkpi/kernel.c $(LK_HDR)
-	$(CC) -std=gnu11 -Wno-everything -Isrc/lkpi/include -Isrc/lkpi -Ithird_party/yokitea/common $(filter %.c,$^) -o $@
+	$(CC) -std=gnu11 -Wno-everything -Isrc/lkpi/include -Isrc/lkpi $(filter %.c,$^) -o $@
 .PHONY: check

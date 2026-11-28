@@ -46,7 +46,7 @@ static struct {
     bool scanning, scan_done, associated, link_up;
     uint8_t ap_bssid[6], ap_qos, ap_band, ap_width;
     uint16_t ap_center_freq, assoc_status, disconnect_reason;
-    uint8_t target_ssid[AIC_MAC_SSID_LEN], target_ssid_len;
+    uint8_t target_ssid[WIFI_SSID_LEN], target_ssid_len;
     wifi_scan_bss_t scan_bss[WIFI_MAX_SCAN_BSS];
     uint16_t scan_count;
     wifi_eapol_frame_t eapol_ring[WIFI_EAPOL_RING_CAP];
@@ -112,7 +112,7 @@ static void scan_add(wifi_scan_bss_t bss) {
     }
     if (match >= 0) {
         wifi_scan_bss_t *o = &g.scan_bss[match];
-        if (bss.ssid_len == 0 && o->ssid_len) { bss.ssid_len = o->ssid_len; memcpy(bss.ssid, o->ssid, AIC_MAC_SSID_LEN); }
+        if (bss.ssid_len == 0 && o->ssid_len) { bss.ssid_len = o->ssid_len; memcpy(bss.ssid, o->ssid, WIFI_SSID_LEN); }
         if (bss.sec_mask == 0 && o->sec_mask) {
             bss.sec_mask = o->sec_mask; bss.pairwise_cipher = o->pairwise_cipher;
             bss.group_cipher = o->group_cipher; bss.rsn_capab = o->rsn_capab;
@@ -127,15 +127,8 @@ static void scan_add(wifi_scan_bss_t bss) {
 }
 
 static void ev_bss(const uint8_t *mgmt, size_t len, uint16_t freq, int8_t rssi) {
-    /* the beacon IE parser (wifi_ctl.h) takes the frame behind a scan-result header */
-    uint8_t buf[sizeof(aic_scanu_result_ind_hdr_t) + 2400];
-    aic_scanu_result_ind_hdr_t h = { .length = (uint16_t)len, .center_freq = freq,
-                                     .band = freq > 4000 ? AIC_PHY_BAND_5G : AIC_PHY_BAND_2G4, .rssi = rssi };
     wifi_scan_bss_t bss;
-    if (len > sizeof(buf) - sizeof(h)) return;
-    memcpy(buf, &h, sizeof(h));
-    memcpy(buf + sizeof(h), mgmt, len);
-    if (aic_parse_scanu_result_ind(buf, sizeof(h) + len, &bss) == 0) scan_add(bss);
+    if (wifi_parse_bss(mgmt, len, freq, rssi, &bss) == 0) scan_add(bss);
 }
 
 static void ev_scan_done(bool aborted) {
@@ -451,7 +444,7 @@ kern_return_t wifi_get_status(io_connect_t conn, wifi_status_t *o) {
     o->eapol_rx_total = g.eapol_total;
     o->ssid_len = g.target_ssid_len;
     memcpy(o->ap_bssid, g.ap_bssid, 6);
-    memcpy(o->ssid, g.target_ssid, AIC_MAC_SSID_LEN);
+    memcpy(o->ssid, g.target_ssid, WIFI_SSID_LEN);
     pthread_mutex_unlock(&g.state_lock);
     return KERN_SUCCESS;
 }
@@ -497,7 +490,7 @@ kern_return_t wifi_connect_ft(io_connect_t conn, const wifi_connect_req_t *in, w
     (void)conn;
     if (!g.started) return kIOReturnNotReady;
     if (ft && !wifi_has_ft()) return kIOReturnUnsupported;
-    if (in->ssid_len == 0 || in->ssid_len > AIC_MAC_SSID_LEN || in->ie_len > WIFI_CONNECT_IE_MAX)
+    if (in->ssid_len == 0 || in->ssid_len > WIFI_SSID_LEN || in->ie_len > WIFI_CONNECT_IE_MAX)
         return kIOReturnBadArgument;
     *out = *in;
     out->out_status = 0xFF;
@@ -568,7 +561,7 @@ kern_return_t wifi_send_eapol(io_connect_t conn, const uint8_t *eth, size_t len)
 static uint32_t cipher_suite(uint8_t cipher) {
     for (uint8_t s = 1; s <= 13; s++) {
         const uint8_t sel[4] = { 0x00, 0x0F, 0xAC, s };
-        if (aic_rsn_cipher_suite_to_mac(sel) == cipher) return 0x000FAC00U | s;
+        if (wifi_cipher_from_suite(sel) == cipher) return 0x000FAC00U | s;
     }
     return 0;
 }
@@ -577,7 +570,7 @@ kern_return_t wifi_add_key(io_connect_t conn, uint8_t key_idx, bool pairwise, ui
                            const uint8_t *key, uint8_t key_len, uint8_t *out_hw_idx) {
     (void)conn;
     if (!g.started || !g.associated) return kIOReturnNotReady;
-    if (key_len > AIC_MAC_SEC_KEY_LEN) return kIOReturnBadArgument;
+    if (key_len > WIFI_KEY_LEN) return kIOReturnBadArgument;
     const uint32_t suite = cipher_suite(cipher);
     if (!suite) return kIOReturnUnsupported;
     if (out_hw_idx) *out_hw_idx = pairwise ? 0 : key_idx;

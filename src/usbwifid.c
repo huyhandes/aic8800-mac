@@ -41,11 +41,10 @@
 #include <mach-o/dyld.h>
 #include <xpc/xpc.h>
 
-#include "aic8800_abi.h"
-#include "aic8800_wifi_ctl.h"
-#include "rtl_sae.h"
+#include "ft.h"
+#include "wpa3.h"
 #include "usbwifi_core.h" /* in-process station core + chip drivers replace the kext */
-#include "rtwd.h"
+#include "rtw89/rtwd.h"
 
 /* per adapter slot: slot 0 keeps the single-dongle wifi.conf, slot N uses wifi-N.conf */
 static char g_conf_path[PATH_MAX] = WIFI_CONF_DIR "/wifi.conf";
@@ -53,7 +52,7 @@ static char g_conf_path[PATH_MAX] = WIFI_CONF_DIR "/wifi.conf";
 static char g_sock_path[104] = WIFI_RUN_DIR "/0.sock";
 #define WIFI_CONF_PATH g_conf_path
 #define WIFI_SOCK_PATH g_sock_path
-#define AIC_IPC_BUF_SIZE   32768U
+#define IPC_BUF_SIZE   32768U
 
 extern char **environ;
 
@@ -131,19 +130,19 @@ static int cmp_bss_rssi_desc(const void *a, const void *b) {
 }
 
 static void format_sec_str(uint32_t m, char *buf, size_t cap) {
-    if ((m & AIC_SEC_WPA2_PSK) && (m & AIC_SEC_WPA3_SAE)) {
+    if ((m & WIFI_SEC_WPA2_PSK) && (m & WIFI_SEC_WPA3_SAE)) {
         snprintf(buf, cap, "WPA2/WPA3");
-    } else if (m & AIC_SEC_WPA3_SAE) {
+    } else if (m & WIFI_SEC_WPA3_SAE) {
         snprintf(buf, cap, "WPA3-SAE");
-    } else if ((m & AIC_SEC_WPA2_PSK) && (m & AIC_SEC_WPA_PSK)) {
+    } else if ((m & WIFI_SEC_WPA2_PSK) && (m & WIFI_SEC_WPA_PSK)) {
         snprintf(buf, cap, "WPA/WPA2");
-    } else if (m & AIC_SEC_WPA2_PSK) {
-        snprintf(buf, cap, (m & AIC_SEC_SHA256) ? "WPA2-SHA256" : "WPA2-PSK");
-    } else if (m & AIC_SEC_WPA_PSK) {
+    } else if (m & WIFI_SEC_WPA2_PSK) {
+        snprintf(buf, cap, (m & WIFI_SEC_SHA256) ? "WPA2-SHA256" : "WPA2-PSK");
+    } else if (m & WIFI_SEC_WPA_PSK) {
         snprintf(buf, cap, "WPA-PSK");
-    } else if (m & AIC_SEC_8021X) {
+    } else if (m & WIFI_SEC_8021X) {
         snprintf(buf, cap, "802.1X");
-    } else if (m & AIC_SEC_PRIVACY) {
+    } else if (m & WIFI_SEC_PRIVACY) {
         snprintf(buf, cap, "WEP/ENC");
     } else {
         snprintf(buf, cap, "OPEN");
@@ -311,7 +310,7 @@ static void apply_mac(const char *ssid, size_t ssid_len) {
     uint8_t s[32], m[6];
     if (!wifi_has_set_mac()) return;
     const bool rnd = mr_pref() && mac_secret(s);
-    if (rnd) rtl_random_mac(s, wifi_slot() < 0 ? 0 : wifi_slot(), (const uint8_t *)ssid, ssid_len, m);
+    if (rnd) wifi_random_mac(s, wifi_slot() < 0 ? 0 : wifi_slot(), (const uint8_t *)ssid, ssid_len, m);
     const int r = wifi_set_mac(rnd ? m : NULL);
     if (r) fprintf(stderr, "warn: station address change failed (%d), keeping the current one\n", r);
 }
@@ -403,7 +402,7 @@ static bool roam_check(io_connect_t conn, const wifi_status_t *st) {
         const wifi_scan_bss_t *b = &list.bss[i];
         if (b->ssid_len != ssid_len || memcmp(b->ssid, known_ssid, ssid_len) != 0) continue;
         if (memcmp(b->bssid, st->ap_bssid, 6) == 0) { cur.rssi = b->rssi; continue; } /* same scan, fair compare */
-        if ((last_bss.sec_mask & AIC_SEC_WPA2_PSK) && !(b->sec_mask & AIC_SEC_WPA2_PSK)) continue; /* last_bss = now */
+        if ((last_bss.sec_mask & WIFI_SEC_WPA2_PSK) && !(b->sec_mask & WIFI_SEC_WPA2_PSK)) continue; /* last_bss = now */
         if (pinned) continue;
         if (btm && memcmp(b->bssid, hb, 6) == 0) pinned = true;
         if (pinned || !best || band_score(b, pref) > band_score(best, pref)) best = b;
@@ -426,7 +425,7 @@ static bool roam_check(io_connect_t conn, const wifi_status_t *st) {
     return true;
 }
 
-static int install_keys(io_connect_t conn, const aic_wpa2_ctx_t *c, char *err_buf, size_t err_cap) {
+static int install_keys(io_connect_t conn, const wpa2_ctx_t *c, char *err_buf, size_t err_cap) {
     uint8_t hw_idx = 0U;
     kern_return_t kr = wifi_add_key(conn, 0U, true, c->pairwise_cipher, &c->ptk[32], 16U, &hw_idx);
     if (kr != KERN_SUCCESS) {
@@ -449,10 +448,10 @@ static int install_keys(io_connect_t conn, const aic_wpa2_ctx_t *c, char *err_bu
 
 /* RTL with PMF: the IGTK from an accepted M3 or group M1, so mlme can check BIP on broadcast deauth/disassoc.
    Sent again on every group handshake: mlme keeps the replay counter of a key it already holds. */
-static void install_igtk(io_connect_t conn, const aic_wpa2_ctx_t *c, const uint8_t *eth, size_t len) {
+static void install_igtk(io_connect_t conn, const wpa2_ctx_t *c, const uint8_t *eth, size_t len) {
     uint8_t k[22], hw_idx = 0U;
-    const int id = wifi_has_ft() ? rtl_igtk(c, eth, len, k) : 0;
-    if (id && wifi_add_key(conn, (uint8_t)id, false, AIC_CIPHER_BIP_CMAC_128, k, sizeof(k), &hw_idx) == KERN_SUCCESS) {
+    const int id = wifi_has_ft() ? wpa2_igtk(c, eth, len, k) : 0;
+    if (id && wifi_add_key(conn, (uint8_t)id, false, WIFI_CIPHER_BIP_CMAC_128, k, sizeof(k), &hw_idx) == KERN_SUCCESS) {
         printf("      Installed IGTK idx=%d\n", id);
     }
 }
@@ -462,7 +461,7 @@ static int perform_connect(io_connect_t conn,
                            const char *ssid_arg,
                            const char *passphrase,
                            bool run_dhcp,
-                           aic_wpa2_ctx_t *out_wpa_ctx,
+                           wpa2_ctx_t *out_wpa_ctx,
                            bool *out_is_open,
                            char *err_buf,
                            size_t err_cap) {
@@ -506,7 +505,7 @@ static int perform_connect(io_connect_t conn,
     const char *pref = band_pref();
     const bool last_band_ok = strcmp(pref, "auto") == 0 || (pref[0] == '5') == (last_bss.freq >= 5000U);
     /* with a passphrase only a WPA2 BSS will do: a same-named open AP must not get the traffic */
-    const bool sec_ok = !passphrase || (last_bss.sec_mask & AIC_SEC_WPA2_PSK) != 0U;
+    const bool sec_ok = !passphrase || (last_bss.sec_mask & WIFI_SEC_WPA2_PSK) != 0U;
     if (fast && have_last && last_band_ok && sec_ok && !getenv("AICD_ALWAYS_SCAN")) {
         printf("[1/4] Reusing last BSS for \"%s\" (no scan)...\n", ssid_arg);
         target = &last_bss;
@@ -524,7 +523,7 @@ static int perform_connect(io_connect_t conn,
         for (uint16_t i = 0U; i < list.count; ++i) {
             const wifi_scan_bss_t *b = &list.bss[i];
             if (b->ssid_len != ssid_len || memcmp(b->ssid, ssid_arg, ssid_len) != 0) continue;
-            if (passphrase && !(b->sec_mask & AIC_SEC_WPA2_PSK)) continue;
+            if (passphrase && !(b->sec_mask & WIFI_SEC_WPA2_PSK)) continue;
             const int score = band_score(b, pref);
             if (score > best) { best = score; target = b; }
             bool dup = false;
@@ -553,10 +552,10 @@ static int perform_connect(io_connect_t conn,
            target->bssid[3], target->bssid[4], target->bssid[5],
            target->freq, (int)target->rssi, sec_str);
 
-    const bool is_open = (target->sec_mask & (AIC_SEC_PRIVACY | AIC_SEC_WPA_PSK | AIC_SEC_WPA2_PSK | AIC_SEC_WPA3_SAE | AIC_SEC_8021X)) == 0U;
-    const bool has_wpa2 = (target->sec_mask & AIC_SEC_WPA2_PSK) != 0U;
+    const bool is_open = (target->sec_mask & (WIFI_SEC_PRIVACY | WIFI_SEC_WPA_PSK | WIFI_SEC_WPA2_PSK | WIFI_SEC_WPA3_SAE | WIFI_SEC_8021X)) == 0U;
+    const bool has_wpa2 = (target->sec_mask & WIFI_SEC_WPA2_PSK) != 0U;
     /* WPA3-SAE (with PMF) when the driver connects through ft_connect (RTL); WPA2-PSK after SAE failed once */
-    const bool try_sae = (target->sec_mask & AIC_SEC_WPA3_SAE) && wifi_has_ft() && !(sae_off && has_wpa2);
+    const bool try_sae = (target->sec_mask & WIFI_SEC_WPA3_SAE) && wifi_has_ft() && !(sae_off && has_wpa2);
 
     if (!is_open && !has_wpa2 && !try_sae) {
         set_err(err_buf, err_cap, "Unsupported security: %s (needs OPEN or WPA2-PSK)", sec_str);
@@ -574,14 +573,14 @@ static int perform_connect(io_connect_t conn,
             fprintf(stderr, "error: valid 8..63 char passphrase required for %s\n", sec_str);
             return 1;
         }
-        if (aic_wpa2_derive_pmk(passphrase, strlen(passphrase),
-                                target->ssid, target->ssid_len, pmk) != 0) {
+        if (wpa2_derive_pmk(passphrase, strlen(passphrase),
+                            target->ssid, target->ssid_len, pmk) != 0) {
             set_err(err_buf, err_cap, "PBKDF2 passphrase derivation failed");
             fprintf(stderr, "error: PBKDF2 passphrase derivation failed\n");
             return 1;
         }
-        const uint8_t grp = (target->group_cipher != AIC_CIPHER_INVALID) ? target->group_cipher : AIC_CIPHER_CCMP;
-        rsn_ie_len = aic_build_wpa2_rsn_ie(rsn_ie, grp, false);
+        const uint8_t grp = (target->group_cipher != WIFI_CIPHER_INVALID) ? target->group_cipher : WIFI_CIPHER_CCMP;
+        rsn_ie_len = wifi_build_wpa2_rsn_ie(rsn_ie, grp, false);
     }
 
     /* FT-PSK when the driver has it: the driver says unsupported, before authenticating, when the AP has no FT */
@@ -612,20 +611,20 @@ static int perform_connect(io_connect_t conn,
         memcpy(ft.prev_bssid, ft_prev, 6U);
     }
 
-    printf("[2/4] Associating via SM_CONNECT_REQ...\n");
+    printf("[2/4] Associating...\n");
     wifi_connect_req_t creq;
     wifi_connect_req_t cresp;
     memset(&cresp, 0, sizeof(cresp)); /* read in the error message even when wifi_connect fails early */
     memset(&creq, 0, sizeof(creq));
     creq.ssid_len = target->ssid_len;
     memcpy(creq.ssid, target->ssid, target->ssid_len);
-    memcpy(creq.bssid, target->bssid, AIC_MAC_ADDR_LEN);
+    memcpy(creq.bssid, target->bssid, WIFI_ADDR_LEN);
     creq.band      = target->band;
     creq.freq      = target->freq;
     creq.auth_type = 0U;
     if (!is_open) {
-        creq.flags               = AIC_CONTROL_PORT_HOST | AIC_WPA_WPA2_IN_USE;
-        creq.ctrl_port_ethertype = htons(AIC_EAPOL_ETHERTYPE);
+        creq.flags               = WIFI_CONN_CONTROL_PORT_HOST | WIFI_CONN_WPA_WPA2_IN_USE;
+        creq.ctrl_port_ethertype = htons(EAPOL_ETHERTYPE);
         creq.ie_len              = (uint16_t)rsn_ie_len;
         memcpy(creq.ie_buf, rsn_ie, rsn_ie_len);
     }
@@ -641,8 +640,8 @@ static int perform_connect(io_connect_t conn,
         ft_off = true;
     }
     if (kr != KERN_SUCCESS || cresp.out_status != 0U) {
-        set_err(err_buf, err_cap, "SM_CONNECT_REQ failed (status=%u)", cresp.out_status);
-        fprintf(stderr, "error: SM_CONNECT_REQ failed kr=0x%08x fw_status=%u\n", kr, cresp.out_status);
+        set_err(err_buf, err_cap, "connect failed (status=%u)", cresp.out_status);
+        fprintf(stderr, "error: connect failed kr=0x%08x fw_status=%u\n", kr, cresp.out_status);
         return 1;
     }
 
@@ -676,14 +675,14 @@ static int perform_connect(io_connect_t conn,
            st.ap_sta_idx, st.ap_bssid[0], st.ap_bssid[1], st.ap_bssid[2],
            st.ap_bssid[3], st.ap_bssid[4], st.ap_bssid[5], st.ap_center_freq);
 
-    aic_wpa2_ctx_t local_ctx;
-    aic_wpa2_ctx_t *wpa_ctx = out_wpa_ctx ? out_wpa_ctx : &local_ctx;
+    wpa2_ctx_t local_ctx;
+    wpa2_ctx_t *wpa_ctx = out_wpa_ctx ? out_wpa_ctx : &local_ctx;
     if (!is_open && use_ft && ft_reassoc) {
         printf("[3/4] FT reassociation: keys from the PMK-R0, no 4-way handshake\n");
-        const uint8_t pw = (target->pairwise_cipher != AIC_CIPHER_INVALID) ? target->pairwise_cipher : AIC_CIPHER_CCMP;
-        const uint8_t grp = (target->group_cipher != AIC_CIPHER_INVALID) ? target->group_cipher : AIC_CIPHER_CCMP;
+        const uint8_t pw = (target->pairwise_cipher != WIFI_CIPHER_INVALID) ? target->pairwise_cipher : WIFI_CIPHER_CCMP;
+        const uint8_t grp = (target->group_cipher != WIFI_CIPHER_INVALID) ? target->group_cipher : WIFI_CIPHER_CCMP;
         /* shortcut: no M2 key data, so a PTK rekey by 4-way after an FT roam fails and reconnects; rare on PSK APs */
-        aic_wpa2_ctx_init(wpa_ctx, st.mac_addr, st.ap_bssid, g_ft.pmk_r1, NULL, 0U, pw, grp);
+        wpa2_ctx_init(wpa_ctx, st.mac_addr, st.ap_bssid, g_ft.pmk_r1, NULL, 0U, pw, grp);
         wpa_ctx->derive_ptk = ft_ptk;
         if (ft_finish(&g_ft, &ft, wpa_ctx) != 0) {
             set_err(err_buf, err_cap, "FT reassociation response did not check out");
@@ -696,8 +695,8 @@ static int perform_connect(io_connect_t conn,
         }
     } else if (!is_open) {
         printf("[3/4] Running WPA2-PSK 4-Way Handshake%s...\n", use_ft ? " (FT-PSK)" : try_sae ? (h2e ? " (WPA3-SAE H2E)" : " (WPA3-SAE)") : "");
-        const uint8_t pw = (target->pairwise_cipher != AIC_CIPHER_INVALID) ? target->pairwise_cipher : AIC_CIPHER_CCMP;
-        const uint8_t grp = (target->group_cipher != AIC_CIPHER_INVALID) ? target->group_cipher : AIC_CIPHER_CCMP;
+        const uint8_t pw = (target->pairwise_cipher != WIFI_CIPHER_INVALID) ? target->pairwise_cipher : WIFI_CIPHER_CCMP;
+        const uint8_t grp = (target->group_cipher != WIFI_CIPHER_INVALID) ? target->group_cipher : WIFI_CIPHER_CCMP;
         uint8_t kd[255];
         int kd_len = (int)rsn_ie_len;
         memcpy(kd, rsn_ie, rsn_ie_len);
@@ -715,7 +714,7 @@ static int perform_connect(io_connect_t conn,
                 return 1;
             }
         }
-        aic_wpa2_ctx_init(wpa_ctx, st.mac_addr, st.ap_bssid, use_ft ? g_ft.pmk_r1 : pmk, kd, (uint8_t)kd_len, pw, grp);
+        wpa2_ctx_init(wpa_ctx, st.mac_addr, st.ap_bssid, use_ft ? g_ft.pmk_r1 : pmk, kd, (uint8_t)kd_len, pw, grp);
         if (use_ft) {
             wpa_ctx->derive_ptk = ft_ptk;
         }
@@ -729,14 +728,14 @@ static int perform_connect(io_connect_t conn,
                 size_t reply_len = 0U;
                 bool keys_ready = false;
                 bool gtk_rekey  = false;
-                const int hrc = aic_wpa2_handle_rx_eapol(wpa_ctx,
-                                                         rx_frame.data,
-                                                         rx_frame.len,
-                                                         reply_eth,
-                                                         sizeof(reply_eth),
-                                                         &reply_len,
-                                                         &keys_ready,
-                                                         &gtk_rekey);
+                const int hrc = wpa2_handle_rx_eapol(wpa_ctx,
+                                                     rx_frame.data,
+                                                     rx_frame.len,
+                                                     reply_eth,
+                                                     sizeof(reply_eth),
+                                                     &reply_len,
+                                                     &keys_ready,
+                                                     &gtk_rekey);
                 if (hrc < 0) { /* a bad MIC is dropped (0): -1 is a local crypto or key-unwrap failure */
                     set_err(err_buf, err_cap, "4-Way Handshake failed");
                     fprintf(stderr, "error: EAPOL key derivation/unwrap failure\n");
@@ -776,7 +775,7 @@ static int perform_connect(io_connect_t conn,
 
     char bsd[32];
     wifi_ifname(svc, bsd, sizeof(bsd));
-    printf("[4/4] Opening LMAC control port & raising link on %s...\n", bsd);
+    printf("[4/4] Opening the control port & raising link on %s...\n", bsd);
     kr = wifi_set_port_link(conn, true, true);
     if (kr != KERN_SUCCESS) {
         set_err(err_buf, err_cap, "SET_PORT_LINK failed: 0x%08x", kr);
@@ -877,18 +876,18 @@ typedef enum {
     CMD_FORGET,
     CMD_RECONNECT,
     CMD_POWERSAVE /* the driver is only called from the main loop */
-} aic_daemon_cmd_kind_t;
+} daemon_cmd_kind_t;
 
 typedef struct {
-    aic_daemon_cmd_kind_t kind;
+    daemon_cmd_kind_t kind;
     char                  ssid[36];
     char                  pass[72];
     bool                  has_pass;
     bool                  save_profile;
     bool                  done;
     uint32_t              seq; /* a reply for an older, timed-out command must not finish this one */
-    char                  json_reply[AIC_IPC_BUF_SIZE];
-} aic_daemon_pending_cmd_t;
+    char                  json_reply[IPC_BUF_SIZE];
+} daemon_pending_cmd_t;
 
 static pthread_mutex_t g_state_lock     = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_req_lock       = PTHREAD_MUTEX_INITIALIZER;
@@ -912,7 +911,7 @@ static char              g_active_ssid[36]     = "";
 static char              g_active_pass[72]     = "";
 static bool              g_active_has_pass     = false;
 
-static aic_daemon_pending_cmd_t g_pending_cmd;
+static daemon_pending_cmd_t g_pending_cmd;
 
 static void wake_daemon_loop(void) {
     if (g_wake_pipe[1] >= 0) {
@@ -1136,7 +1135,7 @@ static void build_scan_json(const wifi_scan_list_t *list, char *out, size_t cap)
                  b->bssid[0], b->bssid[1], b->bssid[2], b->bssid[3], b->bssid[4], b->bssid[5]);
         char sec_str[20];
         format_sec_str(b->sec_mask, sec_str, sizeof(sec_str));
-        const bool is_open = (b->sec_mask & (AIC_SEC_PRIVACY | AIC_SEC_WPA_PSK | AIC_SEC_WPA2_PSK | AIC_SEC_WPA3_SAE | AIC_SEC_8021X)) == 0U;
+        const bool is_open = (b->sec_mask & (WIFI_SEC_PRIVACY | WIFI_SEC_WPA_PSK | WIFI_SEC_WPA2_PSK | WIFI_SEC_WPA3_SAE | WIFI_SEC_8021X)) == 0U;
 
         sb_appendf(&sb, "%s{\"ssid\":", (i > 0U) ? "," : "");
         sb_append_json_str(&sb, hidden ? "" : ssid_str);
@@ -1159,7 +1158,7 @@ static void build_err_json(const char *msg, char *out, size_t cap) {
 static void finish_pending_cmd_locked(uint32_t seq, const char *json_msg);
 
 static void execute_pending_scan(io_connect_t conn, uint32_t seq) {
-    static char reply[AIC_IPC_BUF_SIZE]; /* only the daemon loop thread scans */
+    static char reply[IPC_BUF_SIZE]; /* only the daemon loop thread scans */
     wifi_scan_list_t list;
     char err[160] = {0};
     if (conn == IO_OBJECT_NULL) {
@@ -1172,7 +1171,7 @@ static void execute_pending_scan(io_connect_t conn, uint32_t seq) {
     finish_pending_cmd_locked(seq, reply);
 }
 
-static bool dispatch_daemon_cmd_sync(const aic_daemon_pending_cmd_t *req, char *reply_out, size_t reply_cap) {
+static bool dispatch_daemon_cmd_sync(const daemon_pending_cmd_t *req, char *reply_out, size_t reply_cap) {
     pthread_mutex_lock(&g_req_lock);
 
     pthread_mutex_lock(&g_req_wait_lock);
@@ -1257,26 +1256,26 @@ static void handle_ipc_client(int cfd) {
     if (strcmp(req_line, "STATUS") != 0) /* command word only: CONNECT_HEX carries the passphrase */
         fprintf(stderr, "usbwifid: slot %d command %.*s\n", wifi_slot(), (int)strcspn(req_line, " "), req_line);
 
-    char reply[AIC_IPC_BUF_SIZE];
+    char reply[IPC_BUF_SIZE];
     if (strcmp(req_line, "STATUS") == 0) {
         build_status_json(reply, sizeof(reply));
     } else if (strcmp(req_line, "SCAN") == 0) {
-        aic_daemon_pending_cmd_t req;
+        daemon_pending_cmd_t req;
         memset(&req, 0, sizeof(req));
         req.kind = CMD_SCAN;
         (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
     } else if (strcmp(req_line, "DISCONNECT") == 0) {
-        aic_daemon_pending_cmd_t req;
+        daemon_pending_cmd_t req;
         memset(&req, 0, sizeof(req));
         req.kind = CMD_DISCONNECT;
         (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
     } else if (strcmp(req_line, "FORGET") == 0) {
-        aic_daemon_pending_cmd_t req;
+        daemon_pending_cmd_t req;
         memset(&req, 0, sizeof(req));
         req.kind = CMD_FORGET;
         (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
     } else if (strcmp(req_line, "RECONNECT") == 0) {
-        aic_daemon_pending_cmd_t req;
+        daemon_pending_cmd_t req;
         memset(&req, 0, sizeof(req));
         req.kind = CMD_RECONNECT;
         (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
@@ -1307,7 +1306,7 @@ static void handle_ipc_client(int cfd) {
         } else if (!write_pref(g_ps_path, v)) {
             build_err_json(strerror(errno), reply, sizeof(reply));
         } else {
-            aic_daemon_pending_cmd_t req;
+            daemon_pending_cmd_t req;
             memset(&req, 0, sizeof(req));
             req.kind = CMD_POWERSAVE;
             (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
@@ -1325,7 +1324,7 @@ static void handle_ipc_client(int cfd) {
             const char *pass_hex = sp1 + 1;
             const int save_flag  = atoi(sp2 + 1);
 
-            aic_daemon_pending_cmd_t req;
+            daemon_pending_cmd_t req;
             memset(&req, 0, sizeof(req));
             req.kind         = CMD_CONNECT;
             req.save_profile = (save_flag != 0);
@@ -1434,13 +1433,13 @@ static int setup_control_socket(void) {
 /* Returns true if broken out due to a pending control command instead of disconnect. */
 static bool run_rekey_loop(io_connect_t conn,
                            io_service_t svc,
-                           aic_wpa2_ctx_t *wpa_ctx,
+                           wpa2_ctx_t *wpa_ctx,
                            bool is_open,
                            bool daemon_mode) {
     while (g_keep_running) {
         if (daemon_mode && sleep_with_wake_ms(250)) {
             drain_wake_pipe();
-            aic_daemon_cmd_kind_t k = CMD_NONE;
+            daemon_cmd_kind_t k = CMD_NONE;
             pthread_mutex_lock(&g_req_wait_lock);
             k = g_pending_cmd.done ? CMD_NONE : g_pending_cmd.kind;
             const uint32_t seq = g_pending_cmd.seq;
@@ -1485,14 +1484,14 @@ static bool run_rekey_loop(io_connect_t conn,
                 size_t reply_len = 0U;
                 bool keys_ready = false;
                 bool gtk_rekey  = false;
-                if (aic_wpa2_handle_rx_eapol(wpa_ctx,
-                                             rx_frame.data,
-                                             rx_frame.len,
-                                             reply_eth,
-                                             sizeof(reply_eth),
-                                             &reply_len,
-                                             &keys_ready,
-                                             &gtk_rekey) == 1) {
+                if (wpa2_handle_rx_eapol(wpa_ctx,
+                                         rx_frame.data,
+                                         rx_frame.len,
+                                         reply_eth,
+                                         sizeof(reply_eth),
+                                         &reply_len,
+                                         &keys_ready,
+                                         &gtk_rekey) == 1) {
                     (void)wifi_send_eapol(conn, reply_eth, reply_len);
                     if (keys_ready) { /* the AP renewed the PTK with a fresh 4-way handshake */
                         uint8_t hw_idx = 0U;
@@ -1517,10 +1516,10 @@ static bool run_rekey_loop(io_connect_t conn,
 
 static bool handle_daemon_pending_command(io_connect_t conn,
                                           io_service_t svc,
-                                          aic_wpa2_ctx_t *wpa_ctx,
+                                          wpa2_ctx_t *wpa_ctx,
                                           bool *is_open_out,
                                           bool *connected_now) {
-    aic_daemon_pending_cmd_t local;
+    daemon_pending_cmd_t local;
     pthread_mutex_lock(&g_req_wait_lock);
     if (g_pending_cmd.done || g_pending_cmd.kind == CMD_NONE) {
         pthread_mutex_unlock(&g_req_wait_lock);
@@ -1529,7 +1528,7 @@ static bool handle_daemon_pending_command(io_connect_t conn,
     local = g_pending_cmd;
     pthread_mutex_unlock(&g_req_wait_lock);
 
-    char reply[AIC_IPC_BUF_SIZE];
+    char reply[IPC_BUF_SIZE];
     if (local.kind == CMD_SCAN) {
         execute_pending_scan(conn, local.seq);
     } else if (local.kind == CMD_DISCONNECT) {
@@ -1746,7 +1745,7 @@ static int run_worker(void) {
         sync_saved_ssid_snapshot();
         if (conn == IO_OBJECT_NULL) {
             refresh_snapshot(IO_OBJECT_NULL, IO_OBJECT_NULL);
-            aic_wpa2_ctx_t dummy_ctx;
+            wpa2_ctx_t dummy_ctx;
             bool dummy_open = false;
             bool dummy_conn = false;
             if (sleep_with_wake_ms(1500)) {
@@ -1764,7 +1763,7 @@ static int run_worker(void) {
             IOObjectRelease(svc);
             if (sleep_with_wake_ms(800)) {
                 drain_wake_pipe();
-                aic_wpa2_ctx_t dummy_ctx;
+                wpa2_ctx_t dummy_ctx;
                 bool dummy_open = false;
                 bool dummy_conn = false;
                 (void)handle_daemon_pending_command(IO_OBJECT_NULL, IO_OBJECT_NULL, &dummy_ctx, &dummy_open, &dummy_conn);
@@ -1773,7 +1772,7 @@ static int run_worker(void) {
         }
 
         /* Process any queued socket command before auto-connect */
-        aic_wpa2_ctx_t wpa_ctx;
+        wpa2_ctx_t wpa_ctx;
         bool is_open = false;
         bool connected_now = false;
         drain_wake_pipe();
@@ -2071,7 +2070,7 @@ int main(int argc, char **argv) {
     kern_return_t open_kr = KERN_FAILURE;
     if (wifi_open(&conn, &svc, false, &open_kr) != 0) {
         if (open_kr == kIOReturnNotPrivileged && strcmp(argv[1], "status") == 0) {
-            char json[AIC_IPC_BUF_SIZE];
+            char json[IPC_BUF_SIZE];
             if (query_daemon_socket("STATUS", json, sizeof(json)) == 0) {
                 printf("%s", json);
                 return 0;
@@ -2099,7 +2098,7 @@ int main(int argc, char **argv) {
                 pass = argv[i];
             }
         }
-        aic_wpa2_ctx_t wpa_ctx;
+        wpa2_ctx_t wpa_ctx;
         bool is_open = false;
         rc = perform_connect(conn, svc, ssid, pass, run_dhcp, &wpa_ctx, &is_open, NULL, 0U);
         if (rc == 0 && stay) {
