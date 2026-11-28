@@ -255,6 +255,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let ioQueue = DispatchQueue(label: "com.usbwifi.app.io", qos: .userInitiated, attributes: .concurrent)
 
     private var pollTimer: Timer?
+    private var waveTimer: Timer?
+    private var waveStep = 0
     private var daemonOffline = true
     private var adapters: [Int: Adapter] = [:] /* by slot */
 
@@ -478,26 +480,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let sts = sortedAdapters.compactMap { $0.status }.filter { $0.present }
         let symbolName: String
         var title = ""
+        var level: Double? /* set only while connecting: how many bars are lit */
 
         if daemonOffline || sts.isEmpty {
             symbolName = "wifi.slash"
         } else if sts.contains(where: { $0.connecting }) {
             symbolName = "wifi"
-            title = " …"
+            level = Double(waveStep % 4) / 3
         } else if sts.contains(where: { $0.associated && $0.link_up }) {
             symbolName = "wifi"
         } else {
             symbolName = "wifi.exclamationmark"
         }
 
-        if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "USB Wi-Fi") {
-            img.isTemplate = true
-            button.image = img
+        if level != nil, waveTimer == nil {
+            let t = Timer(timeInterval: 0.4, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.waveStep += 1
+                self.updateIconAndTitle()
+            }
+            RunLoop.main.add(t, forMode: .common) /* keep animating while the menu is open */
+            waveTimer = t
+        } else if level == nil, waveTimer != nil {
+            waveTimer?.invalidate()
+            waveTimer = nil
+            waveStep = 0
+        }
+
+        let count = daemonOffline ? 0 : sts.count
+        var desc = level == nil ? "USB Wi-Fi" : "USB Wi-Fi, connecting"
+        if count > 1 { desc += ", \(count) adapters" }
+        if let img = NSImage(systemSymbolName: symbolName, variableValue: level ?? 1, accessibilityDescription: desc)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)) {
+            let out = count > 1 ? badged(img, count) : img
+            out.isTemplate = true
+            out.accessibilityDescription = desc
+            button.image = out
         } else {
             button.image = nil
             title = "WiFi"
         }
         button.title = title
+    }
+
+    /// the adapter count as a small digit in the icon's bottom-right corner
+    private func badged(_ img: NSImage, _ n: Int) -> NSImage {
+        let font = NSFont.systemFont(ofSize: 9, weight: .bold)
+        let text = NSAttributedString(string: "\(n)", attributes: [.font: font, .foregroundColor: NSColor.black])
+        let tw = ceil(text.size().width)
+        let size = NSSize(width: img.size.width + ceil(tw / 2), height: img.size.height)
+        return NSImage(size: size, flipped: false) { _ in
+            img.draw(in: NSRect(origin: .zero, size: img.size))
+            /* clear a gap around the digit so it does not merge with the arcs */
+            NSRect(x: size.width - tw - 2, y: 0, width: tw + 2, height: ceil(font.capHeight) + 2).fill(using: .clear)
+            text.draw(at: NSPoint(x: size.width - tw, y: font.descender))
+            return true
+        }
     }
 
     private func disabledInfoItem(_ text: String, bold: Bool = false) -> NSMenuItem {
