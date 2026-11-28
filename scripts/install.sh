@@ -4,6 +4,7 @@
 # usage (as root): scripts/install.sh             copy build/ + set up (manual install)
 #                  scripts/install.sh --setup     set up only (pkg postinstall: payload already in place)
 #                  scripts/install.sh --uninstall
+#                  scripts/install.sh --clean       uninstall every version (1.0.x too) but keep the saved networks
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN=/Library/PrivilegedHelperTools/usbwifi
@@ -42,18 +43,26 @@ pkill -x AIC8800Menu 2>/dev/null || true
 rm -rf /Library/PrivilegedHelperTools/aic8800-mac "$OLD_SUP" /Applications/AIC8800Menu.app
 for p in $OLD.pkg $OLD.pkg.aic8800 $OLD.pkg.rtl8852bu $OLD.pkg.setup; do pkgutil --forget "$p" >/dev/null 2>&1 || true; done
 
-if [[ "${1:-}" == "--uninstall" ]]; then
+if [[ "${1:-}" == "--uninstall" || "${1:-}" == "--clean" ]]; then
   for s in {0..15}; do # one network service + feth pair per adapter slot
     [[ -x "$BIN/usbwifi_netsvc" ]] && "$BIN/usbwifi_netsvc" remove - "feth$((80 + 2 * s))" >/dev/null || true
     ifconfig "feth$((80 + 2 * s))" destroy 2>/dev/null || true
     ifconfig "feth$((81 + 2 * s))" destroy 2>/dev/null || true
   done
   for l in "${LABELS[@]}"; do rm -f "/Library/LaunchDaemons/$l.plist"; done
-  rm -rf "$BIN" "$SUP" "$APP" "$AGENT" "$CD_AGENT" /var/run/usbwifi /var/log/com.usbwifi.wifi.log*
-  for p in com.usbwifi.pkg com.usbwifi.pkg.aic8800 com.usbwifi.pkg.rtl8852bu com.usbwifi.pkg.setup; do
+  rm -rf "$BIN" "$APP" "$AGENT" "$CD_AGENT" /var/run/usbwifi /var/log/com.usbwifi.wifi.log*
+  for p in com.usbwifi.pkg com.usbwifi.pkg.aic8800 com.usbwifi.pkg.rtl8852bu com.usbwifi.pkg.setup com.usbwifi.pkg.clean; do
     pkgutil --forget "$p" >/dev/null 2>&1 || true
   done
-  echo "uninstalled"
+  if [[ "$1" == "--clean" ]]; then
+    # keep the saved networks: the auto-join profiles (SSID + passphrase) and the dongle-to-slot map that
+    # picks which wifi-N.conf a dongle reads. Keychain passwords are never touched
+    find "$SUP" -mindepth 1 -maxdepth 1 ! -name wifi.conf ! -name 'wifi-*.conf' ! -name adapters -exec rm -rf {} + 2>/dev/null || true
+    echo "cleaned"
+  else
+    rm -rf "$SUP"
+    echo "uninstalled"
+  fi
   exit 0
 fi
 

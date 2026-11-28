@@ -14,6 +14,9 @@ Requirements:
    On the **Installation Type** page, tick the driver for your dongle
    (AIC8800D80, RTL8852BU, or both). From Terminal,
    `sudo installer -pkg USBWifi.pkg -target /` installs both drivers.
+   Tick Clean install on the same page to first remove every earlier install
+   (1.0.x included) with its settings and logs. Saved networks and their
+   Keychain passwords stay.
 3. Plug in the dongle. Within a few seconds the driver comes up and the
    **USB Wifi** icon appears in the menu bar. The menu shows the adapter chip.
 4. Click the icon, pick a network and enter the password once. The password is
@@ -40,6 +43,9 @@ What gets installed:
 ```sh
 sudo /Library/PrivilegedHelperTools/usbwifi/install.sh --uninstall
 ```
+
+`--clean` in place of `--uninstall` removes the same files but keeps the saved
+networks (`wifi.conf`, `wifi-N.conf`, `adapters`) and the Keychain passwords.
 
 ## Build from source
 

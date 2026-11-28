@@ -1,4 +1,4 @@
-# aic8800-mac
+# Apple Silicon (macos) USB Wifi Unified Driver
 
 Userspace macOS driver for USB Wi-Fi dongles on Apple Silicon. Supported chips:
 

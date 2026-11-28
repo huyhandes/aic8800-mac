@@ -4,11 +4,15 @@
     <options customize="always" require-scripts="true" hostArchitectures="arm64,x86_64"/>
     <domains enable_localSystem="true"/>
     <choices-outline>
+        <line choice="clean"/>
         <line choice="core"/>
         <line choice="aic8800"/>
         <line choice="rtl8852bu"/>
         <line choice="setup"/>
     </choices-outline>
+    <choice id="clean" title="Clean install" description="First remove every earlier USB Wifi and AIC8800 install (1.0.x included): app, daemon, drivers, settings, logs and network services. Saved networks and their passwords stay." selected="false">
+        <pkg-ref id="com.usbwifi.pkg.clean"/>
+    </choice>
     <choice id="core" title="USB Wifi app and daemon" description="Menu bar app (network list, Keychain passwords) and the Wi-Fi daemon. Required." enabled="false" selected="true">
         <pkg-ref id="com.usbwifi.pkg"/>
     </choice>
@@ -21,6 +25,7 @@
     <choice id="setup" visible="false" selected="true" enabled="false">
         <pkg-ref id="com.usbwifi.pkg.setup"/>
     </choice>
+    <pkg-ref id="com.usbwifi.pkg.clean">clean.pkg</pkg-ref>
     <pkg-ref id="com.usbwifi.pkg">core.pkg</pkg-ref>
     <pkg-ref id="com.usbwifi.pkg.aic8800">aic8800.pkg</pkg-ref>
     <pkg-ref id="com.usbwifi.pkg.rtl8852bu">rtl8852bu.pkg</pkg-ref>

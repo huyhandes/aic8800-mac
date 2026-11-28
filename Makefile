@@ -56,7 +56,8 @@ build/libusb-1.0.0.dylib:
 	codesign --force --sign - $@
 
 # double-click installer: required core + selectable drivers; the hidden setup pkg runs last
-# (install.sh --setup), so it only wires up the drivers that were ticked
+# (install.sh --setup), so it only wires up the drivers that were ticked. The optional clean pkg runs first
+# (choices-outline order) and carries its own install.sh, since none may be installed yet
 VERSION = 1.1.0
 PKGROOT = build/pkgroot
 HELPER  = Library/PrivilegedHelperTools/usbwifi
@@ -67,7 +68,7 @@ pkg: all
 	rm -rf build/pkgroot build/pkgscripts build/pkgs
 	install -d "$(PKGROOT)/core/Applications" "$(PKGROOT)/core/$(HELPER)" "$(PKGROOT)/core/$(SUPDIR)/licenses" \
 	  "$(PKGROOT)/aic/$(SUPDIR)/fw" "$(PKGROOT)/rtl/$(SUPDIR)/fw" "$(PKGROOT)/rtl/$(SUPDIR)/licenses" \
-	  build/pkgscripts/core build/pkgscripts/setup build/pkgs
+	  build/pkgscripts/core build/pkgscripts/setup build/pkgscripts/clean build/pkgs
 	cp -R build/USBWifi.app "$(PKGROOT)/core/Applications/USB Wifi.app"
 	install -m 755 build/usbwifid build/usbwifi_netsvc build/libusb-1.0.0.dylib scripts/install.sh "$(PKGROOT)/core/$(HELPER)/"
 	install -m 644 LICENSE "$(PKGROOT)/core/$(SUPDIR)/licenses/LICENSE"
@@ -81,11 +82,15 @@ pkg: all
 	install -m 755 scripts/pkg-preinstall.sh build/pkgscripts/core/preinstall
 	printf '#!/bin/bash\nexec "/$(HELPER)/install.sh" --setup\n' > build/pkgscripts/setup/postinstall
 	chmod 755 build/pkgscripts/setup/postinstall
+	install -m 755 scripts/install.sh build/pkgscripts/clean/
+	printf '#!/bin/bash\nexec "$$(dirname "$$0")/install.sh" --clean\n' > build/pkgscripts/clean/preinstall
+	chmod 755 build/pkgscripts/clean/preinstall
 	pkgbuild --analyze --root "$(PKGROOT)/core" build/components.plist
 	plutil -replace 0.BundleIsRelocatable -bool NO build/components.plist
 	pkgbuild --root "$(PKGROOT)/core" --component-plist build/components.plist --scripts build/pkgscripts/core --identifier com.usbwifi.pkg --version $(VERSION) --ownership recommended --install-location / build/pkgs/core.pkg
 	pkgbuild --root "$(PKGROOT)/aic" --identifier com.usbwifi.pkg.aic8800 --version $(VERSION) --ownership recommended --install-location / build/pkgs/aic8800.pkg
 	pkgbuild --root "$(PKGROOT)/rtl" --identifier com.usbwifi.pkg.rtl8852bu --version $(VERSION) --ownership recommended --install-location / build/pkgs/rtl8852bu.pkg
+	pkgbuild --nopayload --scripts build/pkgscripts/clean --identifier com.usbwifi.pkg.clean --version $(VERSION) build/pkgs/clean.pkg
 	pkgbuild --nopayload --scripts build/pkgscripts/setup --identifier com.usbwifi.pkg.setup --version $(VERSION) build/pkgs/setup.pkg
 	productbuild --distribution scripts/distribution.xml --package-path build/pkgs --version $(VERSION) build/USBWifi.pkg
 .PHONY: pkg
@@ -95,14 +100,18 @@ clean:
 .PHONY: all clean
 
 # self-check (no root): WPA2 handshake and lkpi shim unit tests, then driver bring-up + scan against the plugged dongle
-check: build/usbwifid build/libusb-1.0.0.dylib build/wpa2_test build/drv_contract_test build/kernel_test build/mac80211_test
+check: build/usbwifid build/libusb-1.0.0.dylib build/wpa2_test build/reord_test build/drv_contract_test build/kernel_test build/mac80211_test
 	./build/wpa2_test
+	./build/reord_test
 	./build/drv_contract_test
 	./build/kernel_test
 	./build/mac80211_test
 	AICD_NO_NET=1 ./build/usbwifid scan
 
 build/wpa2_test: tests/wpa2_test.c third_party/yokitea/common/aic8800_wpa2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(INC) $< -o $@
+build/reord_test: tests/reord_test.c third_party/yokitea/common/aic8800_reord.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INC) $< -o $@
 build/drv_contract_test: tests/drv_contract_test.c src/usbwifi_core.c src/usbwifi_core.h src/wifi_drv.h
