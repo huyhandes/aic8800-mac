@@ -273,11 +273,11 @@ static int setup_feth(void) {
     const uint8_t *m = g.info.mac;
     char mac[24];
     snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
-    /* create may fail if left over from a previous run; that's fine */
+    /* left over from a previous run: reuse it */
     char *c1[] = { "ifconfig", wifi_if_host, "create", NULL };
     char *c2[] = { "ifconfig", wifi_if_peer, "create", NULL };
-    (void)run_cmd("/sbin/ifconfig", c1);
-    (void)run_cmd("/sbin/ifconfig", c2);
+    if (!if_nametoindex(wifi_if_host)) (void)run_cmd("/sbin/ifconfig", c1);
+    if (!if_nametoindex(wifi_if_peer)) (void)run_cmd("/sbin/ifconfig", c2);
     char *c3[] = { "ifconfig", wifi_if_host, "-peer", NULL };
     (void)run_cmd("/sbin/ifconfig", c3); /* start link-down; set_host_link() peers once WiFi is up */
     char *c4[] = { "ifconfig", wifi_if_host, "lladdr", mac, "down", NULL }; /* up only once WiFi link is up */

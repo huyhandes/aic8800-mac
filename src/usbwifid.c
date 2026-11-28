@@ -258,6 +258,9 @@ static const char *band_pref(void) {
 
 /* one per dongle (powersave, powersave-N): "on" turns the chip's power save on, anything else = off */
 static char g_ps_path[PATH_MAX] = WIFI_CONF_DIR "/powersave";
+/* one per dongle (chans, chans-N): the channels of the last scan that found the SSID, "freq freq ...\nSSID",
+   so a replugged dongle's fresh worker does the 0.2 s known-channel scan */
+static char g_chans_path[PATH_MAX] = WIFI_CONF_DIR "/chans";
 static bool ps_pref(void) {
     char v[8] = "";
     FILE *f = fopen(g_ps_path, "r");
@@ -324,6 +327,18 @@ static int perform_connect(io_connect_t conn,
     static char     known_ssid[33];
     static uint16_t known_freqs[8];
     static int      n_known;
+    if (n_known == 0) {
+        char line[128], name[40];
+        FILE *f = fopen(g_chans_path, "r");
+        if (f && fgets(line, sizeof(line), f) && fgets(name, sizeof(name), f)) {
+            name[strcspn(name, "\n")] = '\0';
+            char *p = line, *end;
+            for (long v; n_known < 8 && (v = strtol(p, &end, 10)) > 0 && v < 8000; p = end)
+                known_freqs[n_known++] = (uint16_t)v;
+            snprintf(known_ssid, sizeof(known_ssid), "%s", name);
+        }
+        if (f) fclose(f);
+    }
     const bool fast = n_known > 0 && strcmp(known_ssid, ssid_arg) == 0;
     wifi_scan_list_t list;
     const wifi_scan_bss_t *target = NULL;
@@ -359,6 +374,13 @@ static int perform_connect(io_connect_t conn,
             if (!dup && n_known < 8) known_freqs[n_known++] = b->freq;
         }
         snprintf(known_ssid, sizeof(known_ssid), "%s", ssid_arg);
+        if (target) {
+            char v[128];
+            int len = 0;
+            for (int k = 0; k < n_known; ++k) len += snprintf(v + len, sizeof(v) - (size_t)len, "%u ", known_freqs[k]);
+            snprintf(v + len, sizeof(v) - (size_t)len, "\n%s", ssid_arg);
+            (void)write_pref(g_chans_path, v);
+        }
     }
     if (!target) {
         set_err(err_buf, err_cap, "Network \"%s\" not found", ssid_arg);
@@ -1418,6 +1440,7 @@ static void worker_bound(void) {
         snprintf(g_conf_path, sizeof(g_conf_path), WIFI_CONF_DIR "/wifi-%d.conf", slot);
         snprintf(g_band_path, sizeof(g_band_path), WIFI_CONF_DIR "/band-%d", slot);
         snprintf(g_ps_path, sizeof(g_ps_path), WIFI_CONF_DIR "/powersave-%d", slot);
+        snprintf(g_chans_path, sizeof(g_chans_path), WIFI_CONF_DIR "/chans-%d", slot);
     }
     snprintf(g_sock_path, sizeof(g_sock_path), WIFI_RUN_DIR "/%d.sock", slot);
 
@@ -1464,12 +1487,14 @@ static int run_worker(void) {
     pthread_t pm_thread;
     if (pthread_create(&pm_thread, NULL, power_thread, NULL) == 0) pthread_detach(pm_thread);
 
+    int connect_fails = 0;
     while (g_keep_running) {
         io_connect_t conn = IO_OBJECT_NULL;
         io_service_t svc  = IO_OBJECT_NULL;
         if (wifi_open(&conn, &svc, true, NULL) == 0 && !g_ctrl_thread_started) worker_bound();
         else if (!g_ctrl_thread_started) {
-            if (sleep_with_wake_ms(1500)) drain_wake_pipe();
+            /* wifi_open already waits up to 1 s for an RTL8852BU; an AIC8800D80 is only seen once per pass */
+            if (sleep_with_wake_ms(500)) drain_wake_pipe();
             continue; /* no free dongle yet */
         }
         sync_saved_ssid_snapshot();
@@ -1558,7 +1583,8 @@ static int run_worker(void) {
             refresh_snapshot(conn, svc);
 
             pthread_mutex_lock(&g_state_lock);
-            g_snap_connecting = false;
+            /* still connecting through the 0.5 s first retry, so the app doesn't auto-scan into it */
+            g_snap_connecting = rc != 0 && connect_fails == 0;
             if (rc != 0 && err[0] != '\0') {
                 snprintf(g_snap_last_error, sizeof(g_snap_last_error), "%s", err);
             } else if (rc == 0) {
@@ -1566,9 +1592,11 @@ static int run_worker(void) {
             }
             pthread_mutex_unlock(&g_state_lock);
 
+            /* the first retry comes fast: right after a replug the AP often rejects the association once */
             if (rc == 0) {
+                connect_fails = 0;
                 (void)run_rekey_loop(conn, svc, &wpa_ctx, is_open, true);
-            } else if (sleep_with_wake_ms(3000)) {
+            } else if (sleep_with_wake_ms(connect_fails++ ? 3000 : 500)) {
                 drain_wake_pipe();
                 (void)handle_daemon_pending_command(conn, svc, &wpa_ctx, &is_open, &connected_now);
                 if (connected_now) {
@@ -1589,6 +1617,9 @@ static int run_worker(void) {
         IOServiceClose(conn);
         IOObjectRelease(svc);
     }
+    /* deauth before exit: a warm AIC firmware and the AP otherwise keep the old association, so the next
+       start's first connect is rejected (status 1) or its LMAC commands time out under the stale traffic */
+    (void)wifi_disconnect(IO_OBJECT_NULL, 3U);
 
     if (g_ctrl_thread_started) {
         pthread_join(g_ctrl_thread, NULL);

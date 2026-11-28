@@ -44,6 +44,7 @@ typedef struct {
 typedef struct {
     uint16_t         ind_sn;
     uint16_t         pending_count;
+    uint16_t         stuck_sn; /* ind_sn at the last timeout tick: a hole is skipped only once it has waited a full tick */
     aic_reord_slot_t slots[AIC_REORD_WINSIZE];
 } aic_reord_tid_t;
 
@@ -63,6 +64,7 @@ static inline void aic_rx_reord_init(aic_rx_reord_t *r) {
     memset(r, 0, sizeof(*r));
     for (uint8_t t = 0U; t < AIC_REORD_TID_CNT; ++t) {
         r->tids[t].ind_sn = AIC_REORD_SN_UNINIT;
+        r->tids[t].stuck_sn = AIC_REORD_SN_UNINIT;
     }
 }
 
@@ -127,6 +129,7 @@ static inline void aic_rx_reord_flush_tid(aic_rx_reord_t *r,
     memset(q->slots, 0, sizeof(q->slots));
     q->pending_count = 0U;
     q->ind_sn        = AIC_REORD_SN_UNINIT;
+    q->stuck_sn      = AIC_REORD_SN_UNINIT;
 }
 
 static inline void aic_rx_reord_flush_all(aic_rx_reord_t *r,
@@ -143,7 +146,9 @@ static inline void aic_rx_reord_flush_all(aic_rx_reord_t *r,
 }
 
 /*
- * Force-advance reorder windows across all TIDs on 50ms timeout.
+ * Called every AIC_REORD_TIMEOUT_MS while frames are buffered. A TID whose window has not moved since
+ * the previous call skips its hole; one that moved (the hole filled, a newer one opened) gets a full
+ * timeout first, or a retry 1 ms away would be skipped and reach TCP out of order.
  * Returns true if any TID still has buffered future packets needing re-arm.
  */
 static inline bool aic_rx_reord_timeout_flush(aic_rx_reord_t *r,
@@ -156,6 +161,11 @@ static inline bool aic_rx_reord_timeout_flush(aic_rx_reord_t *r,
     for (uint8_t t = 0U; t < AIC_REORD_TID_CNT; ++t) {
         aic_reord_tid_t *q = &r->tids[t];
         if (q->pending_count == 0U || q->ind_sn == AIC_REORD_SN_UNINIT) {
+            continue;
+        }
+        if (q->stuck_sn != q->ind_sn) {
+            q->stuck_sn = q->ind_sn;
+            any_pending = true;
             continue;
         }
         bool advanced = false;
@@ -235,8 +245,20 @@ static inline void aic_rx_reord_submit(aic_rx_reord_t *r,
         q->ind_sn = sn;
     }
 
-    /* Behind expected window: deliver immediately without stalling */
+    /* Behind expected window. Within two windows it is an AP retry of a frame already handed up: a second
+     * copy makes TCP send dup ACKs and the sender cuts cwnd, so drop it as mac80211 does. Further back is a
+     * restarted session: deliver without stalling. */
     if (aic_reord_sn_less(sn, q->ind_sn)) {
+        if ((uint16_t)((q->ind_sn - sn) & AIC_REORD_SN_MASK) <= 2U * AIC_REORD_WINSIZE) {
+            r->dup_drops++;
+            if (drop) {
+                drop(pkt, ctx);
+            }
+            if (out_needs_timer) {
+                *out_needs_timer = (q->pending_count > 0U);
+            }
+            return;
+        }
         if (deliver) {
             deliver(pkt, pkt_bytes, ctx);
         }

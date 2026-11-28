@@ -202,7 +202,10 @@ static void LIBUSB_CALL rx_done(struct libusb_transfer *t) {
         (void)aic_rx_demux_usb_aggr(t->buffer, (size_t)t->actual_length, on_data_chunk, on_cfg_pkt, NULL);
     else if (t->status != LIBUSB_TRANSFER_COMPLETED) usleep(10000); /* transient error: don't spin */
     if (a.stopping) return;
+    /* a stalled IN endpoint (seen with two dongles on one hub): clear it instead of dropping the dongle */
+    if (t->status == LIBUSB_TRANSFER_STALL) (void)libusb_clear_halt(a.h, a.ep_in);
     int rc = libusb_submit_transfer(t);
+    if (rc == LIBUSB_ERROR_PIPE && libusb_clear_halt(a.h, a.ep_in) == 0) rc = libusb_submit_transfer(t);
     if (rc != 0) { fprintf(stderr, "aic8800: RX resubmit failed: %s\n", libusb_error_name(rc)); ev->gone(); }
 }
 
@@ -290,6 +293,11 @@ static int bring_up_lmac(void) {
     aic_dbg_mem_read_cfm_t chip_cfm = {0};
     CMD(AIC_DBG_MEM_READ_REQ, AIC_TASK_DBG, &chip_req, AIC_DBG_MEM_READ_CFM, &chip_cfm);
     a.chip_id = chip_cfm.memdata;
+    /* a worker that died associated (crash, kill -9) leaves station 0 in the warm firmware: MM_RESET keeps
+       it, the next connect fails once and the leaked entry can crash the firmware later. Tear it down the
+       way a clean exit does; on a fresh firmware vif 0 is inactive and this only gets its CFM */
+    aic_sm_disconnect_req_t dis = { .reason_code = 3, .vif_idx = 0 };
+    (void)send_cmd(AIC_SM_DISCONNECT_REQ, AIC_TASK_SM, &dis, sizeof(dis), AIC_SM_DISCONNECT_CFM, NULL, 0, NULL);
 
     aic_mm_set_stack_start_req_t ss_req = { 1U, 0U, AIC_STACK_START_VENDOR_BIT, 0U };
     aic_mm_set_stack_start_cfm_t ss_cfm = {0};

@@ -647,7 +647,7 @@ static int eject_stage0_via_diskarbitration_ex(uint16_t vid,
         run_da_wait(&eject_ctx.done, da_mode, 5000);
         if (!eject_ctx.done || eject_ctx.status != 0) {
             fprintf(stderr,
-                    "[fwload] error: DADiskEject(/dev/%s) failed (done=%d status=0x%08x)\n",
+                    "[fwload] note: DADiskEject(/dev/%s) not done yet (done=%d status=0x%08x), retrying\n",
                     bsd_name, eject_ctx.done ? 1 : 0, (unsigned)eject_ctx.status);
             rc = -1;
         }

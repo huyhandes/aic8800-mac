@@ -344,7 +344,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         a.networks = []
                         a.pendingAutoScan = false
                     }
-                    if !a.pendingAutoScan && a.ready && a.networks.isEmpty {
+                    // not while the daemon connects or just linked: the scan would delay its retry and DHCP;
+                    // opening the menu still scans
+                    if !a.pendingAutoScan && a.ready && a.networks.isEmpty && !st.connecting && !st.associated {
                         a.pendingAutoScan = true
                         self.triggerScan(a)
                     }
