@@ -141,8 +141,9 @@ fi
 # menu app at login for the console user (same plist the app's "Launch at Login" toggle manages).
 # Nobody at the console (pkg pushed at the login window): skip it, the app starts from /Applications later
 if [[ "$USER_NAME" == root ]]; then echo "installed (no console user: menu agent skipped)"; exit 0; fi
-install -d -o "$USER_NAME" "$USER_HOME/Library/LaunchAgents"
-cat > "$AGENT" <<PL
+# written as the user: a symlink planted in the user's folder cannot aim a root write or chown at a system file
+sudo -u "$USER_NAME" mkdir -p "$USER_HOME/Library/LaunchAgents"
+sudo -u "$USER_NAME" tee "$AGENT" >/dev/null <<PL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -151,7 +152,6 @@ cat > "$AGENT" <<PL
 <key>RunAtLoad</key><true/>
 </dict></plist>
 PL
-chown "$USER_NAME" "$AGENT"
 launchctl bootstrap "gui/$USER_UID" "$AGENT" || launchctl asuser "$USER_UID" open "$APP"
 
 echo "installed. log: /var/log/com.usbwifi.wifi.log"

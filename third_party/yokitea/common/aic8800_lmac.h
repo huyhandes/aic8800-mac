@@ -290,13 +290,6 @@ static inline void aic_build_d80_add_if_sta_req(aic_mm_add_if_req_t *req,
     req->p2p  = 0U;
 }
 
-static inline void aic_build_d80_agg_disable_req(aic_mm_set_agg_disable_req_t *req) {
-    aic_lmac_zero(req, sizeof(*req));
-    req->disable    = 1U;
-    req->staidx     = 0U;
-    req->disable_rx = 1U;
-}
-
 static inline void aic_build_d80_agg_enable_req(aic_mm_set_agg_disable_req_t *req) {
     aic_lmac_zero(req, sizeof(*req));
     req->disable    = 0U;
@@ -532,69 +525,6 @@ static inline int aic_usb_dispatch_msg_urb_ex(aic_lmac_cmd_matcher_t *matcher,
         *out_summary = local;
     }
     return (packets > 0U) ? 0 : -1;
-}
-
-static inline int aic_usb_dispatch_msg_urb(aic_lmac_cmd_matcher_t *matcher,
-                                           const uint8_t *urb_buf,
-                                           size_t urb_len,
-                                           aic_msg_rx_dispatch_t *out_summary) {
-    return aic_usb_dispatch_msg_urb_ex(matcher, urb_buf, urb_len, NULL, NULL, out_summary);
-}
-
-/* ==========================================================================
- * TX Flow Control Watermark Hysteresis (High=150, Low=50, Cap=200)
- * ========================================================================== */
-
-typedef struct {
-    uint16_t capacity;
-    uint16_t low_water;
-    uint16_t high_water;
-    bool     stalled;
-    uint64_t stall_events;
-    uint64_t wake_events;
-} aic_tx_flow_ctrl_t;
-
-static inline void aic_tx_flow_ctrl_init(aic_tx_flow_ctrl_t *fc,
-                                         uint16_t capacity,
-                                         uint16_t low_water,
-                                         uint16_t high_water) {
-    aic_lmac_zero(fc, sizeof(*fc));
-    fc->capacity   = capacity;
-    fc->low_water  = low_water;
-    fc->high_water = high_water;
-}
-
-static inline bool aic_tx_flow_ctrl_can_accept(const aic_tx_flow_ctrl_t *fc,
-                                               uint16_t in_flight) {
-    return (fc != NULL) && !fc->stalled && (in_flight < fc->capacity);
-}
-
-static inline bool aic_tx_flow_ctrl_on_acquire(aic_tx_flow_ctrl_t *fc,
-                                               uint16_t new_in_flight) {
-    if (!fc) {
-        return false;
-    }
-    if (!fc->stalled && new_in_flight >= fc->high_water) {
-        fc->stalled = true;
-        fc->stall_events++;
-    }
-    return fc->stalled;
-}
-
-/**
- * Returns true if TX queue just transitioned from stalled -> resumed.
- */
-static inline bool aic_tx_flow_ctrl_on_release(aic_tx_flow_ctrl_t *fc,
-                                               uint16_t new_in_flight) {
-    if (!fc) {
-        return false;
-    }
-    if (fc->stalled && new_in_flight <= fc->low_water) {
-        fc->stalled = false;
-        fc->wake_events++;
-        return true;
-    }
-    return false;
 }
 
 #ifdef __cplusplus

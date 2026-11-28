@@ -19,7 +19,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <grp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -98,26 +97,6 @@ static void set_err(char *err_buf, size_t err_cap, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(err_buf, err_cap, fmt, ap);
     va_end(ap);
-}
-
-
-static int trigger_dhcp(const char *bsd) {
-    if (bsd && strncmp(bsd, "feth", 4) == 0) {
-        return 0; /* port: the feth80 network service (usbwifi_netsvc) runs DHCP via configd */
-    }
-    if (!bsd || strcmp(bsd, "unknown") == 0 || strncmp(bsd, "en", 2) != 0) {
-        return -1;
-    }
-    char *argv_dhcp[] = { (char *)"ipconfig", (char *)"set", (char *)bsd, (char *)"DHCP", NULL };
-    pid_t pid = 0;
-    const int rc = posix_spawn(&pid, "/usr/sbin/ipconfig", NULL, NULL, argv_dhcp, environ);
-    if (rc != 0) {
-        return -1;
-    }
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-    }
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 
@@ -248,10 +227,15 @@ static int cmd_scan(io_connect_t conn) {
 /* one per dongle, named like its profile (band, band-N): "5", "2.4", anything else (or none) = auto */
 static char g_band_path[PATH_MAX] = WIFI_CONF_DIR "/band";
 #define WIFI_BAND_PATH g_band_path
+/* the first word of a one-word setting file, "" when the file is missing */
+static void read_word(const char *path, char v[16]) {
+    v[0] = '\0';
+    FILE *f = fopen(path, "r");
+    if (f) { (void)fscanf(f, "%15s", v); fclose(f); }
+}
 static const char *band_pref(void) {
-    char v[8] = "";
-    FILE *f = fopen(WIFI_BAND_PATH, "r");
-    if (f) { (void)fscanf(f, "%7s", v); fclose(f); }
+    char v[16];
+    read_word(WIFI_BAND_PATH, v);
     return strcmp(v, "5") == 0 ? "5" : strcmp(v, "2.4") == 0 ? "2.4" : "auto";
 }
 
@@ -261,9 +245,8 @@ static char g_ps_path[PATH_MAX] = WIFI_CONF_DIR "/powersave";
    so a replugged dongle's fresh worker does the 0.2 s known-channel scan */
 static char g_chans_path[PATH_MAX] = WIFI_CONF_DIR "/chans";
 static bool ps_pref(void) {
-    char v[8] = "";
-    FILE *f = fopen(g_ps_path, "r");
-    if (f) { (void)fscanf(f, "%7s", v); fclose(f); }
+    char v[16];
+    read_word(g_ps_path, v);
     return strcmp(v, "on") == 0;
 }
 static void apply_power_save(void) {
@@ -276,9 +259,8 @@ static void apply_power_save(void) {
    connects with a random address per network, like Windows "MAC Randomization" */
 static char g_mr_path[PATH_MAX] = WIFI_CONF_DIR "/macrandom";
 static bool mr_pref(void) {
-    char v[8] = "";
-    FILE *f = fopen(g_mr_path, "r");
-    if (f) { (void)fscanf(f, "%7s", v); fclose(f); }
+    char v[16];
+    read_word(g_mr_path, v);
     return strcmp(v, "off") != 0;
 }
 /* shared by all dongles; link() so two workers creating it at once agree on one */
@@ -358,9 +340,8 @@ static char g_roam_path[PATH_MAX] = WIFI_CONF_DIR "/roam";
 static const char *const roam_names[] = { "VeryHigh", "High", "Middle", "Low", "VeryLow", "Disable" };
 #define ROAM_MARGIN 8
 static int roam_level(void) { /* index into roam_names, VeryHigh when unset */
-    char v[16] = "";
-    FILE *f = fopen(g_roam_path, "r");
-    if (f) { (void)fscanf(f, "%15s", v); fclose(f); }
+    char v[16];
+    read_word(g_roam_path, v);
     for (int i = 0; i < 6; i++) if (strcmp(v, roam_names[i]) == 0) return i;
     return 0;
 }
@@ -460,7 +441,6 @@ static int perform_connect(io_connect_t conn,
                            io_service_t svc,
                            const char *ssid_arg,
                            const char *passphrase,
-                           bool run_dhcp,
                            wpa2_ctx_t *out_wpa_ctx,
                            bool *out_is_open,
                            char *err_buf,
@@ -530,6 +510,9 @@ static int perform_connect(io_connect_t conn,
             for (int k = 0; k < n_known; ++k) dup |= known_freqs[k] == b->freq;
             if (!dup && n_known < 8) known_freqs[n_known++] = b->freq;
         }
+        /* the known channels may predate a band choice: off the chosen band, scan everything once */
+        if (pass == 0 && target && strcmp(pref, "auto") != 0 && (pref[0] == '5') != (target->freq >= 5000U))
+            target = NULL;
         snprintf(known_ssid, sizeof(known_ssid), "%s", ssid_arg);
         if (target) {
             char v[128];
@@ -715,6 +698,7 @@ static int perform_connect(io_connect_t conn,
             }
         }
         wpa2_ctx_init(wpa_ctx, st.mac_addr, st.ap_bssid, use_ft ? g_ft.pmk_r1 : pmk, kd, (uint8_t)kd_len, pw, grp);
+        wpa_ctx->expect_rsn = target->sec_mask & WPA2_RSN_CHECK_BITS;
         if (use_ft) {
             wpa_ctx->derive_ptk = ft_ptk;
         }
@@ -781,11 +765,6 @@ static int perform_connect(io_connect_t conn,
         set_err(err_buf, err_cap, "SET_PORT_LINK failed: 0x%08x", kr);
         fprintf(stderr, "error: SET_PORT_LINK failed: 0x%08x\n", kr);
         return 1;
-    }
-
-    if (run_dhcp) {
-        const int drc = trigger_dhcp(bsd);
-        printf("      DHCP trigger on %s: rc=%d\n", bsd, drc);
     }
 
     if (out_is_open) {
@@ -1398,9 +1377,6 @@ static void *control_socket_thread(void *arg) {
 }
 
 static int setup_control_socket(void) {
-    const struct group *grp = getgrnam("admin");
-    g_admin_gid = grp ? grp->gr_gid : 20U;
-
     (void)unlink(WIFI_SOCK_PATH);
     const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -1604,7 +1580,6 @@ static bool handle_daemon_pending_command(io_connect_t conn,
                                        svc,
                                        local.ssid,
                                        local.has_pass ? local.pass : NULL,
-                                       true,
                                        wpa_ctx,
                                        is_open_out,
                                        err,
@@ -1658,6 +1633,17 @@ static void on_power(void *ref, io_service_t svc, natural_t msg, void *arg) {
     }
 }
 
+static bool g_ctrl_thread_started;
+static bool g_bound; /* worker_bound ran: once only, it hands fd 3 to the supervisor and closes it */
+
+/* a new USB interface (an AIC8800D80 out of fwload, an RTL8852BU out of its CD) ends the unbound worker's
+   wait at once instead of at its next 0.7 s pass */
+static void on_usb_iface(void *ref, io_iterator_t it) {
+    bool arm = ref != NULL;
+    for (io_service_t s; (s = IOIteratorNext(it));) (IOObjectRelease)(s); /* the header's IOObjectRelease macro is a no-op */
+    if (!arm && !g_bound) wake_daemon_loop();
+}
+
 static void *power_thread(void *arg) {
     (void)arg;
     IONotificationPortRef port = NULL;
@@ -1668,6 +1654,15 @@ static void *power_thread(void *arg) {
         return NULL;
     }
     CFRunLoopAddSource(CFRunLoopGetCurrent(), IONotificationPortGetRunLoopSource(port), kCFRunLoopDefaultMode);
+    IONotificationPortRef usb_port = IONotificationPortCreate(kIOMainPortDefault);
+    io_iterator_t usb_it = IO_OBJECT_NULL;
+    if (usb_port && IOServiceAddMatchingNotification(usb_port, kIOFirstMatchNotification,
+                                                     IOServiceMatching("IOUSBHostInterface"), on_usb_iface,
+                                                     NULL, &usb_it) == KERN_SUCCESS) {
+        on_usb_iface(&usb_it, usb_it); /* arms it: the interfaces already there are not news */
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), IONotificationPortGetRunLoopSource(usb_port),
+                           kCFRunLoopDefaultMode);
+    }
     CFRunLoopRun();
     return NULL;
 }
@@ -1675,9 +1670,9 @@ static void *power_thread(void *arg) {
 /* First bind in a worker: take this dongle's slot paths, its network service and socket, then tell the
    supervisor (fd 3) so it starts the next worker for the next dongle. */
 static pthread_t g_ctrl_thread;
-static bool      g_ctrl_thread_started = false;
 
 static void worker_bound(void) {
+    g_bound = true;
     const int slot = wifi_slot() < 0 ? 0 : wifi_slot();
     if (slot > 0) {
         snprintf(g_conf_path, sizeof(g_conf_path), WIFI_CONF_DIR "/wifi-%d.conf", slot);
@@ -1736,40 +1731,18 @@ static int run_worker(void) {
     while (g_keep_running) {
         io_connect_t conn = IO_OBJECT_NULL;
         io_service_t svc  = IO_OBJECT_NULL;
-        if (wifi_open(&conn, &svc, true, NULL) == 0 && !g_ctrl_thread_started) worker_bound();
-        else if (!g_ctrl_thread_started) {
-            /* wifi_open already waits up to 1 s for an RTL8852BU; an AIC8800D80 is only seen once per pass */
+        if (wifi_open(&conn, &svc, true, NULL) != 0) {
+            /* no free dongle yet. wifi_open already waits 0.2 s for an RTL8852BU; on_usb_iface cuts this sleep
+               short on a plug. Once bound, wifi_open always succeeds and the dongle is ready */
             if (sleep_with_wake_ms(500)) drain_wake_pipe();
-            continue; /* no free dongle yet */
-        }
-        sync_saved_ssid_snapshot();
-        if (conn == IO_OBJECT_NULL) {
-            refresh_snapshot(IO_OBJECT_NULL, IO_OBJECT_NULL);
-            wpa2_ctx_t dummy_ctx;
-            bool dummy_open = false;
-            bool dummy_conn = false;
-            if (sleep_with_wake_ms(1500)) {
-                drain_wake_pipe();
-                (void)handle_daemon_pending_command(IO_OBJECT_NULL, IO_OBJECT_NULL, &dummy_ctx, &dummy_open, &dummy_conn);
-            }
             continue;
         }
-
+        if (!g_bound) worker_bound();
+        sync_saved_ssid_snapshot();
         refresh_snapshot(conn, svc);
         apply_power_save(); /* every open starts with it off */
         wifi_status_t st;
-        if (wifi_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready) {
-            IOServiceClose(conn);
-            IOObjectRelease(svc);
-            if (sleep_with_wake_ms(800)) {
-                drain_wake_pipe();
-                wpa2_ctx_t dummy_ctx;
-                bool dummy_open = false;
-                bool dummy_conn = false;
-                (void)handle_daemon_pending_command(IO_OBJECT_NULL, IO_OBJECT_NULL, &dummy_ctx, &dummy_open, &dummy_conn);
-            }
-            continue;
-        }
+        (void)wifi_get_status(conn, &st);
 
         /* Process any queued socket command before auto-connect */
         wpa2_ctx_t wpa_ctx;
@@ -1819,7 +1792,6 @@ static int run_worker(void) {
                                            svc,
                                            target_ssid,
                                            target_has_pass ? target_pass : NULL,
-                                           true,
                                            &wpa_ctx,
                                            &is_open,
                                            err,
@@ -1965,7 +1937,10 @@ static int run_daemon(void) {
             int st;
             if (w[i].pid <= 0 || waitpid(w[i].pid, &st, WNOHANG) != w[i].pid) continue;
             if (w[i].fd >= 0) close(w[i].fd);
-            if (w[i].slot >= 0) {
+            bool slot_reused = false; /* a replug can bind the same slot before this reap: leave its paths */
+            for (int j = 0; j <= WIFI_MAX_SLOTS; j++)
+                if (j != i && w[j].pid > 0 && w[j].slot == w[i].slot) slot_reused = true;
+            if (w[i].slot >= 0 && !slot_reused) {
                 char sock[64];
                 printf("usbwifid: slot %d worker exited (%d)\n", w[i].slot, st);
                 unpeer_slot(w[i].slot);
@@ -2029,7 +2004,7 @@ static void print_usage(const char *prog) {
             "Usage:\n"
             "  sudo %s status\n"
             "  sudo %s scan\n"
-            "  sudo %s connect <SSID> [passphrase] [--no-dhcp] [--stay]\n"
+            "  sudo %s connect <SSID> [passphrase] [--stay]   (or the passphrase in env USBWIFI_PASS)\n"
             "  sudo %s save <SSID> [passphrase]    (save auto-connect profile to wifi.conf)\n"
             "  sudo %s disconnect\n"
             "  %s cd-eject                         (switch a Realtek driver CD to Wi-Fi; as the console user)\n"
@@ -2065,17 +2040,15 @@ int main(int argc, char **argv) {
         return save_profile(argv[2], pass);
     }
 
+    char json[IPC_BUF_SIZE]; /* a running daemon holds the dongle: ask it */
+    if (strcmp(argv[1], "status") == 0 && query_daemon_socket("STATUS", json, sizeof(json)) == 0) {
+        printf("%s", json);
+        return 0;
+    }
+
     io_connect_t conn = IO_OBJECT_NULL;
     io_service_t svc  = IO_OBJECT_NULL;
-    kern_return_t open_kr = KERN_FAILURE;
-    if (wifi_open(&conn, &svc, false, &open_kr) != 0) {
-        if (open_kr == kIOReturnNotPrivileged && strcmp(argv[1], "status") == 0) {
-            char json[IPC_BUF_SIZE];
-            if (query_daemon_socket("STATUS", json, sizeof(json)) == 0) {
-                printf("%s", json);
-                return 0;
-            }
-        }
+    if (wifi_open(&conn, &svc, false, NULL) != 0) {
         return 1;
     }
 
@@ -2086,21 +2059,21 @@ int main(int argc, char **argv) {
         rc = cmd_scan(conn);
     } else if (strcmp(argv[1], "connect") == 0 && argc >= 3) {
         const char *ssid = argv[2];
-        const char *pass = NULL;
+        const char *pass = getenv("USBWIFI_PASS"); /* keeps the passphrase out of ps; argv still works */
         bool stay = false;
-        bool run_dhcp = true;
+        if (pass && !*pass) pass = NULL;
         for (int i = 3; i < argc; ++i) {
             if (strcmp(argv[i], "--stay") == 0) {
                 stay = true;
             } else if (strcmp(argv[i], "--no-dhcp") == 0) {
-                run_dhcp = false;
+                /* old flag, ignored: configd runs DHCP on the network service */
             } else if (!pass) {
                 pass = argv[i];
             }
         }
         wpa2_ctx_t wpa_ctx;
         bool is_open = false;
-        rc = perform_connect(conn, svc, ssid, pass, run_dhcp, &wpa_ctx, &is_open, NULL, 0U);
+        rc = perform_connect(conn, svc, ssid, pass, &wpa_ctx, &is_open, NULL, 0U);
         if (rc == 0 && stay) {
             signal(SIGINT, on_sigterm);
             signal(SIGTERM, on_sigterm);

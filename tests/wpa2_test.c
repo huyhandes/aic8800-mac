@@ -15,16 +15,23 @@
 #define ENC  WPA_KEY_INFO_ENC_KEY_DATA
 
 /* EAPOL-Key frame (HMAC-SHA1 MIC); ptk != NULL signs it with ptk's KCK and, with gtk_byte != 0,
-   wraps a GTK KDE (16 x gtk_byte, key id 1) under ptk's KEK */
+   wraps a GTK KDE (16 x gtk_byte, key id 1), behind g_rsne when set, under ptk's KEK */
+static const uint8_t *g_rsne; /* a 22-byte RSNE */
 static size_t frame(uint8_t *f, uint16_t info, uint8_t replay, uint8_t anonce, const uint8_t *ptk, uint8_t gtk_byte)
 {
-	uint8_t kd[32] = { 0 };
+	uint8_t kd[64] = { 0 };
 	size_t kd_len = 0;
 	if (gtk_byte) {
-		uint8_t kde[24] = { 0xdd, 22, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00 };
-		memset(kde + 8, gtk_byte, 16);
+		uint8_t kde[48] = { 0 };
+		const size_t at = g_rsne ? 22 : 0, n = g_rsne ? 48 : 24; /* 22 + 24 padded with dd 00 */
+		if (g_rsne) {
+			memcpy(kde, g_rsne, 22);
+			kde[46] = 0xdd;
+		}
+		memcpy(kde + at, (const uint8_t[]){ 0xdd, 22, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00 }, 8);
+		memset(kde + at + 8, gtk_byte, 16);
 		kd_len = sizeof(kd);
-		assert(CCSymmetricKeyWrap(kCCWRAPAES, CCrfc3394_iv, CCrfc3394_ivLen, ptk + 16, 16, kde, sizeof(kde),
+		assert(CCSymmetricKeyWrap(kCCWRAPAES, CCrfc3394_iv, CCrfc3394_ivLen, ptk + 16, 16, kde, n,
 					  kd, &kd_len) == kCCSuccess);
 	}
 	const size_t body = 95 + kd_len;
@@ -418,6 +425,19 @@ int main(void)
 
 	/* truncated frame: dropped */
 	assert(RX(20) == 0);
+
+	/* M3's RSNE against the scanned beacon: the same AKM passes, another (a forged beacon) fails */
+	uint8_t rsne[22];
+	wifi_build_wpa2_rsn_ie(rsne, WIFI_CIPHER_CCMP, false);
+	g_rsne = rsne;
+	for (int downgrade = 0; downgrade < 2; downgrade++) {
+		wpa2_ctx_init(&c, spa, aa, pmk, NULL, 0, WIFI_CIPHER_CCMP, WIFI_CIPHER_CCMP);
+		c.expect_rsn = downgrade ? (WIFI_SEC_WPA3_SAE | WIFI_SEC_SHA256 | WIFI_SEC_MFP_REQ) : WIFI_SEC_WPA2_PSK;
+		assert(RX(frame(f, PW | ACK, 1, 0xaa, NULL, 0)) == 1);
+		const int rc = RX(frame(f, PW | ACK | MIC | SEC | ENC, 2, 0xaa, c.tptk, 0x11));
+		assert(downgrade ? (rc == -1 && !kr && !c.has_ptk) : (rc == 1 && kr && c.gtk[0] == 0x11));
+	}
+	g_rsne = NULL;
 
 	/* random MAC: locally administered unicast, stable per network, different per network and per dongle */
 	uint8_t m1[6], m2[6], m3[6], m4[6];

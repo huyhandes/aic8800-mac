@@ -391,8 +391,8 @@ static void rx_one(struct sk_buff *skb, struct rxout *o)
 		}
 		if (!(st->flag & RX_FLAG_MIC_STRIPPED))
 			skb_trim(skb, skb->len - 8);
-	} else if (M.rsn && M.ptk) {
-		goto drop; /* keys are in place: plaintext data is not accepted */
+	} else if (M.rsn && (M.ptk || M.txblock)) {
+		goto drop; /* keys are in place (or a rekey failed): plaintext data is not accepted */
 	}
 
 	p = skb->data + hl;
@@ -890,6 +890,7 @@ static void mgmt_work_fn(struct wiphy *w, struct wiphy_work *wk)
 					__skb_queue_head_init(&o.q);
 					mutex_lock(&rx_lock);
 					rx_reord_flush_tid(&M.reord, tid, false, rx_deliver, rx_drop, &o);
+					M.reord.tids[tid].ind_sn = ssn & RX_REORD_SN_MASK; /* the window starts at the SSN, as in mac80211 */
 					M.ba_rx |= BIT(tid);
 					mutex_unlock(&rx_lock);
 					rx_flush_out(&o);

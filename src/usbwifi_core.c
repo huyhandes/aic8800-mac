@@ -128,6 +128,8 @@ static void scan_add(wifi_scan_bss_t bss) {
 
 static void ev_bss(const uint8_t *mgmt, size_t len, uint16_t freq, int8_t rssi) {
     wifi_scan_bss_t bss;
+    /* the AIC firmware sometimes reports center_freq 0x8000; rwnx drops a result whose channel it cannot find */
+    if (freq < 2412U || freq > 7125U) return;
     if (wifi_parse_bss(mgmt, len, freq, rssi, &bss) == 0) scan_add(bss);
 }
 
@@ -374,7 +376,9 @@ int wifi_open(io_connect_t *out_conn, io_service_t *out_svc, bool quiet, kern_re
         for (size_t k = 0; k < n && !drv; k++) {
             const size_t i = (first + k) % n;
             memset(&g.info, 0, sizeof(g.info));
-            int rc = wifi_drivers[i]->open(&events, &g.info, 1000);
+            /* short: the unbound worker loops and an IOKit plug notice wakes it, so a long RTL8852BU wait
+               only delays seeing an AIC8800D80 that comes up meanwhile */
+            int rc = wifi_drivers[i]->open(&events, &g.info, 200);
             if (rc == 0) drv = wifi_drivers[i], led(WIFI_LED_IDLE);
             else if (rc != -ENODEV) { /* half-bound dongle: start over in a fresh process */
                 if ((bf = fopen(WIFI_RUN_DIR "/bad-driver", "w"))) fprintf(bf, "%zu\n", i), fclose(bf);
