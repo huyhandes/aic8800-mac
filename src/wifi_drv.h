@@ -63,6 +63,26 @@ struct wifi_connect_params {
 	size_t ie_len;
 };
 
+/* 802.11r FT-PSK for the optional op ft_connect. Initial association (auth_len 0): the driver checks the AP
+   offers FT-PSK and a mobility domain, adds the AP's MDE after the given RSNE (AKM 4) and fills md, or returns
+   -EOPNOTSUPP before authenticating. Roam: FT authentication carrying auth_ie, then a reassociation from
+   prev_bssid whose RSNE, MDE and FTE reassoc_ie builds from the authentication response; -EOPNOTSUPP when the
+   AP is not in mobility domain md. Either way resp gets the (re)association response's elements. */
+struct wifi_ft {
+	const uint8_t *auth_ie;
+	size_t auth_len;
+	uint8_t md[3]; /* MDE body: MDID (2, as sent), FT capability */
+	uint8_t prev_bssid[6];
+	int (*reassoc_ie)(void *arg, const uint8_t *auth_resp_ie, size_t len, uint8_t *out, size_t cap); /* length or -1 */
+	/* WPA3-SAE instead of FT (the FT fields then unused): rx and tx start at the authentication transaction
+	   number; rx NULL asks for our first commit (rx_len 1 then: the AP takes hash-to-element). Returns the tx length, 0 once the AP's confirm checks out,
+	   -1 to give up. */
+	int (*sae)(void *arg, const uint8_t *rx, size_t rx_len, uint8_t *tx, size_t cap);
+	void *arg;
+	uint8_t resp[512];
+	size_t resp_len;
+};
+
 struct wifi_drv {
 	const char *name;
 	/* bind the first supported dongle no other process holds and bring the radio up; 0 or -errno.
@@ -84,6 +104,14 @@ struct wifi_drv {
 	void (*led)(enum wifi_led s); /* may run from an event: must not block */
 	/* off after open(); once on, it stays on across connects. 0 or -errno */
 	int (*power_save)(bool on);
+	/* station address while not connected (MAC randomization); 0 or -errno */
+	int (*set_mac)(const uint8_t mac[6]);
+	/* the current AP's signal in dBm, 0 = unknown; must not block */
+	int (*rssi)(void);
+	/* 11k/11v roam channels since the last call (see rtwd_roam_hint), count or 0 */
+	int (*roam_hint)(uint16_t freqs[8], uint8_t bssid[6], bool *btm);
+	/* connect() with 802.11r FT-PSK or WPA3-SAE (struct wifi_ft) */
+	int (*ft_connect)(const struct wifi_connect_params *p, struct wifi_ft *ft);
 };
 
 extern const struct wifi_drv wifi_drv_aic8800, wifi_drv_rtw89;

@@ -1,4 +1,4 @@
-# Apple Silicon (macos) USB Wifi Unified Driver
+# Apple Silicon (macos) Unified USB Wifi Driver
 
 Userspace macOS driver for USB Wi-Fi dongles on Apple Silicon. Supported chips:
 

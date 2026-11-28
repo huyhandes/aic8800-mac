@@ -175,6 +175,34 @@ static void led(enum wifi_led s) {
 bool wifi_has_power_save(void) { return drv && drv->power_save; }
 int wifi_set_power_save(bool on) { return wifi_has_power_save() ? drv->power_save(on) : -EOPNOTSUPP; }
 
+bool wifi_has_rssi(void) { return drv && drv->rssi; }
+int wifi_get_rssi(void) { return wifi_has_rssi() ? drv->rssi() : 0; }
+int wifi_roam_hint(uint16_t freqs[8], uint8_t bssid[6], bool *btm) {
+    *btm = false;
+    return drv && drv->roam_hint ? drv->roam_hint(freqs, bssid, btm) : 0;
+}
+
+static uint8_t g_perm_mac[6]; /* the dongle's own address: the adapter slot stays keyed on it */
+bool wifi_has_set_mac(void) { return drv && drv->set_mac; }
+int wifi_set_mac(const uint8_t *mac) {
+    if (!wifi_has_set_mac()) return -EOPNOTSUPP;
+    if (!mac) mac = g_perm_mac;
+    if (memcmp(mac, g.info.mac, 6) == 0) return 0;
+    const int r = drv->set_mac(mac);
+    if (r) return r;
+    pthread_mutex_lock(&g.state_lock);
+    memcpy(g.info.mac, mac, 6);
+    pthread_mutex_unlock(&g.state_lock);
+    char a[18];
+    snprintf(a, sizeof(a), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    fprintf(stderr, "usbwifi: station address now %s\n", a);
+    if (getenv("AICD_NO_NET") == NULL) { /* feth must carry it too: ARP, DHCP and the BPF path use feth's */
+        char *c[] = { "ifconfig", wifi_if_host, "lladdr", a, NULL };
+        if (run_cmd("/sbin/ifconfig", c) != 0) fprintf(stderr, "usbwifi: feth lladdr %s failed\n", a);
+    }
+    return 0;
+}
+
 static void ev_assoc(const struct wifi_drv_assoc *a) {
     pthread_mutex_lock(&g.state_lock);
     g.assoc_status = a->status;
@@ -368,6 +396,7 @@ int wifi_open(io_connect_t *out_conn, io_service_t *out_svc, bool quiet, kern_re
             return -1; /* not plugged / firmware not loaded yet: caller retries */
         }
         const uint8_t *m = g.info.mac;
+        memcpy(g_perm_mac, m, 6);
         fprintf(stderr, "usbwifi: %s up (%s driver), mac %02x:%02x:%02x:%02x:%02x:%02x\n", g.info.chip, drv->name,
                 m[0], m[1], m[2], m[3], m[4], m[5]);
         if (getenv("AICD_NO_NET") == NULL) {
@@ -459,9 +488,15 @@ kern_return_t wifi_get_scan_results(io_connect_t conn, wifi_scan_list_t *o) {
     return KERN_SUCCESS;
 }
 
+bool wifi_has_ft(void) { return drv && drv->ft_connect; }
 kern_return_t wifi_connect(io_connect_t conn, const wifi_connect_req_t *in, wifi_connect_req_t *out) {
+    return wifi_connect_ft(conn, in, out, NULL);
+}
+kern_return_t wifi_connect_ft(io_connect_t conn, const wifi_connect_req_t *in, wifi_connect_req_t *out,
+                              struct wifi_ft *ft) {
     (void)conn;
     if (!g.started) return kIOReturnNotReady;
+    if (ft && !wifi_has_ft()) return kIOReturnUnsupported;
     if (in->ssid_len == 0 || in->ssid_len > AIC_MAC_SSID_LEN || in->ie_len > WIFI_CONNECT_IE_MAX)
         return kIOReturnBadArgument;
     *out = *in;
@@ -488,8 +523,9 @@ kern_return_t wifi_connect(io_connect_t conn, const wifi_connect_req_t *in, wifi
         .ie = in->ie_len ? in->ie_buf : NULL, .ie_len = in->ie_len,
     };
     memcpy(p.bssid, in->bssid, 6);
-    int rc = drv->connect(&p);
+    int rc = ft ? drv->ft_connect(&p, ft) : drv->connect(&p);
     if (rc != 0) led(WIFI_LED_IDLE);
+    if (rc == -EOPNOTSUPP) return kIOReturnUnsupported;
     if (rc < 0) return kIOReturnIOError;
     out->out_status = (uint8_t)rc;
     return KERN_SUCCESS;

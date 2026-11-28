@@ -29,9 +29,9 @@ static int nop_tx(const uint8_t *e, size_t l) { return 0; }
 
 /* the core's driver table names these two; here they stand for "a stuck chip" and "a new chip" */
 const struct wifi_drv wifi_drv_aic8800 = { "stuck", stuck_open, fake_scan, nop_connect, nop_disconnect,
-					   nop_key, nop_auth, nop_tx, NULL, NULL, NULL };
+					   nop_key, nop_auth, nop_tx, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
 const struct wifi_drv wifi_drv_rtw89 = { "fake3", fake_open, fake_scan, nop_connect, nop_disconnect,
-					 nop_key, nop_auth, nop_tx, NULL, NULL, NULL };
+					 nop_key, nop_auth, nop_tx, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
 
 static int child(void)
 {

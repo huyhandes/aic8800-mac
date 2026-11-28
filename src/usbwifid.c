@@ -43,7 +43,7 @@
 
 #include "aic8800_abi.h"
 #include "aic8800_wifi_ctl.h"
-#include "aic8800_wpa2.h"
+#include "rtl_sae.h"
 #include "usbwifi_core.h" /* in-process station core + chip drivers replace the kext */
 #include "rtwd.h"
 
@@ -273,6 +273,49 @@ static void apply_power_save(void) {
     if (r && r != -EOPNOTSUPP) fprintf(stderr, "warn: power save %s failed (%d)\n", on ? "on" : "off", r);
 }
 
+/* one per dongle (macrandom, macrandom-N): "off" keeps the dongle's own address, anything else (or none)
+   connects with a random address per network, like Windows "MAC Randomization" */
+static char g_mr_path[PATH_MAX] = WIFI_CONF_DIR "/macrandom";
+static bool mr_pref(void) {
+    char v[8] = "";
+    FILE *f = fopen(g_mr_path, "r");
+    if (f) { (void)fscanf(f, "%7s", v); fclose(f); }
+    return strcmp(v, "off") != 0;
+}
+/* shared by all dongles; link() so two workers creating it at once agree on one */
+static bool mac_secret(uint8_t s[32]) {
+    const char *path = WIFI_CONF_DIR "/macsecret";
+    char hex[65] = "";
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        char tmp[PATH_MAX];
+        snprintf(tmp, sizeof(tmp), "%s.%d", path, (int)getpid());
+        (void)mkdir(WIFI_CONF_DIR, 0755);
+        arc4random_buf(s, 32);
+        FILE *w = fopen(tmp, "w");
+        if (w) {
+            (void)fchmod(fileno(w), 0600);
+            for (int i = 0; i < 32; i++) fprintf(w, "%02x", s[i]);
+            fclose(w);
+            (void)link(tmp, path);
+            (void)unlink(tmp);
+        }
+        f = fopen(path, "r");
+    }
+    const bool ok = f && fscanf(f, "%64[0-9a-f]", hex) == 1 && strlen(hex) == 64;
+    if (f) fclose(f);
+    for (int i = 0; ok && i < 32; i++) (void)sscanf(hex + 2 * i, "%2hhx", &s[i]);
+    return ok;
+}
+static void apply_mac(const char *ssid, size_t ssid_len) {
+    uint8_t s[32], m[6];
+    if (!wifi_has_set_mac()) return;
+    const bool rnd = mr_pref() && mac_secret(s);
+    if (rnd) rtl_random_mac(s, wifi_slot() < 0 ? 0 : wifi_slot(), (const uint8_t *)ssid, ssid_len, m);
+    const int r = wifi_set_mac(rnd ? m : NULL);
+    if (r) fprintf(stderr, "warn: station address change failed (%d), keeping the current one\n", r);
+}
+
 /* each slot runs its own worker: write and rename so two commands never interleave */
 static bool write_pref(const char *path, const char *v) {
     (void)mkdir(WIFI_CONF_DIR, 0755);
@@ -289,11 +332,129 @@ static bool write_pref(const char *path, const char *v) {
     return ok;
 }
 
+/* the channels this SSID was last seen on, so a rescan takes ~0.2 s instead of ~3 s */
+static char     known_ssid[33];
+static uint16_t known_freqs[8];
+static int      n_known;
+/* reconnect to the BSS of the last successful join without scanning; cleared on any failure.
+   A roam puts its target here and drops the link. */
+static wifi_scan_bss_t last_bss;
+static bool have_last;
+static ft_state_t g_ft; /* RTL FT-PSK (wifi_has_ft): the PMK-R0 a roam within the mobility domain reuses */
+static uint8_t ft_prev[6]; /* the BSS roam_check left, for the reassociation's current AP field */
+static bool ft_roam, ft_off; /* ft_off: a first FT association failed, so plain PSK from now on */
+/* shortcut: SAE failing once on a WPA2/WPA3 AP means WPA2-PSK there until the daemon restarts */
+static bool sae_off;
+
 /* auto: 5 GHz unless it is >15 dB weaker or below -75 dBm; a chosen band wins while above -80 dBm */
 static int band_score(const wifi_scan_bss_t *b, const char *pref) {
     const bool is5 = b->freq >= 5000U;
     if (strcmp(pref, "auto") == 0) return b->rssi + ((is5 && b->rssi > -75) ? 15 : 0);
     return b->rssi + (((pref[0] == '5') == is5 && b->rssi > -80) ? 100 : 0);
+}
+
+/* one per dongle (roam, roam-N): Windows "Roaming Sensitivity Level". Below the level's signal the worker
+   rescans the known channels and moves to a same-SSID BSS that scores ROAM_MARGIN dB better. */
+static char g_roam_path[PATH_MAX] = WIFI_CONF_DIR "/roam";
+static const char *const roam_names[] = { "VeryHigh", "High", "Middle", "Low", "VeryLow", "Disable" };
+#define ROAM_MARGIN 8
+static int roam_level(void) { /* index into roam_names, VeryHigh when unset */
+    char v[16] = "";
+    FILE *f = fopen(g_roam_path, "r");
+    if (f) { (void)fscanf(f, "%15s", v); fclose(f); }
+    for (int i = 0; i < 6; i++) if (strcmp(v, roam_names[i]) == 0) return i;
+    return 0;
+}
+/* true when it dropped the link to move to a better BSS: the caller reconnects to last_bss without a scan */
+static bool roam_check(io_connect_t conn, const wifi_status_t *st) {
+    static uint64_t next_ms;
+    static int wait_ms = 15000;
+    uint16_t hf[8];
+    uint8_t hb[6];
+    bool btm; /* 11v: the AP asked us to move (and the driver already said yes), so no threshold or margin */
+    const int nh = wifi_roam_hint(hf, hb, &btm);
+    for (int i = 0; i < nh; i++) { /* 11k/11v channels join the known ones */
+        int k = 0;
+        while (k < n_known && known_freqs[k] != hf[i]) k++;
+        if (k == n_known && n_known < 8) known_freqs[n_known++] = hf[i];
+    }
+    const int rssi = wifi_get_rssi();
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ULL;
+    const int lvl = rssi < -60 ? roam_level() : 5;
+    if (n_known == 0) return false;
+    if (!btm && (rssi == 0 || lvl == 5 || rssi >= -60 - 5 * lvl)) {
+        wait_ms = 15000; /* signal is fine again: the next dip scans soon */
+        next_ms = 0;
+        return false;
+    }
+    if (!btm && now < next_ms) return false;
+    wifi_scan_list_t list;
+    if (run_scan_and_wait(conn, (const uint8_t *)known_ssid, (uint8_t)strlen(known_ssid), known_freqs, n_known,
+                          &list, NULL, 0U) != 0) {
+        next_ms = now + (uint64_t)wait_ms;
+        return false;
+    }
+    const char *pref = band_pref();
+    wifi_scan_bss_t cur = { .freq = st->ap_center_freq, .rssi = (int8_t)rssi };
+    const wifi_scan_bss_t *best = NULL;
+    bool pinned = false; /* the AP's BTM target was seen */
+    const size_t ssid_len = strlen(known_ssid);
+    for (uint16_t i = 0U; i < list.count; ++i) {
+        const wifi_scan_bss_t *b = &list.bss[i];
+        if (b->ssid_len != ssid_len || memcmp(b->ssid, known_ssid, ssid_len) != 0) continue;
+        if (memcmp(b->bssid, st->ap_bssid, 6) == 0) { cur.rssi = b->rssi; continue; } /* same scan, fair compare */
+        if ((last_bss.sec_mask & AIC_SEC_WPA2_PSK) && !(b->sec_mask & AIC_SEC_WPA2_PSK)) continue; /* last_bss = now */
+        if (pinned) continue;
+        if (btm && memcmp(b->bssid, hb, 6) == 0) pinned = true;
+        if (pinned || !best || band_score(b, pref) > band_score(best, pref)) best = b;
+    }
+    if (!best || (!btm && band_score(best, pref) < band_score(&cur, pref) + ROAM_MARGIN)) {
+        next_ms = now + (uint64_t)wait_ms;
+        if (wait_ms < 240000) wait_ms *= 2; /* one AP and a weak spot: don't keep going off channel */
+        return false;
+    }
+    printf("roam: %d dBm on %u MHz -> %02x:%02x:%02x:%02x:%02x:%02x %d dBm on %u MHz (%s)\n",
+           (int)cur.rssi, cur.freq, best->bssid[0], best->bssid[1], best->bssid[2], best->bssid[3],
+           best->bssid[4], best->bssid[5], (int)best->rssi, best->freq, btm ? "BSS transition request" : roam_names[lvl]);
+    last_bss = *best;
+    have_last = true;
+    memcpy(ft_prev, st->ap_bssid, 6);
+    ft_roam = true;
+    wait_ms = 15000;
+    next_ms = now + 15000; /* settle on the new AP before judging it */
+    (void)wifi_disconnect(conn, 3U);
+    return true;
+}
+
+static int install_keys(io_connect_t conn, const aic_wpa2_ctx_t *c, char *err_buf, size_t err_cap) {
+    uint8_t hw_idx = 0U;
+    kern_return_t kr = wifi_add_key(conn, 0U, true, c->pairwise_cipher, &c->ptk[32], 16U, &hw_idx);
+    if (kr != KERN_SUCCESS) {
+        set_err(err_buf, err_cap, "Install PTK failed: 0x%08x", kr);
+        fprintf(stderr, "error: install PTK failed: 0x%08x\n", kr);
+        return 1;
+    }
+    printf("      Installed PTK (hw_key_idx=%u)\n", hw_idx);
+    if (c->has_gtk) {
+        kr = wifi_add_key(conn, c->gtk_idx, false, c->group_cipher, c->gtk, c->gtk_len, &hw_idx);
+        if (kr != KERN_SUCCESS) {
+            set_err(err_buf, err_cap, "Install GTK failed: 0x%08x", kr);
+            fprintf(stderr, "error: install GTK failed: 0x%08x\n", kr);
+            return 1;
+        }
+        printf("      Installed GTK idx=%u (hw_key_idx=%u)\n", c->gtk_idx, hw_idx);
+    }
+    return 0;
+}
+
+/* RTL with PMF: the IGTK from an accepted M3 or group M1, so mlme can check BIP on broadcast deauth/disassoc.
+   Sent again on every group handshake: mlme keeps the replay counter of a key it already holds. */
+static void install_igtk(io_connect_t conn, const aic_wpa2_ctx_t *c, const uint8_t *eth, size_t len) {
+    uint8_t k[22], hw_idx = 0U;
+    const int id = wifi_has_ft() ? rtl_igtk(c, eth, len, k) : 0;
+    if (id && wifi_add_key(conn, (uint8_t)id, false, AIC_CIPHER_BIP_CMAC_128, k, sizeof(k), &hw_idx) == KERN_SUCCESS) {
+        printf("      Installed IGTK idx=%d\n", id);
+    }
 }
 
 static int perform_connect(io_connect_t conn,
@@ -314,6 +475,9 @@ static int perform_connect(io_connect_t conn,
         fprintf(stderr, "error: invalid SSID length\n");
         return 1;
     }
+    apply_mac(ssid_arg, ssid_len); /* before scanning: the probes and the join use the same address */
+    const bool roaming = ft_roam;
+    ft_roam = false;
 
     wifi_status_t st;
     if (wifi_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready) {
@@ -324,9 +488,6 @@ static int perform_connect(io_connect_t conn,
 
     /* A full scan (38 channels, DFS ones passive) takes ~3 s; rescan only the channels this SSID was last
        seen on (~0.2 s) and fall back to the full scan when it is not there. */
-    static char     known_ssid[33];
-    static uint16_t known_freqs[8];
-    static int      n_known;
     if (n_known == 0) {
         char line[128], name[40];
         FILE *f = fopen(g_chans_path, "r");
@@ -342,9 +503,6 @@ static int perform_connect(io_connect_t conn,
     const bool fast = n_known > 0 && strcmp(known_ssid, ssid_arg) == 0;
     wifi_scan_list_t list;
     const wifi_scan_bss_t *target = NULL;
-    /* reconnect to the BSS of the last successful join without scanning; cleared on any failure */
-    static wifi_scan_bss_t last_bss;
-    static bool have_last;
     const char *pref = band_pref();
     const bool last_band_ok = strcmp(pref, "auto") == 0 || (pref[0] == '5') == (last_bss.freq >= 5000U);
     /* with a passphrase only a WPA2 BSS will do: a same-named open AP must not get the traffic */
@@ -397,8 +555,10 @@ static int perform_connect(io_connect_t conn,
 
     const bool is_open = (target->sec_mask & (AIC_SEC_PRIVACY | AIC_SEC_WPA_PSK | AIC_SEC_WPA2_PSK | AIC_SEC_WPA3_SAE | AIC_SEC_8021X)) == 0U;
     const bool has_wpa2 = (target->sec_mask & AIC_SEC_WPA2_PSK) != 0U;
+    /* WPA3-SAE (with PMF) when the driver connects through ft_connect (RTL); WPA2-PSK after SAE failed once */
+    const bool try_sae = (target->sec_mask & AIC_SEC_WPA3_SAE) && wifi_has_ft() && !(sae_off && has_wpa2);
 
-    if (!is_open && !has_wpa2) {
+    if (!is_open && !has_wpa2 && !try_sae) {
         set_err(err_buf, err_cap, "Unsupported security: %s (needs OPEN or WPA2-PSK)", sec_str);
         fprintf(stderr, "error: security mode '%s' is not supported (requires OPEN or WPA2-PSK/Mixed)\n",
                 sec_str);
@@ -424,6 +584,34 @@ static int perform_connect(io_connect_t conn,
         rsn_ie_len = aic_build_wpa2_rsn_ie(rsn_ie, grp, false);
     }
 
+    /* FT-PSK when the driver has it: the driver says unsupported, before authenticating, when the AP has no FT */
+    const bool try_ft = !is_open && !try_sae && wifi_has_ft() && !ft_off;
+    const bool ft_reassoc = try_ft && roaming && g_ft.ok && target == &last_bss && memcmp(g_ft.sta, st.mac_addr, 6) == 0;
+    g_ft.ok = false; /* a failed FT roam must not be retried: the next attempt authenticates in full */
+    struct wifi_ft ft = { .arg = &g_ft, .reassoc_ie = ft_reassoc_ie };
+    uint8_t ft_auth[40 + 5 + 2 + 82 + 2 + 48];
+    if (try_ft) {
+        rsn_ie[19] = 4U; /* AKM 00-0f-ac:4, FT-PSK */
+        memcpy(ft.md, g_ft.md, 3U);
+    }
+    sae_t sae;
+    struct wifi_ft sae_ft = { .sae = sae_step, .arg = &sae };
+    if (try_sae) {
+        if (sae_init(&sae, st.mac_addr, target->bssid, target->ssid, target->ssid_len, passphrase, strlen(passphrase)) != 0) {
+            set_err(err_buf, err_cap, "SAE password element not found");
+            fprintf(stderr, "error: SAE password element derivation failed\n");
+            return 1;
+        }
+        rsn_ie[19] = 8U;    /* AKM 00-0f-ac:8, SAE */
+        rsn_ie[20] |= 0x80U; /* MFPC: WPA3 needs PMF */
+        sae_off = has_wpa2; /* cleared once SAE associates */
+    }
+    if (ft_reassoc) {
+        ft.auth_ie = ft_auth;
+        ft.auth_len = ft_auth_ie(&g_ft, target->bssid, ft_auth);
+        memcpy(ft.prev_bssid, ft_prev, 6U);
+    }
+
     printf("[2/4] Associating via SM_CONNECT_REQ...\n");
     wifi_connect_req_t creq;
     wifi_connect_req_t cresp;
@@ -442,7 +630,16 @@ static int perform_connect(io_connect_t conn,
         memcpy(creq.ie_buf, rsn_ie, rsn_ie_len);
     }
 
-    kern_return_t kr = wifi_connect(conn, &creq, &cresp);
+    kern_return_t kr = try_sae ? wifi_connect_ft(conn, &creq, &cresp, &sae_ft)
+                     : try_ft ? wifi_connect_ft(conn, &creq, &cresp, &ft) : kIOReturnUnsupported;
+    const bool use_ft = try_ft && kr != kIOReturnUnsupported;
+    if (!use_ft && !try_sae) {
+        rsn_ie[19] = creq.ie_buf[19] = 2U;
+        kr = wifi_connect(conn, &creq, &cresp);
+    } else if (!ft_reassoc) {
+        /* shortcut: any failure of a first FT association (also a timeout) means plain PSK until the daemon restarts */
+        ft_off = true;
+    }
     if (kr != KERN_SUCCESS || cresp.out_status != 0U) {
         set_err(err_buf, err_cap, "SM_CONNECT_REQ failed (status=%u)", cresp.out_status);
         fprintf(stderr, "error: SM_CONNECT_REQ failed kr=0x%08x fw_status=%u\n", kr, cresp.out_status);
@@ -469,17 +666,59 @@ static int perform_connect(io_connect_t conn,
         fprintf(stderr, "error: timed out waiting for SM_CONNECT_IND\n");
         return 1;
     }
+    const bool h2e = try_sae && sae.h2e; /* read before the wipe below */
+    if (try_sae) {
+        memcpy(pmk, sae.pmk, sizeof(pmk));
+        sae_off = false;
+    }
+    memset(&sae, 0, sizeof(sae));
     printf("      Associated! ap_sta_idx=%u bssid=%02x:%02x:%02x:%02x:%02x:%02x freq=%u\n",
            st.ap_sta_idx, st.ap_bssid[0], st.ap_bssid[1], st.ap_bssid[2],
            st.ap_bssid[3], st.ap_bssid[4], st.ap_bssid[5], st.ap_center_freq);
 
     aic_wpa2_ctx_t local_ctx;
     aic_wpa2_ctx_t *wpa_ctx = out_wpa_ctx ? out_wpa_ctx : &local_ctx;
-    if (!is_open) {
-        printf("[3/4] Running WPA2-PSK 4-Way Handshake...\n");
+    if (!is_open && use_ft && ft_reassoc) {
+        printf("[3/4] FT reassociation: keys from the PMK-R0, no 4-way handshake\n");
         const uint8_t pw = (target->pairwise_cipher != AIC_CIPHER_INVALID) ? target->pairwise_cipher : AIC_CIPHER_CCMP;
         const uint8_t grp = (target->group_cipher != AIC_CIPHER_INVALID) ? target->group_cipher : AIC_CIPHER_CCMP;
-        aic_wpa2_ctx_init(wpa_ctx, st.mac_addr, st.ap_bssid, pmk, rsn_ie, (uint8_t)rsn_ie_len, pw, grp);
+        /* shortcut: no M2 key data, so a PTK rekey by 4-way after an FT roam fails and reconnects; rare on PSK APs */
+        aic_wpa2_ctx_init(wpa_ctx, st.mac_addr, st.ap_bssid, g_ft.pmk_r1, NULL, 0U, pw, grp);
+        wpa_ctx->derive_ptk = ft_ptk;
+        if (ft_finish(&g_ft, &ft, wpa_ctx) != 0) {
+            set_err(err_buf, err_cap, "FT reassociation response did not check out");
+            fprintf(stderr, "ft: reassociation response MIC, nonces or GTK wrong\n");
+            (void)wifi_disconnect(conn, 3U);
+            return 1;
+        }
+        if (install_keys(conn, wpa_ctx, err_buf, err_cap) != 0) {
+            return 1;
+        }
+    } else if (!is_open) {
+        printf("[3/4] Running WPA2-PSK 4-Way Handshake%s...\n", use_ft ? " (FT-PSK)" : try_sae ? (h2e ? " (WPA3-SAE H2E)" : " (WPA3-SAE)") : "");
+        const uint8_t pw = (target->pairwise_cipher != AIC_CIPHER_INVALID) ? target->pairwise_cipher : AIC_CIPHER_CCMP;
+        const uint8_t grp = (target->group_cipher != AIC_CIPHER_INVALID) ? target->group_cipher : AIC_CIPHER_CCMP;
+        uint8_t kd[255];
+        int kd_len = (int)rsn_ie_len;
+        memcpy(kd, rsn_ie, rsn_ie_len);
+        if (h2e) { /* M2 repeats the RSNXE the association request carried (mlme: SAE H2E) */
+            static const uint8_t rsnxe[3] = { 244U, 1U, 0x20U };
+            memcpy(&kd[kd_len], rsnxe, sizeof(rsnxe));
+            kd_len += (int)sizeof(rsnxe);
+        }
+        if (use_ft) {
+            kd_len = ft_initial(&g_ft, pmk, target->ssid, target->ssid_len, st.mac_addr, rsn_ie, &ft, kd, sizeof(kd));
+            if (kd_len < 0) {
+                set_err(err_buf, err_cap, "FT association response unusable");
+                fprintf(stderr, "ft: association response has no usable FTE, using plain WPA2-PSK from now on\n");
+                (void)wifi_disconnect(conn, 3U);
+                return 1;
+            }
+        }
+        aic_wpa2_ctx_init(wpa_ctx, st.mac_addr, st.ap_bssid, use_ft ? g_ft.pmk_r1 : pmk, kd, (uint8_t)kd_len, pw, grp);
+        if (use_ft) {
+            wpa_ctx->derive_ptk = ft_ptk;
+        }
 
         bool keys_installed = false;
         bool replied = false; /* msg2 sent: AP silence after it means its MIC (i.e. the PSK) was wrong */
@@ -514,24 +753,10 @@ static int perform_connect(io_connect_t conn,
                     }
                 }
                 if (keys_ready) {
-                    uint8_t hw_idx = 0U;
-                    kr = wifi_add_key(conn, 0U, true, wpa_ctx->pairwise_cipher, &wpa_ctx->ptk[32], 16U, &hw_idx);
-                    if (kr != KERN_SUCCESS) {
-                        set_err(err_buf, err_cap, "Install PTK failed: 0x%08x", kr);
-                        fprintf(stderr, "error: install PTK failed: 0x%08x\n", kr);
+                    if (install_keys(conn, wpa_ctx, err_buf, err_cap) != 0) {
                         return 1;
                     }
-                    printf("      Installed PTK (hw_key_idx=%u)\n", hw_idx);
-                    if (wpa_ctx->has_gtk) {
-                        kr = wifi_add_key(conn, wpa_ctx->gtk_idx, false, wpa_ctx->group_cipher,
-                                        wpa_ctx->gtk, wpa_ctx->gtk_len, &hw_idx);
-                        if (kr != KERN_SUCCESS) {
-                            set_err(err_buf, err_cap, "Install GTK failed: 0x%08x", kr);
-                            fprintf(stderr, "error: install GTK failed: 0x%08x\n", kr);
-                            return 1;
-                        }
-                        printf("      Installed GTK idx=%u (hw_key_idx=%u)\n", wpa_ctx->gtk_idx, hw_idx);
-                    }
+                    install_igtk(conn, wpa_ctx, rx_frame.data, rx_frame.len);
                     keys_installed = true;
                 }
             } else {
@@ -567,6 +792,9 @@ static int perform_connect(io_connect_t conn,
     if (out_is_open) {
         *out_is_open = is_open;
     }
+    g_ft.ok = use_ft;
+    ft_off &= !use_ft;
+    if (use_ft) printf("ft: %s, mobility domain %02x%02x\n", ft_reassoc ? "roamed" : "keys held", g_ft.md[1], g_ft.md[0]);
     if (target != &last_bss) last_bss = *target;
     have_last = true;
     return 0;
@@ -888,6 +1116,8 @@ static void build_status_json(char *out, size_t cap) {
     sb_appendf(&sb, ",\"last_error\":"); sb_append_json_str(&sb, last_error);
     sb_appendf(&sb, ",\"band_pref\":\"%s\"", band_pref());
     if (wifi_has_power_save()) sb_appendf(&sb, ",\"power_save\":%s", ps_pref() ? "true" : "false");
+    if (wifi_has_set_mac()) sb_appendf(&sb, ",\"mac_random\":%s", mr_pref() ? "true" : "false");
+    if (wifi_has_rssi()) sb_appendf(&sb, ",\"roam\":\"%s\"", roam_names[roam_level()]);
     sb_appendf(&sb, "}\n");
 }
 
@@ -1058,6 +1288,18 @@ static void handle_ipc_client(int cfd) {
             if (!write_pref(WIFI_BAND_PATH, v)) build_err_json(strerror(errno), reply, sizeof(reply));
             else snprintf(reply, sizeof(reply), "{\"ok\":true}\n");
         }
+    } else if (strncmp(req_line, "MACRANDOM ", 10U) == 0) { /* takes effect at the next connect */
+        const char *v = req_line + 10U;
+        if (strcmp(v, "on") != 0 && strcmp(v, "off") != 0) build_err_json("MAC randomization must be on or off", reply, sizeof(reply));
+        else if (!write_pref(g_mr_path, v)) build_err_json(strerror(errno), reply, sizeof(reply));
+        else snprintf(reply, sizeof(reply), "{\"ok\":true}\n");
+    } else if (strncmp(req_line, "ROAM ", 5U) == 0) { /* read on each check, no restart needed */
+        const char *v = req_line + 5U;
+        int i = 0;
+        while (i < 6 && strcmp(v, roam_names[i]) != 0) i++;
+        if (i == 6) build_err_json("Roaming level must be VeryHigh, High, Middle, Low, VeryLow or Disable", reply, sizeof(reply));
+        else if (!write_pref(g_roam_path, v)) build_err_json(strerror(errno), reply, sizeof(reply));
+        else snprintf(reply, sizeof(reply), "{\"ok\":true}\n");
     } else if (strncmp(req_line, "POWERSAVE ", 10U) == 0) { /* saved, then applied by the main loop */
         const char *v = req_line + 10U;
         if (strcmp(v, "on") != 0 && strcmp(v, "off") != 0) {
@@ -1233,6 +1475,7 @@ static bool run_rekey_loop(io_connect_t conn,
         }
         if (daemon_mode) {
             refresh_snapshot(conn, svc);
+            if (roam_check(conn, &st)) break;
         }
 
         if (!is_open) {
@@ -1260,6 +1503,7 @@ static bool run_rekey_loop(io_connect_t conn,
                         (void)wifi_add_key(conn, wpa_ctx->gtk_idx, false, wpa_ctx->group_cipher,
                                          wpa_ctx->gtk, wpa_ctx->gtk_len, &hw_idx);
                     }
+                    install_igtk(conn, wpa_ctx, rx_frame.data, rx_frame.len);
                 }
             }
         }
@@ -1440,6 +1684,8 @@ static void worker_bound(void) {
         snprintf(g_conf_path, sizeof(g_conf_path), WIFI_CONF_DIR "/wifi-%d.conf", slot);
         snprintf(g_band_path, sizeof(g_band_path), WIFI_CONF_DIR "/band-%d", slot);
         snprintf(g_ps_path, sizeof(g_ps_path), WIFI_CONF_DIR "/powersave-%d", slot);
+        snprintf(g_mr_path, sizeof(g_mr_path), WIFI_CONF_DIR "/macrandom-%d", slot);
+        snprintf(g_roam_path, sizeof(g_roam_path), WIFI_CONF_DIR "/roam-%d", slot);
         snprintf(g_chans_path, sizeof(g_chans_path), WIFI_CONF_DIR "/chans-%d", slot);
     }
     snprintf(g_sock_path, sizeof(g_sock_path), WIFI_RUN_DIR "/%d.sock", slot);

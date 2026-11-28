@@ -27,9 +27,10 @@ bool rtwd_gone(void);
 const char *rtwd_chip(void);
 /* ssid_len 0 = wildcard; freqs NULL/n 0 = every allowed channel */
 int rtwd_scan(const uint8_t *ssid, uint8_t ssid_len, const uint16_t *freqs, int n);
-/* blocks until associated or failed; the BSS must be in the last scan */
+struct wifi_ft;
+/* blocks until associated or failed; the BSS must be in the last scan. ft: 802.11r, see wifi_drv.h, or NULL */
 int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uint8_t ssid_len,
-		 const uint8_t *rsn_ie, size_t rsn_len);
+		 const uint8_t *rsn_ie, size_t rsn_len, struct wifi_ft *ft);
 void rtwd_disconnect(uint16_t reason);
 /* LED: 0 slow blink (not connected), 1 fast blink (connecting), 2 on (connected); safe from callbacks */
 void rtwd_led(int mode);
@@ -39,4 +40,11 @@ int rtwd_set_authorized(bool on);
 int rtwd_tx_eth(const uint8_t *eth, size_t len);
 /* rtw89 LPS while associated (vif->cfg.ps); kept across connects */
 int rtwd_power_save(bool on);
+/* station address, only while not connected or scanning; -EBUSY otherwise */
+int rtwd_set_mac(const uint8_t mac[6]);
+/* the current AP's signal in dBm, 0 when not connected or no sample yet */
+int rtwd_rssi(void);
+/* channels from the AP's last 11k neighbor report or 11v BSS transition request (btm: the AP asked us to
+   move, bssid = its preferred target); 0 when none since the last call */
+int rtwd_roam_hint(uint16_t freqs[8], uint8_t bssid[6], bool *btm);
 #endif

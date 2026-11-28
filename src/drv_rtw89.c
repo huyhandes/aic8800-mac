@@ -61,8 +61,10 @@ static int rtw_scan(const uint8_t *ssid, uint8_t ssid_len, const uint16_t *freqs
 }
 
 /* synchronous: auth + assoc are done when rtwd_connect returns */
-static int rtw_connect(const struct wifi_connect_params *p) {
-	int rc = rtwd_connect(p->bssid, p->freq, p->ssid, p->ssid_len, p->ie_len ? p->ie : NULL, p->ie_len);
+static int rtw_ft_connect(const struct wifi_connect_params *p, struct wifi_ft *ft) {
+	int rc = rtwd_connect(p->bssid, p->freq, p->ssid, p->ssid_len, p->ie_len ? p->ie : NULL, p->ie_len, ft);
+	if (rc == -EOPNOTSUPP)
+		return rc; /* the AP has no FT: nothing was sent, the caller connects without it */
 	struct wifi_drv_assoc a = { .status = rc ? 1 : 0, .freq = p->freq, .band = p->band, .qos = true };
 	memcpy(a.bssid, p->bssid, 6);
 	if (rc)
@@ -70,6 +72,7 @@ static int rtw_connect(const struct wifi_connect_params *p) {
 	ev->assoc(&a); /* any non-zero status reads as "rejected" upstream */
 	return 0;
 }
+static int rtw_connect(const struct wifi_connect_params *p) { return rtw_ft_connect(p, NULL); }
 
 /* RTL8852BU loses MAC power state across system sleep (rtw89 "mac preinit fail" -60 after wake);
    restart like an unplug so the supervisor re-binds and reloads firmware.
@@ -90,4 +93,8 @@ const struct wifi_drv wifi_drv_rtw89 = {
 	.system_woke = rtw_woke,
 	.led = rtw_led,
 	.power_save = rtwd_power_save,
+	.set_mac = rtwd_set_mac,
+	.rssi = rtwd_rssi,
+	.roam_hint = rtwd_roam_hint,
+	.ft_connect = rtw_ft_connect,
 };

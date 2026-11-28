@@ -28,7 +28,7 @@ build/fwload.o: third_party/yokitea/fwload/main.c $(YK_HDR)
 # Realtek RTL8852BU: upstream Linux rtw89 (GPL-2.0 OR BSD-3-Clause, unmodified) on the src/lkpi mac80211 shim
 RTW_OBJ  = $(patsubst third_party/rtw89/%.c,build/rtw/%.o,$(wildcard third_party/rtw89/*.c))
 LK_OBJ   = $(patsubst %,build/lk/%.o,kernel usb mac80211 mlme cdcap) build/lk/rtw89_led.o
-LK_HDR   = $(wildcard src/lkpi/include/*.h src/lkpi/include/*/*.h) src/lkpi/local.h src/rtwd.h src/wifi_drv.h $(YK_HDR)
+LK_HDR   = $(wildcard src/lkpi/include/*.h src/lkpi/include/*/*.h) src/lkpi/local.h src/lkpi/ccmp.h src/rtwd.h src/wifi_drv.h $(YK_HDR)
 build/rtw/%.o: third_party/rtw89/%.c $(LK_HDR)
 	@mkdir -p $(@D)
 	$(CC) -c -std=gnu11 -O2 -Isrc/lkpi/include -DCONFIG_RTW89_DEBUGMSG -Wno-everything $< -o $@
@@ -41,7 +41,7 @@ build/lk/%.o: src/lkpi/%.c $(LK_HDR)
 
 # station core + one src/drv_<chip>.c per chip family (wifi_drv.h)
 CORE_SRC = src/usbwifid.c src/usbwifi_core.c src/drv_aic8800.c src/drv_rtw89.c
-build/usbwifid: $(CORE_SRC) src/usbwifi_core.h src/wifi_drv.h src/rtwd.h $(YK_HDR) build/fwload.o $(RTW_OBJ) $(LK_OBJ)
+build/usbwifid: $(CORE_SRC) src/usbwifi_core.h src/wifi_drv.h src/rtwd.h src/rtl_extras.h src/rtl_sae.h $(YK_HDR) build/fwload.o $(RTW_OBJ) $(LK_OBJ)
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INC) $(CORE_SRC) build/fwload.o $(RTW_OBJ) $(LK_OBJ) -o $@ $(USB) $(FW) -framework DiskArbitration
 	install_name_tool -change $$(otool -L $@ | awk '/libusb/{print $$1}') @executable_path/libusb-1.0.0.dylib $@
@@ -108,7 +108,7 @@ check: build/usbwifid build/libusb-1.0.0.dylib build/wpa2_test build/reord_test 
 	./build/mac80211_test
 	AICD_NO_NET=1 ./build/usbwifid scan
 
-build/wpa2_test: tests/wpa2_test.c third_party/yokitea/common/aic8800_wpa2.h
+build/wpa2_test: tests/wpa2_test.c third_party/yokitea/common/aic8800_wpa2.h src/rtl_extras.h src/rtl_sae.h src/lkpi/ccmp.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INC) $< -o $@
 build/reord_test: tests/reord_test.c third_party/yokitea/common/aic8800_reord.h

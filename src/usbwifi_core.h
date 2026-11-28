@@ -33,6 +33,11 @@ kern_return_t wifi_start_scan(io_connect_t conn, const uint8_t *ssid, uint8_t ss
                               const uint16_t *freqs, int n_freqs);
 kern_return_t wifi_get_scan_results(io_connect_t conn, wifi_scan_list_t *out);
 kern_return_t wifi_connect(io_connect_t conn, const wifi_connect_req_t *in_req, wifi_connect_req_t *out_resp);
+struct wifi_ft;
+bool wifi_has_ft(void); /* the driver does 802.11r FT-PSK (RTL only) */
+/* wifi_connect with FT (wifi_drv.h struct wifi_ft); kIOReturnUnsupported when the AP or driver has no FT */
+kern_return_t wifi_connect_ft(io_connect_t conn, const wifi_connect_req_t *in_req, wifi_connect_req_t *out_resp,
+                              struct wifi_ft *ft);
 kern_return_t wifi_disconnect(io_connect_t conn, uint16_t reason);
 kern_return_t wifi_poll_eapol(io_connect_t conn, wifi_eapol_frame_t *out);
 kern_return_t wifi_send_eapol(io_connect_t conn, const uint8_t *eth, size_t len);
@@ -40,6 +45,11 @@ const char *wifi_chip_name(void); /* "" until an adapter is up */
 void wifi_system_woke(void);
 bool wifi_has_power_save(void);
 int  wifi_set_power_save(bool on); /* -EOPNOTSUPP when the driver has none */
+bool wifi_has_set_mac(void);
+bool wifi_has_rssi(void);
+int  wifi_get_rssi(void);
+int  wifi_roam_hint(uint16_t freqs[8], uint8_t bssid[6], bool *btm); /* 11k/11v, 0 = none */ /* dBm of the current AP, 0 = unknown or unsupported */
+int  wifi_set_mac(const uint8_t *mac); /* NULL = the dongle's own; only while not connected */
 kern_return_t wifi_add_key(io_connect_t conn, uint8_t key_idx, bool pairwise, uint8_t cipher,
                            const uint8_t *key, uint8_t key_len, uint8_t *out_hw_idx);
 kern_return_t wifi_set_port_link(io_connect_t conn, bool open_port, bool link_up);

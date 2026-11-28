@@ -11,7 +11,9 @@
 #include "local.h"
 #include "lkpi_usb.h"
 #include "../rtwd.h"
+#include "../wifi_drv.h"
 #include "aic8800_reord.h"
+#include "ccmp.h"
 
 #define HW() (&M.l->hw)
 #define WIPHY() (&M.l->wiphy)
@@ -48,6 +50,12 @@ static struct {
 	u8 bssid[ETH_ALEN];
 	enum nl80211_band band;
 	bool assoc, authorized, rsn, wme, scanning, txblock, ps;
+	int rssi; /* the AP's signal, dBm x16 EWMA, 0 = no sample yet */
+	/* 11k/11v: the AP answers neighbor report requests; channels (and a BTM target) for the daemon's roam scan */
+	bool ap_rm, hint_btm;
+	u16 hint_freq[8];
+	int nhint;
+	u8 hint_bssid[ETH_ALEN];
 	u64 scan_since;
 	int scan_fails;
 	bool scan_lost; /* the last scan-done never came and rtwd_gone() aborted that scan */
@@ -79,6 +87,17 @@ static struct {
 	struct wiphy_work ba_work, mgmt_work;
 	struct delayed_work reord_dw;
 	struct sk_buff_head mgmt_q;
+	/* WPA3: SAE authentication frames for the wifi_ft sae step; PMF (protected management frames) */
+	bool sae, mfp;
+	struct sk_buff_head sae_q;
+	u64 mgmt_tx_pn, mgmt_rx_pn;
+	u8 igtk[16]; /* BIP-CMAC-128, checked here (rtw89 never sees it) */
+	u16 igtk_id; /* 4 or 5, 0 = none */
+	u64 igtk_ipn;
+	u16 saq_id, saq_reason; /* our SA Query after an unprotected deauth, 0 = none pending */
+	int saq_tries;
+	bool saq_due; /* saq_dw fired: mgmt_work resends or gives up */
+	struct delayed_work saq_dw;
 	/* LED: rtwd_led() mode, led_dw blinks it while led_alive (open .. close) */
 	struct delayed_work led_dw;
 	volatile int led_mode;
@@ -96,6 +115,17 @@ static const u8 *ie_find(const u8 *ies, size_t len, u8 id)
 {
 	while (len >= 2 && ies[1] + 2u <= len) {
 		if (ies[0] == id)
+			return ies;
+		len -= ies[1] + 2u;
+		ies += ies[1] + 2u;
+	}
+	return NULL;
+}
+
+static const u8 *ext_find(const u8 *ies, size_t len, u8 ext)
+{
+	while (len >= 2 && ies[1] + 2u <= len) {
+		if (ies[0] == WLAN_EID_EXTENSION && ies[1] >= 1 && ies[2] == ext)
 			return ies;
 		len -= ies[1] + 2u;
 		ies += ies[1] + 2u;
@@ -197,13 +227,31 @@ static void mgmt_hdr(struct ieee80211_mgmt *m, u16 stype)
 	memcpy(m->bssid, M.bssid, ETH_ALEN);
 }
 
-/* shortcut: mgmt frames always go out unprotected (no PMF), upgrade with WPA3 */
-static void mgmt_tx(const void *frame, size_t len)
+/* deauth, disassoc and the action categories PMF protects (802.11-2020 Table 9-51) */
+static bool robust_mgmt(const u8 *f, size_t len)
 {
-	struct sk_buff *skb = dev_alloc_skb(HW()->extra_tx_headroom + len);
+	__le16 fc = ((const struct ieee80211_hdr *)f)->frame_control;
+
+	return ieee80211_is_deauth(fc) || ieee80211_is_disassoc(fc) ||
+	       (ieee80211_is_action(fc) && len > 24 && f[24] != WLAN_CATEGORY_PUBLIC && f[24] != WLAN_CATEGORY_HT &&
+		f[24] != WLAN_CATEGORY_VENDOR_SPECIFIC);
+}
+
+/* with PMF on and the pairwise key k, robust frames go out CCMP-protected (in software: see ccmp.h) */
+static void mgmt_tx_key(const void *frame, size_t len, const struct mkey *k)
+{
+	u8 pf[256 + 40];
+	struct sk_buff *skb;
 	struct ieee80211_tx_info *info;
 	struct lkpi_sta *s = uploaded_sta(M.l);
 
+	if (M.mfp && k && robust_mgmt(frame, len)) {
+		if (len < 24 || len > 256)
+			return;
+		len = ccmp_encrypt(k->k.key, __atomic_add_fetch(&M.mgmt_tx_pn, 1, __ATOMIC_RELAXED), frame, len - 24, pf);
+		frame = pf;
+	}
+	skb = dev_alloc_skb(HW()->extra_tx_headroom + len);
 	if (!skb)
 		return;
 	skb_reserve(skb, HW()->extra_tx_headroom);
@@ -213,6 +261,11 @@ static void mgmt_tx(const void *frame, size_t len)
 	info->band = M.band;
 	info->control.vif = VIF();
 	OPS()->tx(HW(), &(struct ieee80211_tx_control){ .sta = s ? &s->sta : NULL }, skb);
+}
+
+static void mgmt_tx(const void *frame, size_t len)
+{
+	mgmt_tx_key(frame, len, M.ptk);
 }
 
 static void txq_purge(struct ieee80211_txq *tq)
@@ -495,20 +548,77 @@ static void rx_mgmt(struct sk_buff *skb)
 			M.cb->bss(skb->data, len, IEEE80211_SKB_RXCB(skb)->freq, IEEE80211_SKB_RXCB(skb)->signal);
 		return;
 	}
-	if (!ether_addr_equal(m->da, VIF()->addr) || !ether_addr_equal(m->sa, M.bssid))
+	if (!ether_addr_equal(m->sa, M.bssid))
 		return;
-	if (ieee80211_has_protected(fc))
-		return; /* shortcut: no PMF yet, protected mgmt frames are ignored */
+	if (!ether_addr_equal(m->da, VIF()->addr)) {
+		/* the AP's broadcast deauth/disassoc; with PMF only under a valid BIP MMIE and a fresh IPN */
+		if (is_broadcast_ether_addr(m->da) && (ieee80211_is_deauth(fc) || ieee80211_is_disassoc(fc)) && len >= 26) {
+			const u16 reason = le16_to_cpu(m->u.deauth.reason_code);
+			bool ok = true;
+
+			mutex_lock(&rx_lock);
+			if (M.mfp) { /* negotiated PMF: an MMIE is needed even before the keys are in, as in mac80211 */
+				const s64 ipn = M.igtk_id ? bip_verify(M.igtk, M.igtk_id, skb->data, len) : -1;
+
+				ok = ipn > (s64)M.igtk_ipn;
+				if (ok)
+					M.igtk_ipn = ipn;
+			}
+			if (ok && M.assoc) {
+				pr_info("mlme: broadcast %s from the AP, reason %u\n", ieee80211_is_deauth(fc) ? "deauth" : "disassoc", reason);
+				loss_queue(reason, false);
+			}
+			mutex_unlock(&rx_lock);
+		}
+		return;
+	}
 	mutex_lock(&rx_lock);
-	if ((ieee80211_is_auth(fc) && M.jwant == IEEE80211_STYPE_AUTH) ||
+	if (ieee80211_has_protected(fc)) { /* PMF: rtw89 may have decrypted it (CCMP header and MIC still there) */
+		const struct mkey *k = M.ptk;
+		u64 pn;
+		int n = -1;
+
+		if (!M.mfp || !k || !ieee80211_is_mgmt(fc) || ieee80211_is_auth(fc))
+			goto out;
+		if (IEEE80211_SKB_RXCB(skb)->flag & RX_FLAG_DECRYPTED) {
+			if (len >= 40 && (skb->data[27] & 0x20)) {
+				pn = ccmp_pn(skb->data + 24);
+				memmove(skb->data + 24, skb->data + 32, len - 40);
+				skb->data[1] &= ~0x40;
+				n = len - 16;
+			}
+		} else {
+			n = ccmp_decrypt(k->k.key, skb->data, len, &pn);
+		}
+		if (n < 0 || pn <= M.mgmt_rx_pn)
+			goto out;
+		M.mgmt_rx_pn = pn;
+		skb_trim(skb, n);
+		len = n;
+		fc = m->frame_control;
+	} else if (M.mfp && M.ptk && robust_mgmt(skb->data, len)) {
+		/* PMF drops unprotected robust frames. A deauth may still be real (the AP lost our keys), so it starts
+		   an SA Query (mgmt_work_fn) whose silence ends the link */
+		if (!ieee80211_is_deauth(fc) && !ieee80211_is_disassoc(fc))
+			goto out;
+		if (len >= 26 && M.assoc && !M.saq_id && (c = skb_copy(skb, GFP_ATOMIC))) {
+			skb_queue_tail(&M.mgmt_q, c);
+			wiphy_work_queue(WIPHY(), &M.mgmt_work);
+		}
+		goto out;
+	}
+	if (ieee80211_is_auth(fc) && M.sae && len > 30 && le16_to_cpu(m->u.auth.auth_alg) == WLAN_AUTH_SAE &&
+	    (c = skb_copy(skb, GFP_ATOMIC))) {
+		skb_queue_tail(&M.sae_q, c);
+		complete(&M.jc);
+	} else if ((ieee80211_is_auth(fc) && M.jwant == IEEE80211_STYPE_AUTH) ||
 	    ((ieee80211_is_assoc_resp(fc) || ieee80211_is_reassoc_resp(fc)) && M.jwant == IEEE80211_STYPE_ASSOC_RESP)) {
 		M.jlen = len < sizeof(M.jbuf) ? len : sizeof(M.jbuf);
 		memcpy(M.jbuf, m, M.jlen);
 		M.jwant = 0;
 		complete(&M.jc);
 	} else if ((ieee80211_is_deauth(fc) || ieee80211_is_disassoc(fc)) && len >= 26) {
-		/* shortcut: unprotected deauth is honoured (no PMF), upgrade with WPA3 */
-		u16 reason = le16_to_cpu(m->u.deauth.reason_code);
+		u16 reason = le16_to_cpu(m->u.deauth.reason_code); /* protected, or no PMF */
 
 		if (M.jwant) {
 			M.jfail = reason ? reason : 1;
@@ -517,11 +627,14 @@ static void rx_mgmt(struct sk_buff *skb)
 		} else if (M.assoc) {
 			loss_queue(reason, false);
 		}
-	} else if (ieee80211_is_action(fc) && len > 25 && m->u.action.category == WLAN_CATEGORY_BACK && M.assoc &&
+	} else if (ieee80211_is_action(fc) && len > 25 && M.assoc &&
+		   (m->u.action.category == WLAN_CATEGORY_BACK || m->u.action.category == WLAN_CATEGORY_RADIO_MEASUREMENT ||
+		    m->u.action.category == WLAN_CATEGORY_WNM || m->u.action.category == WLAN_CATEGORY_SA_QUERY) &&
 		   (c = skb_copy(skb, GFP_ATOMIC))) {
 		skb_queue_tail(&M.mgmt_q, c);
 		wiphy_work_queue(WIPHY(), &M.mgmt_work);
 	}
+out:
 	mutex_unlock(&rx_lock);
 }
 
@@ -536,6 +649,8 @@ void ieee80211_rx_napi(struct ieee80211_hw *hw, struct ieee80211_link_sta *link_
 		return;
 	}
 	skb_trim(skb, skb->len - FCS_LEN);
+	if (M.assoc && st->signal && !(st->flag & RX_FLAG_NO_SIGNAL_VAL) && ether_addr_equal(h->addr2, M.bssid))
+		M.rssi = M.rssi ? M.rssi + (st->signal * 16 - M.rssi) / 16 : st->signal * 16;
 	if (ieee80211_is_mgmt(h->frame_control)) {
 		rx_mgmt(skb);
 		kfree_skb(skb);
@@ -609,17 +724,154 @@ static void ba_work_fn(struct wiphy *w, struct wiphy_work *wk)
 	}
 }
 
+/* keeps the usable channels of a run of neighbor report elements; btm: true when target got the most
+   preferred candidate other than the current AP */
+static bool nbr_hint(const u8 *ies, size_t len, bool btm, u8 target[ETH_ALEN])
+{
+	int best = -1;
+
+	mutex_lock(&rx_lock);
+	M.nhint = 0;
+	M.hint_btm = false;
+	for (const u8 *e = ies; e + 2 <= ies + len && e + 2 + e[1] <= ies + len; e += 2 + e[1]) {
+		struct ieee80211_channel *ch;
+		const u8 *pref;
+		int freq;
+
+		/* BSSID 6, BSSID info 4, operating class 1, channel 1, PHY type 1, subelements; 131-137 = 6 GHz */
+		if (e[0] != WLAN_EID_NEIGHBOR_REPORT || e[1] < 13 || (e[12] >= 131 && e[12] <= 137))
+			continue;
+		freq = ieee80211_channel_to_frequency(e[13], e[13] > 14 ? NL80211_BAND_5GHZ : NL80211_BAND_2GHZ);
+		ch = find_chan(freq);
+		if (!ch || (ch->flags & IEEE80211_CHAN_DISABLED))
+			continue;
+		pref = ie_find(e + 15, e[1] - 13, 3); /* BSS transition candidate preference */
+		if (btm && ether_addr_equal(e + 2, M.bssid))
+			continue;
+		if (btm && (pref && pref[1] >= 1 ? pref[2] : 0) > best) {
+			best = pref && pref[1] >= 1 ? pref[2] : 0;
+			memcpy(M.hint_bssid, e + 2, ETH_ALEN);
+			memcpy(target, e + 2, ETH_ALEN);
+		}
+		int i = 0;
+		while (i < M.nhint && M.hint_freq[i] != freq)
+			i++;
+		if (i == M.nhint && M.nhint < 8)
+			M.hint_freq[M.nhint++] = freq;
+	}
+	M.hint_btm = btm && best >= 0;
+	mutex_unlock(&rx_lock);
+	return btm && best >= 0;
+}
+
+/* 11k neighbor report response, 11v BSS transition management request */
+static void rm_wnm_rx(struct ieee80211_mgmt *m, size_t len)
+{
+	const u8 *b = &m->u.action.category, *end = (u8 *)m + len;
+	u8 f[64], target[ETH_ALEN];
+	struct ieee80211_mgmt *r = (void *)f;
+	bool ok;
+	u8 *p;
+
+	if (b[0] == WLAN_CATEGORY_RADIO_MEASUREMENT && b[1] == 5 && len >= 27) {
+		nbr_hint(b + 3, end - (b + 3), false, target);
+		return;
+	}
+	if (b[0] != WLAN_CATEGORY_WNM || b[1] != 7 || len < 31)
+		return;
+	/* token 1, request mode 1, disassociation timer 2, validity 1, then optional fields by request mode */
+	const u8 *q = b + 7;
+	if (b[3] & 0x08) /* BSS termination duration subelement */
+		q += 12;
+	if ((b[3] & 0x10) && q < end) /* session information URL */
+		q += 1 + q[0];
+	ok = (b[3] & 0x01) && q <= end && nbr_hint(q, end - q, true, target);
+	mgmt_hdr(r, IEEE80211_STYPE_ACTION);
+	p = &r->u.action.category;
+	*p++ = WLAN_CATEGORY_WNM;
+	*p++ = 8; /* BSS transition management response */
+	*p++ = b[2];
+	*p++ = ok ? 0 : 7; /* accept, or reject: no suitable candidates */
+	*p++ = 0; /* BSS termination delay */
+	if (ok) {
+		memcpy(p, target, ETH_ALEN);
+		p += ETH_ALEN;
+	}
+	mgmt_tx(f, p - f);
+	pr_info("mlme: BSS transition request (mode 0x%02x), %s %pM\n", b[3], ok ? "moving to" : "no candidate",
+		ok ? target : M.bssid);
+}
+
+/* SA Query (802.11-2020 11.13): action 0 request, 1 response, 2-byte transaction ID */
+static void saq_send(u8 action, const void *id)
+{
+	u8 f[28];
+
+	mgmt_hdr((struct ieee80211_mgmt *)f, IEEE80211_STYPE_ACTION);
+	f[24] = WLAN_CATEGORY_SA_QUERY;
+	f[25] = action;
+	memcpy(f + 26, id, 2);
+	mgmt_tx(f, sizeof(f));
+}
+
+/* wiphy held: send our pending SA Query again, or end the link after 3 unanswered ones */
+static void saq_tick(void)
+{
+	if (!M.saq_id || !M.assoc)
+		return;
+	if (++M.saq_tries > 3) {
+		pr_info("mlme: SA Query unanswered, link lost (reason %u)\n", M.saq_reason);
+		loss_queue(M.saq_reason ? M.saq_reason : 1, false);
+		M.saq_id = 0;
+		return;
+	}
+	saq_send(0, &M.saq_id);
+	schedule_delayed_work(&M.saq_dw, msecs_to_jiffies(300));
+}
+
+static void saq_fn(struct work_struct *w)
+{
+	__atomic_store_n(&M.saq_due, true, __ATOMIC_RELEASE);
+	wiphy_work_queue(WIPHY(), &M.mgmt_work);
+}
+
 /* shortcut: no ADDBA response timeout, a lost response leaves that TID non-aggregated */
 static void mgmt_work_fn(struct wiphy *w, struct wiphy_work *wk)
 {
 	struct sk_buff *skb;
 
+	if (__atomic_exchange_n(&M.saq_due, false, __ATOMIC_ACQ_REL))
+		saq_tick();
 	while ((skb = skb_dequeue(&M.mgmt_q))) {
 		struct ieee80211_mgmt *m = (void *)skb->data;
 		u8 act = m->u.action.action_code;
 
 		if (!M.assoc)
 			goto next;
+		if (ieee80211_is_deauth(m->frame_control) || ieee80211_is_disassoc(m->frame_control)) {
+			/* unprotected under PMF (rx_mgmt): believe it only if the AP no longer answers protected */
+			if (!M.saq_id) {
+				M.saq_id = (u16)(get_random_u32() | 1);
+				M.saq_reason = le16_to_cpu(m->u.deauth.reason_code);
+				M.saq_tries = 0;
+				pr_info("mlme: unprotected deauth/disassoc (reason %u), SA Query\n", M.saq_reason);
+				saq_tick();
+			}
+			goto next;
+		}
+		if (m->u.action.category == WLAN_CATEGORY_SA_QUERY) {
+			if (skb->len >= 28 && act == 0)
+				saq_send(1, skb->data + 26);
+			else if (skb->len >= 28 && act == 1 && M.saq_id && !memcmp(skb->data + 26, &M.saq_id, 2)) {
+				M.saq_id = 0;
+				cancel_delayed_work(&M.saq_dw);
+			}
+			goto next;
+		}
+		if (m->u.action.category != WLAN_CATEGORY_BACK) {
+			rm_wnm_rx(m, skb->len);
+			goto next;
+		}
 		if (act == WLAN_ACTION_ADDBA_REQ && skb->len >= 33) {
 			u16 capab = le16_to_cpu(m->u.action.addba_req.capab);
 			u8 tid = (capab >> 2) & 0xf, f[64];
@@ -761,6 +1013,8 @@ static void teardown(u16 reason, bool send)
 	wiphy_work_cancel(WIPHY(), &M.ba_work);
 	wiphy_work_cancel(WIPHY(), &M.mgmt_work);
 	skb_queue_purge(&M.mgmt_q);
+	cancel_delayed_work(&M.saq_dw);
+	M.saq_id = 0;
 	mutex_lock(&rx_lock);
 	mutex_lock(&tx_lock);
 	was_assoc = M.assoc;
@@ -770,6 +1024,7 @@ static void teardown(u16 reason, bool send)
 	M.ptk = NULL;
 	memcpy(gtk, M.gtk, sizeof(gtk));
 	memset(M.gtk, 0, sizeof(M.gtk));
+	M.igtk_id = 0;
 	mutex_unlock(&tx_lock);
 	mutex_unlock(&rx_lock);
 
@@ -781,7 +1036,7 @@ static void teardown(u16 reason, bool send)
 
 		mgmt_hdr(m, IEEE80211_STYPE_DEAUTH);
 		m->u.deauth.reason_code = cpu_to_le16(reason);
-		mgmt_tx(f, sizeof(f));
+		mgmt_tx_key(f, sizeof(f), ptk);
 		OPS()->flush(HW(), VIF(), ~0u, false);
 	}
 	OPS()->flush(HW(), VIF(), ~0u, true);
@@ -907,6 +1162,8 @@ static void init_once(void)
 	INIT_DELAYED_WORK(&M.reord_dw, reord_timeout);
 	INIT_DELAYED_WORK(&M.led_dw, led_fn);
 	skb_queue_head_init(&M.mgmt_q);
+	skb_queue_head_init(&M.sae_q);
+	INIT_DELAYED_WORK(&M.saq_dw, saq_fn);
 	init_completion(&M.jc);
 }
 
@@ -1107,6 +1364,78 @@ static int join_xchg(const u8 *f, size_t len, u16 want)
 	return fail ? -ECONNRESET : -ETIMEDOUT;
 }
 
+/* WPA3-SAE authentication (802.11-2020 12.4): the daemon's sae step builds and checks the commit and confirm
+   frames; a lost frame is sent again after 400 ms, 3 times. op held, wiphy not held. */
+static int sae_auth(struct wifi_ft *s, bool h2e)
+{
+	static u8 f[512];
+	const size_t o = offsetof(struct ieee80211_mgmt, u.auth.auth_transaction);
+	struct ieee80211_mgmt *m = (void *)f;
+	int n, r = -ETIMEDOUT;
+
+	mgmt_hdr(m, IEEE80211_STYPE_AUTH);
+	m->u.auth.auth_alg = cpu_to_le16(WLAN_AUTH_SAE);
+	mutex_lock(&rx_lock);
+	skb_queue_purge(&M.sae_q);
+	M.sae = true;
+	mutex_unlock(&rx_lock);
+	n = s->sae(s->arg, NULL, h2e, f + o, sizeof(f) - o);
+	for (int tries = 0; n > 0 && tries < 3; tries++) {
+		struct sk_buff *skb;
+
+		mgmt_tx(f, o + n);
+		mutex_lock(&rx_lock);
+		reinit_completion(&M.jc);
+		skb = skb_dequeue(&M.sae_q);
+		mutex_unlock(&rx_lock);
+		if (!skb && wait_for_completion_timeout(&M.jc, msecs_to_jiffies(400)))
+			skb = skb_dequeue(&M.sae_q);
+		if (!skb)
+			continue;
+		n = s->sae(s->arg, skb->data + o, skb->len - o, f + o, sizeof(f) - o);
+		if (n < 0)
+			pr_info("mlme: SAE failed at transaction %u, status %u\n", le16_to_cpu(((struct ieee80211_mgmt *)skb->data)->u.auth.auth_transaction),
+				le16_to_cpu(((struct ieee80211_mgmt *)skb->data)->u.auth.status_code));
+		kfree_skb(skb);
+		tries = -1; /* the AP answered: a fresh 3 tries for our next frame */
+	}
+	if (!n)
+		r = 0;
+	else if (n < 0)
+		r = -EACCES;
+	mutex_lock(&rx_lock);
+	M.sae = false;
+	skb_queue_purge(&M.sae_q);
+	mutex_unlock(&rx_lock);
+	return r;
+}
+
+/* RSN capabilities of an RSNE (0 when absent) */
+static u16 rsn_caps(const u8 *e)
+{
+	size_t end = e ? e[1] + 2u : 0, o = 2 + 2 + 4;
+
+	for (int i = 0; i < 2; i++) { /* pairwise, then AKM suites */
+		if (o + 2 > end)
+			return 0;
+		o += 2 + 4 * get_unaligned_le16(e + o);
+	}
+	return o + 2 <= end ? get_unaligned_le16(e + o) : 0;
+}
+
+/* per-stream minimum of two VHT/HE MCS maps (3 = not supported) */
+static u16 mcs_min(u16 x, u16 y)
+{
+	u16 map = 0;
+
+	for (int i = 0; i < 8; i++) {
+		u16 a = (x >> (2 * i)) & 3, b = (y >> (2 * i)) & 3;
+
+		map |= (a == 3 || b == 3 ? 3 : a < b ? a : b) << (2 * i);
+	}
+	return map;
+}
+
 static int rate_nss(u16 map)
 {
 	int n = 0;
@@ -1136,24 +1465,52 @@ static void conf_wmm(const u8 *wmm)
 	}
 }
 
-int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uint8_t ssid_len, const uint8_t *rsn_ie,
-		 size_t rsn_len)
+/* the RSNE lists AKM suite 00-0F-AC:type */
+static bool rsn_akm(const u8 *e, u8 type)
 {
-	static u8 bf[sizeof(((struct bss *)0)->f)], f[600];
+	size_t end = e ? e[1] + 2u : 0, o = 2 + 2 + 4, n;
+
+	if (o + 2 > end)
+		return false;
+	o += 2 + 4 * get_unaligned_le16(e + o); /* pairwise suites */
+	if (o + 2 > end)
+		return false;
+	n = get_unaligned_le16(e + o);
+	o += 2;
+	for (size_t i = 0; i < n && o + 4 * i + 4 <= end; i++)
+		if (!memcmp(e + o + 4 * i, "\x00\x0f\xac", 3) && e[o + 4 * i + 3] == type)
+			return true;
+	return false;
+}
+
+int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uint8_t ssid_len, const uint8_t *rsn_ie,
+		 size_t rsn_len, struct wifi_ft *ft)
+{
+	static u8 bf[sizeof(((struct bss *)0)->f)], f[600], rie[256];
+	struct wifi_ft *sae = ft && ft->sae ? ft : NULL; /* WPA3-SAE comes in on the wifi_ft op, without FT */
+	const bool re = !sae && ft && ft->auth_len; /* FT roam: FT authentication, then reassociation */
+	size_t alen, rl;
 	struct ieee80211_mgmt *bm = (void *)bf, *m = (void *)f;
 	struct ieee80211_channel *ch;
-	struct ieee80211_supported_band *sb;
+	struct ieee80211_supported_band *sb, *vs;
+	const struct ieee80211_sband_iftype_data *id;
 	struct ieee80211_link_sta *ls;
 	struct cfg80211_chan_def cd;
-	const u8 *ies, *htc, *hto, *vhtc, *vhto, *tim, *wmm;
+	struct ieee80211_sta_he_cap he = {};
+	const u8 *ies, *htc, *hto, *vhtc, *vhto, *hec, *heo, *tim, *wmm;
+	size_t hmcs = 0;
 	size_t ilen, blen = 0;
 	u32 supp, basic;
 	u16 capab;
+	bool h2e = false;
 	u8 *p;
 	int r;
 
-	if (ssid_len > IEEE80211_MAX_SSID_LEN || rsn_len > 255 || (rsn_len && rsn_len < 2))
+	if (ssid_len > IEEE80211_MAX_SSID_LEN || rsn_len > 255 || (rsn_len && (rsn_len < 2 || rsn_ie[1] + 2u > rsn_len)) ||
+	    (re && (!ft->reassoc_ie || ft->auth_len > 255)))
 		return -EINVAL;
+	if (sae)
+		ft = NULL;
 	mutex_lock(&op_lock);
 	r = -ENODEV;
 	if (!M.l)
@@ -1191,8 +1548,33 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 	hto = ie_find(ies, ilen, WLAN_EID_HT_OPERATION);
 	vhtc = ie_find(ies, ilen, WLAN_EID_VHT_CAPABILITY);
 	vhto = ie_find(ies, ilen, WLAN_EID_VHT_OPERATION);
+	hec = ext_find(ies, ilen, WLAN_EID_EXT_HE_CAPABILITY);
+	heo = ext_find(ies, ilen, WLAN_EID_EXT_HE_OPERATION);
 	tim = ie_find(ies, ilen, WLAN_EID_TIM);
 	wmm = wmm_find(ies, ilen, 1);
+	/* PMF when both RSNEs set MFPC */
+	M.mfp = rsn_len && (rsn_caps(rsn_ie) & 0x80) && (rsn_caps(ie_find(ies, ilen, WLAN_EID_RSN)) & 0x80);
+	if (ft) { /* 802.11r: the AP must offer FT-PSK in a mobility domain (a roam: the one we hold keys for) */
+		const u8 *mde = ie_find(ies, ilen, WLAN_EID_MOBILITY_DOMAIN);
+
+		r = -EOPNOTSUPP;
+		if (!mde || mde[1] < 3 || !rsn_akm(ie_find(ies, ilen, WLAN_EID_RSN), 4 /* FT-PSK */) ||
+		    (re && memcmp(mde + 2, ft->md, 2)))
+			goto out;
+		memcpy(ft->md, mde + 2, 3);
+	}
+	{
+		const u8 *rm = ie_find(ies, ilen, WLAN_EID_RRM_ENABLED_CAPABILITIES);
+
+		M.ap_rm = rm && rm[1] >= 1 && (rm[2] & 2); /* neighbor report */
+		M.nhint = 0;
+		M.hint_btm = false;
+	}
+	if (sae) { /* SAE hash-to-element when the AP's RSNXE says so */
+		const u8 *x = ie_find(ies, ilen, WLAN_EID_RSNX);
+
+		h2e = x && x[1] >= 1 && (x[2] & 0x20);
+	}
 	if (htc && htc[1] < sizeof(struct ieee80211_ht_cap))
 		htc = NULL;
 	if (hto && hto[1] < sizeof(struct ieee80211_ht_operation))
@@ -1204,8 +1586,31 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 	M.wme = wmm || wmm_find(ies, ilen, 0);
 	if (!M.wme || !sb->ht_cap.ht_supported)
 		htc = hto = NULL; /* HT needs QoS */
-	if (!htc || M.band != NL80211_BAND_5GHZ || !sb->vht_cap.vht_supported)
+	/* VHT on 2.4 GHz too (Windows "VHT 2.4G"): rtw89 only lists VHT caps on the 5 GHz band */
+	vs = M.l->wiphy.bands[NL80211_BAND_5GHZ];
+	if (!htc || !vs || !vs->vht_cap.vht_supported)
 		vhtc = vhto = NULL;
+	if (M.band != NL80211_BAND_5GHZ)
+		vhto = NULL;
+	/* HE: the AP's capabilities element is 1 + 6 + 11 + MCS maps (+ PPE thresholds) */
+	id = ieee80211_get_sband_iftype_data(sb, NL80211_IFTYPE_STATION);
+	if (hec && hec[1] >= 1 + sizeof(he.he_cap_elem) + 4) {
+		memcpy(&he.he_cap_elem, hec + 3, sizeof(he.he_cap_elem));
+		hmcs = 4 + 4 * !!(he.he_cap_elem.phy_cap_info[0] & IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G) +
+		       4 * !!(he.he_cap_elem.phy_cap_info[0] & IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_80PLUS80_MHZ_IN_5G);
+	}
+	if (!hmcs || hec[1] < 1 + sizeof(he.he_cap_elem) + hmcs || !heo || heo[1] < 1 + 6 || !htc ||
+	    (M.band == NL80211_BAND_5GHZ && !vhtc) || !id || !id->he_cap.has_he)
+		hec = heo = NULL;
+	if (hec) {
+		const u8 *e = hec + 3 + sizeof(he.he_cap_elem);
+		size_t pl = hec[1] - 1 - sizeof(he.he_cap_elem) - hmcs;
+
+		memcpy(&he.he_mcs_nss_supp, e, hmcs);
+		if (he.he_cap_elem.phy_cap_info[6] & IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT)
+			memcpy(he.ppe_thres, e + hmcs, min_t(size_t, pl, sizeof(he.ppe_thres)));
+		he.has_he = true;
+	}
 	M.rsn = rsn_len > 0;
 
 	/* channel width: shortcut: 20 MHz on 2.4 GHz, up to 80 MHz on 5 GHz */
@@ -1260,6 +1665,14 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 	VIF()->bss_conf.use_short_slot = M.band == NL80211_BAND_5GHZ || (capab & WLAN_CAPABILITY_SHORT_SLOT_TIME);
 	VIF()->bss_conf.qos = M.wme;
 	VIF()->bss_conf.dtim_period = tim && tim[1] >= 2 && tim[3] ? tim[3] : 1;
+	VIF()->bss_conf.he_support = !!hec;
+	VIF()->bss_conf.he_oper.params = heo ? get_unaligned_le32(heo + 3) : 0;
+	VIF()->bss_conf.he_oper.nss_set = heo ? get_unaligned_le16(heo + 7) : 0;
+	VIF()->bss_conf.he_bss_color.color =
+		(VIF()->bss_conf.he_oper.params & IEEE80211_HE_OPERATION_BSS_COLOR_MASK) >>
+		IEEE80211_HE_OPERATION_BSS_COLOR_OFFSET;
+	VIF()->bss_conf.he_bss_color.enabled =
+		heo && !(VIF()->bss_conf.he_oper.params & IEEE80211_HE_OPERATION_BSS_COLOR_DISABLED);
 	OPS()->link_info_changed(HW(), VIF(), &VIF()->bss_conf,
 				 BSS_CHANGED_BSSID | BSS_CHANGED_BASIC_RATES | BSS_CHANGED_BEACON_INT |
 					 BSS_CHANGED_ERP_SLOT | BSS_CHANGED_QOS | BSS_CHANGED_HT | BSS_CHANGED_BANDWIDTH);
@@ -1299,22 +1712,25 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 	}
 	if (vhtc) {
 		const struct ieee80211_vht_cap *v = (const void *)(vhtc + 2);
-		u16 ap = le16_to_cpu(v->supp_mcs.rx_mcs_map), us = le16_to_cpu(sb->vht_cap.vht_mcs.tx_mcs_map), map = 0;
+		u16 map = mcs_min(le16_to_cpu(v->supp_mcs.rx_mcs_map), le16_to_cpu(vs->vht_cap.vht_mcs.tx_mcs_map));
 		u32 vcap = le32_to_cpu(v->vht_cap_info);
 		static const u16 mpdu[3] = { 3895, 7991, 11454 };
 
-		for (int i = 0; i < 8; i++) {
-			u16 a = (ap >> (2 * i)) & 3, b = (us >> (2 * i)) & 3;
-
-			map |= (a == 3 || b == 3 ? 3 : a < b ? a : b) << (2 * i);
-		}
 		ls->vht_cap.vht_supported = true;
-		ls->vht_cap.cap = vcap & (sb->vht_cap.cap | IEEE80211_VHT_CAP_MAX_MPDU_MASK);
+		ls->vht_cap.cap = vcap & (vs->vht_cap.cap | IEEE80211_VHT_CAP_MAX_MPDU_MASK);
 		ls->vht_cap.vht_mcs = v->supp_mcs;
 		ls->vht_cap.vht_mcs.rx_mcs_map = cpu_to_le16(map);
 		if (rate_nss(map))
 			ls->rx_nss = rate_nss(map);
 		ls->agg.max_amsdu_len = ls->agg.max_rc_amsdu_len = mpdu[(vcap & 3) < 3 ? vcap & 3 : 0];
+	}
+	if (hec) {
+		u16 map = mcs_min(le16_to_cpu(he.he_mcs_nss_supp.rx_mcs_80), le16_to_cpu(id->he_cap.he_mcs_nss_supp.tx_mcs_80));
+
+		ls->he_cap = he;
+		ls->he_cap.he_mcs_nss_supp.rx_mcs_80 = cpu_to_le16(map);
+		if (rate_nss(map))
+			ls->rx_nss = rate_nss(map);
 	}
 	ls->bandwidth = cd.width == NL80211_CHAN_WIDTH_80 ? IEEE80211_STA_RX_BW_80 :
 			cd.width == NL80211_CHAN_WIDTH_40 ? IEEE80211_STA_RX_BW_40 : IEEE80211_STA_RX_BW_20;
@@ -1332,14 +1748,34 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 	if (r)
 		goto fail;
 
-	/* open system authentication */
+	/* open system authentication, or FT authentication carrying the RSNE, MDE and FTE */
 	mgmt_hdr(m, IEEE80211_STYPE_AUTH);
-	m->u.auth.auth_alg = cpu_to_le16(WLAN_AUTH_OPEN);
+	m->u.auth.auth_alg = cpu_to_le16(re ? WLAN_AUTH_FT : WLAN_AUTH_OPEN);
 	m->u.auth.auth_transaction = cpu_to_le16(1);
 	m->u.auth.status_code = 0;
-	r = join_xchg(f, offsetof(struct ieee80211_mgmt, u.auth.variable), IEEE80211_STYPE_AUTH);
-	if (!r && (M.jlen < 30 || le16_to_cpu(((struct ieee80211_mgmt *)M.jbuf)->u.auth.status_code)))
+	alen = offsetof(struct ieee80211_mgmt, u.auth.variable);
+	if (re) {
+		memcpy(f + alen, ft->auth_ie, ft->auth_len);
+		alen += ft->auth_len;
+	}
+	r = sae ? sae_auth(sae, h2e) : join_xchg(f, alen, IEEE80211_STYPE_AUTH);
+	if (!r && !sae && (M.jlen < 30 || le16_to_cpu(((struct ieee80211_mgmt *)M.jbuf)->u.auth.status_code))) {
+		if (re)
+			pr_info("mlme: FT authentication refused, status %u\n",
+				M.jlen < 30 ? 0xffff : le16_to_cpu(((struct ieee80211_mgmt *)M.jbuf)->u.auth.status_code));
 		r = -EACCES;
+	}
+	if (!r && re) { /* the reassociation's RSNE, MDE and FTE come from the AP's ANonce and R1KH-ID */
+		const size_t o = offsetof(struct ieee80211_mgmt, u.auth.variable);
+		int n = M.jlen > o ? ft->reassoc_ie(ft->arg, M.jbuf + o, M.jlen - o, rie, sizeof(rie)) : -1;
+
+		r = -EACCES;
+		if (n >= 2 && rie[1] + 2 <= n) {
+			rsn_ie = rie;
+			rsn_len = n;
+			r = 0;
+		}
+	}
 	if (r)
 		goto fail;
 	wiphy_lock(WIPHY());
@@ -1348,21 +1784,45 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 	if (r)
 		goto fail;
 
-	/* association request */
-	mgmt_hdr(m, IEEE80211_STYPE_ASSOC_REQ);
+	/* (re)association request */
+	mgmt_hdr(m, re ? IEEE80211_STYPE_REASSOC_REQ : IEEE80211_STYPE_ASSOC_REQ);
 	capab = WLAN_CAPABILITY_ESS;
 	if (M.band == NL80211_BAND_2GHZ)
 		capab |= WLAN_CAPABILITY_SHORT_SLOT_TIME | WLAN_CAPABILITY_SHORT_PREAMBLE;
 	m->u.assoc_req.capab_info = cpu_to_le16(capab);
 	m->u.assoc_req.listen_interval = cpu_to_le16(10);
 	p = m->u.assoc_req.variable;
+	if (re) {
+		memcpy(m->u.reassoc_req.current_ap, ft->prev_bssid, ETH_ALEN);
+		p = m->u.reassoc_req.variable;
+	}
 	*p++ = WLAN_EID_SSID;
 	*p++ = ssid_len;
 	memcpy(p, ssid, ssid_len);
 	p = put_rates(p + ssid_len, sb);
-	if (rsn_len) {
-		memcpy(p, rsn_ie, rsn_len);
-		p += rsn_len;
+	rl = rsn_len ? rsn_ie[1] + 2u : 0; /* the RSNE; FT puts the MDE and FTE after the RM capabilities */
+	memcpy(p, rsn_ie, rl);
+	p += rl;
+	{
+		/* 11k: neighbor report only (no measurement reports to answer) */
+		static const u8 rm_caps[] = { WLAN_EID_RRM_ENABLED_CAPABILITIES, 5, 0x02, 0, 0, 0, 0 };
+
+		memcpy(p, rm_caps, sizeof(rm_caps));
+		p += sizeof(rm_caps);
+	}
+	if (rsn_len > rl) {
+		memcpy(p, rsn_ie + rl, rsn_len - rl);
+		p += rsn_len - rl;
+	} else if (ft) {
+		*p++ = WLAN_EID_MOBILITY_DOMAIN;
+		*p++ = 3;
+		memcpy(p, ft->md, 3);
+		p += 3;
+	}
+	if (h2e) { /* RSNXE: SAE hash-to-element */
+		*p++ = WLAN_EID_RSNX;
+		*p++ = 1;
+		*p++ = 0x20;
 	}
 	if (htc) {
 		struct ieee80211_ht_cap h = {
@@ -1381,13 +1841,37 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 		memcpy(p, &h, sizeof(h));
 		p += sizeof(h);
 	}
+	{
+		static const u8 ext_caps[] = { WLAN_EID_EXT_CAPABILITY, 3, 0, 0, 0x08 }; /* bit 19: 11v BSS transition */
+
+		memcpy(p, ext_caps, sizeof(ext_caps));
+		p += sizeof(ext_caps);
+	}
 	if (vhtc) {
-		struct ieee80211_vht_cap v = { .vht_cap_info = cpu_to_le32(sb->vht_cap.cap), .supp_mcs = sb->vht_cap.vht_mcs };
+		struct ieee80211_vht_cap v = { .vht_cap_info = cpu_to_le32(vs->vht_cap.cap), .supp_mcs = vs->vht_cap.vht_mcs };
 
 		*p++ = WLAN_EID_VHT_CAPABILITY;
 		*p++ = sizeof(v);
 		memcpy(p, &v, sizeof(v));
 		p += sizeof(v);
+	}
+	if (hec) {
+		struct ieee80211_he_cap_elem e = id->he_cap.he_cap_elem;
+		size_t n = 4;
+
+		/* only the widths this connection uses, as mac80211 does */
+		if (cd.width != NL80211_CHAN_WIDTH_40 && cd.width != NL80211_CHAN_WIDTH_80)
+			e.phy_cap_info[0] &= ~(IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G |
+					       IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G);
+		e.phy_cap_info[0] &= ~(IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G |
+				       IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_80PLUS80_MHZ_IN_5G);
+		e.phy_cap_info[6] &= ~IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT; /* rtw89 sets none */
+		*p++ = WLAN_EID_EXTENSION;
+		*p++ = 1 + sizeof(e) + n;
+		*p++ = WLAN_EID_EXT_HE_CAPABILITY;
+		memcpy(p, &e, sizeof(e));
+		memcpy(p + sizeof(e), &id->he_cap.he_mcs_nss_supp, n);
+		p += sizeof(e) + n;
 	}
 	if (M.wme) {
 		static const u8 wmm_info[] = { WLAN_EID_VENDOR_SPECIFIC, 7, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00 };
@@ -1395,14 +1879,38 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 		memcpy(p, wmm_info, sizeof(wmm_info));
 		p += sizeof(wmm_info);
 	}
-	r = join_xchg(f, p - f, IEEE80211_STYPE_ASSOC_RESP);
+	for (int i = 0;; i++) {
+		const size_t o = offsetof(struct ieee80211_mgmt, u.assoc_resp.variable);
+		const u8 *ti;
+		u32 tu = 1000;
+
+		r = join_xchg(f, p - f, IEEE80211_STYPE_ASSOC_RESP);
+		m = (void *)M.jbuf;
+		if (r || i == 2 || M.jlen < 30 ||
+		    le16_to_cpu(m->u.assoc_resp.status_code) != WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY)
+			break;
+		/* PMF: the AP checks our old association with an SA Query first, its comeback time says when to retry */
+		ti = ie_find(M.jbuf + o, M.jlen > o ? M.jlen - o : 0, WLAN_EID_TIMEOUT_INTERVAL);
+		if (ti && ti[1] >= 5 && ti[2] == 3)
+			tu = get_unaligned_le32(ti + 3);
+		pr_info("mlme: association refused temporarily, retrying in %u TU\n", tu);
+		msleep(min_t(u32, tu, 3000) * 1024 / 1000);
+		/* status 30 only comes with PMF, so SAE here; Comeback_P drops our SAE state with the old link */
+		if (sae && (r = sae_auth(sae, h2e)))
+			break;
+	}
 	if (r)
 		goto fail;
-	m = (void *)M.jbuf;
 	if (M.jlen < 30 || m->u.assoc_resp.status_code) {
 		pr_err("mlme: association refused, status %u\n", M.jlen < 30 ? 0xffff : le16_to_cpu(m->u.assoc_resp.status_code));
 		r = -ECONNREFUSED;
 		goto fail;
+	}
+	if (ft) {
+		const size_t o = offsetof(struct ieee80211_mgmt, u.assoc_resp.variable);
+
+		ft->resp_len = M.jlen > o ? min_t(size_t, M.jlen - o, sizeof(ft->resp)) : 0;
+		memcpy(ft->resp, M.jbuf + o, ft->resp_len);
 	}
 	wiphy_lock(WIPHY());
 	STA()->aid = le16_to_cpu(m->u.assoc_resp.aid) & 0x3fff;
@@ -1422,11 +1930,14 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 	mutex_lock(&rx_lock);
 	mutex_lock(&tx_lock);
 	M.assoc = true;
+	M.rssi = 0;
 	memset(M.seq, 0, sizeof(M.seq));
 	mutex_unlock(&tx_lock);
 	mutex_unlock(&rx_lock);
 	VIF()->cfg.ps = M.ps;
 	OPS()->vif_cfg_changed(HW(), VIF(), BSS_CHANGED_ASSOC | BSS_CHANGED_PS);
+	if (hec) /* rtw89 programs the color only once associated */
+		OPS()->link_info_changed(HW(), VIF(), &VIF()->bss_conf, BSS_CHANGED_HE_BSS_COLOR);
 	if (!M.rsn) {
 		r = sta_move(IEEE80211_STA_AUTHORIZED);
 		if (r)
@@ -1434,8 +1945,8 @@ int rtwd_connect(const uint8_t bssid[6], uint16_t freq, const uint8_t *ssid, uin
 		M.authorized = true;
 	}
 	wiphy_unlock(WIPHY());
-	pr_info("mlme: associated aid %u, %u MHz width %d, ht %d vht %d nss %d\n", STA()->aid, freq, cd.width,
-		!!htc, !!vhtc, ls->rx_nss);
+	pr_info("mlme: associated aid %u, %u MHz width %d, ht %d vht %d he %d nss %d%s\n", STA()->aid, freq,
+		cd.width, !!htc, !!vhtc, !!hec, ls->rx_nss, re ? " (FT reassociation)" : ft ? " (FT)" : "");
 	mutex_unlock(&op_lock);
 	return 0;
 
@@ -1474,6 +1985,60 @@ int rtwd_power_save(bool on)
 	return 0;
 }
 
+int rtwd_rssi(void)
+{
+	return M.assoc ? M.rssi / 16 : 0;
+}
+
+int rtwd_roam_hint(uint16_t freqs[8], uint8_t bssid[6], bool *btm)
+{
+	int n;
+
+	mutex_lock(&rx_lock);
+	n = M.nhint;
+	memcpy(freqs, M.hint_freq, n * sizeof(*freqs));
+	memcpy(bssid, M.hint_bssid, ETH_ALEN);
+	*btm = M.hint_btm;
+	M.nhint = 0;
+	M.hint_btm = false;
+	mutex_unlock(&rx_lock);
+	return n;
+}
+
+int rtwd_set_mac(const uint8_t mac[6])
+{
+	u8 old[ETH_ALEN];
+	int r;
+
+	mutex_lock(&op_lock);
+	r = -ENODEV;
+	if (!M.l || !M.l->lv)
+		goto out;
+	r = -EBUSY;
+	if (M.scanning || M.ctx)
+		goto out;
+	r = 0;
+	if (ether_addr_equal(VIF()->addr, mac))
+		goto out;
+	/* what mac80211 does for a MAC change: the interface goes down and comes back with the new address */
+	wiphy_lock(WIPHY());
+	memcpy(old, VIF()->addr, ETH_ALEN);
+	OPS()->remove_interface(HW(), VIF());
+	memcpy(VIF()->addr, mac, ETH_ALEN);
+	memcpy(VIF()->bss_conf.addr, mac, ETH_ALEN);
+	r = OPS()->add_interface(HW(), VIF());
+	if (r) {
+		memcpy(VIF()->addr, old, ETH_ALEN);
+		memcpy(VIF()->bss_conf.addr, old, ETH_ALEN);
+		if (OPS()->add_interface(HW(), VIF()))
+			pr_err("mlme: interface lost after a failed MAC change\n");
+	}
+	wiphy_unlock(WIPHY());
+out:
+	mutex_unlock(&op_lock);
+	return r;
+}
+
 int rtwd_set_authorized(bool on)
 {
 	int r = -ENOTCONN;
@@ -1485,18 +2050,53 @@ int rtwd_set_authorized(bool on)
 		mutex_lock(&rx_lock);
 		M.authorized = on && !r;
 		mutex_unlock(&rx_lock);
+		if (M.authorized && M.ap_rm) { /* 11k: the AP's neighbors give the roam scan its channels */
+			u8 f[32];
+			struct ieee80211_mgmt *m = (void *)f;
+
+			mgmt_hdr(m, IEEE80211_STYPE_ACTION);
+			f[24] = WLAN_CATEGORY_RADIO_MEASUREMENT;
+			f[25] = 4; /* neighbor report request */
+			f[26] = 1; /* dialog token */
+			mgmt_tx(f, 27);
+		}
 		wiphy_unlock(WIPHY());
 	}
 	mutex_unlock(&op_lock);
 	return r;
 }
 
-/* shortcut: CCMP-128 only (no TKIP/WEP/GCMP); BIP arrives with WPA3 */
+/* the IGTK (key then IPN): kept here for BIP on broadcast deauth/disassoc. The same key again keeps the
+   higher replay counter. */
+static int igtk_set(uint8_t idx, const uint8_t *key)
+{
+	u64 ipn = 0;
+	int r = -ENOTCONN;
+
+	for (int i = 5; i >= 0; i--)
+		ipn = ipn << 8 | key[16 + i];
+	mutex_lock(&op_lock);
+	if (M.l && M.assoc) {
+		mutex_lock(&rx_lock);
+		if (M.igtk_id != idx || memcmp(M.igtk, key, 16) || ipn > M.igtk_ipn)
+			M.igtk_ipn = ipn;
+		M.igtk_id = idx;
+		memcpy(M.igtk, key, 16);
+		mutex_unlock(&rx_lock);
+		r = 0;
+	}
+	mutex_unlock(&op_lock);
+	return r;
+}
+
+/* shortcut: CCMP-128 and the BIP-CMAC-128 IGTK only (no TKIP/WEP/GCMP, no BIP-GMAC) */
 int rtwd_add_key(bool pairwise, uint8_t idx, uint32_t cipher_suite, const uint8_t *key, uint8_t len)
 {
 	struct mkey *k, *old;
 	int r;
 
+	if (cipher_suite == WLAN_CIPHER_SUITE_AES_CMAC)
+		return !pairwise && (idx == 4 || idx == 5) && len == 22 ? igtk_set(idx, key) : -EOPNOTSUPP;
 	if (cipher_suite != WLAN_CIPHER_SUITE_CCMP || len != 16 || (!pairwise && (idx < 1 || idx > 3)) ||
 	    (pairwise && idx))
 		return -EOPNOTSUPP;
@@ -1536,6 +2136,7 @@ int rtwd_add_key(bool pairwise, uint8_t idx, uint32_t cipher_suite, const uint8_
 	if (pairwise) {
 		M.ptk = r ? NULL : k;
 		memset(M.rx_pn, 0, sizeof(M.rx_pn));
+		M.mgmt_tx_pn = M.mgmt_rx_pn = 0;
 		M.txblock = r && old; /* a failed rekey must not fall back to plaintext */
 	} else {
 		M.gtk[idx] = r ? NULL : k;

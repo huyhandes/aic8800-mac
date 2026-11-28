@@ -251,7 +251,7 @@ static inline int aic_wpa2_compute_eapol_mic(uint16_t key_ver,
         memcpy(mic_out, digest, 16U);
         return 0;
     }
-    if (key_ver == AIC_KEY_INFO_VER_AES_CMAC) {
+    if (key_ver == AIC_KEY_INFO_VER_AES_CMAC || key_ver == 0U) { /* 0: AKM-defined, SAE uses AES-CMAC */
         aic_aes128_cmac(kck, copy, eapol_len, mic_out);
         return 0;
     }
@@ -332,7 +332,7 @@ typedef struct {
     uint8_t  gtk[AIC_MAC_SEC_KEY_LEN];
     uint8_t  gtk_len;
     uint8_t  gtk_idx;
-    uint8_t  rsn_ie[24];
+    uint8_t  rsn_ie[255]; /* M2 key data: the RSNE, and for FT-PSK also the MDE and FTE */
     uint8_t  rsn_ie_len;
     uint8_t  pairwise_cipher;
     uint8_t  group_cipher;
@@ -343,6 +343,9 @@ typedef struct {
     bool     has_ptk;
     bool     has_gtk;
     bool     ptk_done; /* M3 accepted: the next M1 starts a new handshake */
+    /* NULL: the 802.11i PRF. Set by a driver-specific feature (RTL FT-PSK) that derives the PTK another way */
+    void (*derive_ptk)(const uint8_t pmk[32], const uint8_t snonce[32], const uint8_t anonce[32],
+                       const uint8_t aa[6], const uint8_t spa[6], uint8_t ptk[64]);
 } aic_wpa2_ctx_t;
 
 static inline void aic_wpa2_ctx_init(aic_wpa2_ctx_t *ctx,
@@ -504,13 +507,17 @@ static inline int aic_wpa2_handle_rx_eapol(aic_wpa2_ctx_t *ctx,
         ctx->ptk_done = false;
         memcpy(ctx->anonce, &key_body[13], 32U);
         ctx->key_ver = key_ver;
-        aic_wpa2_derive_ptk(ctx->pmk,
-                            ctx->aa,
-                            ctx->spa,
-                            ctx->anonce,
-                            ctx->snonce,
-                            (key_ver == AIC_KEY_INFO_VER_AES_CMAC),
-                            ctx->tptk);
+        if (ctx->derive_ptk) {
+            ctx->derive_ptk(ctx->pmk, ctx->snonce, ctx->anonce, ctx->aa, ctx->spa, ctx->tptk);
+        } else {
+            aic_wpa2_derive_ptk(ctx->pmk,
+                                ctx->aa,
+                                ctx->spa,
+                                ctx->anonce,
+                                ctx->snonce,
+                                (key_ver == AIC_KEY_INFO_VER_AES_CMAC || key_ver == 0U),
+                                ctx->tptk);
+        }
         ctx->has_tptk = true;
 
         const uint16_t m2_info = (uint16_t)(key_ver | AIC_KEY_INFO_PAIRWISE | AIC_KEY_INFO_MIC);

@@ -25,6 +25,8 @@ struct WifiStatus: Decodable {
     let last_error: String
     let band_pref: String? /* "auto", "5" or "2.4"; absent from older daemons */
     let power_save: Bool? /* absent when the dongle's driver has no power save */
+    let mac_random: Bool? /* absent when the driver cannot change its address */
+    let roam: String? /* absent when the driver reports no signal for the current AP */
 }
 
 struct ScanBss: Decodable {
@@ -234,11 +236,11 @@ final class Adapter {
     var ready: Bool { status.map { $0.present && $0.lmac_ready } ?? false }
 }
 
-/// (adapter, network) for a network menu item
-private final class BandChoice {
+/// (adapter, command) for a submenu choice such as "BAND 5"
+private final class Choice {
     let adapter: Adapter
-    let band: String
-    init(_ adapter: Adapter, _ band: String) { self.adapter = adapter; self.band = band }
+    let cmd: String
+    init(_ adapter: Adapter, _ cmd: String) { self.adapter = adapter; self.cmd = cmd }
 }
 
 private final class NetChoice {
@@ -618,7 +620,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let bands = NSMenu()
             bands.autoenablesItems = false
             for (title, v) in [("Auto", "auto"), ("5 GHz", "5"), ("2.4 GHz", "2.4")] {
-                let it = actionItem(title, #selector(onBand(_:)), BandChoice(a, v))
+                let it = actionItem(title, #selector(onChoice(_:)), Choice(a, "BAND \(v)"))
                 it.state = pref == v ? .on : .off
                 bands.addItem(it)
             }
@@ -630,6 +632,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let it = actionItem("\(ind)Power Saving", #selector(onPowerSave(_:)), a)
             it.state = ps ? .on : .off
             menu.addItem(it)
+        }
+        if let mr = st.mac_random { /* a per-network address, applied at the next connect */
+            let it = actionItem("\(ind)MAC Randomization", #selector(onMacRandom(_:)), a)
+            it.state = mr ? .on : .off
+            menu.addItem(it)
+        }
+        if let roam = st.roam { /* like the Windows driver: VeryHigh roams soonest (below -60 dBm) */
+            let levels = NSMenu()
+            levels.autoenablesItems = false
+            for v in ["VeryHigh", "High", "Middle", "Low", "VeryLow", "Disable"] {
+                let it = actionItem(v, #selector(onChoice(_:)), Choice(a, "ROAM \(v)"))
+                it.state = roam == v ? .on : .off
+                levels.addItem(it)
+            }
+            let sub = NSMenuItem(title: "\(ind)Roaming Sensitivity", action: nil, keyEquivalent: "")
+            sub.submenu = levels
+            menu.addItem(sub)
         }
 
         let nets: NSMenu
@@ -801,14 +820,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
     }
 
-    @objc private func onBand(_ sender: NSMenuItem) {
-        guard let c = sender.representedObject as? BandChoice else { return }
-        sendSimpleAction(c.adapter, "BAND \(c.band)")
+    @objc private func onChoice(_ sender: NSMenuItem) {
+        guard let c = sender.representedObject as? Choice else { return }
+        sendSimpleAction(c.adapter, c.cmd)
     }
 
     @objc private func onPowerSave(_ sender: NSMenuItem) {
         guard let a = sender.representedObject as? Adapter else { return }
         sendSimpleAction(a, sender.state == .on ? "POWERSAVE off" : "POWERSAVE on")
+    }
+
+    @objc private func onMacRandom(_ sender: NSMenuItem) {
+        guard let a = sender.representedObject as? Adapter else { return }
+        sendSimpleAction(a, sender.state == .on ? "MACRANDOM off" : "MACRANDOM on")
     }
 
     @objc private func onOpenLog() {
